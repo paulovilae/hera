@@ -1,0 +1,14 @@
+--- q8_t5.rs
++++ q8_t5.rs
+@@ -179,9 +179,9 @@
+ 
+ impl LayerNorm {
+-    fn load(h: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+-        let weight = vb.get(h, "weight")?.dequantize(vb.device())?;
++    fn load(h: usize, eps: f64, name: &str, vb: &VarBuilder) -> Result<Self> {
++        let weight = vb.get_no_shape(name)?.dequantize(vb.device())?;
+         Ok(Self { weight, eps })
+     }
+ 
+ 
+ 

@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "hera-core",
+    "hera-execution"
+]
+resolver = "2"

@@ -1,0 +1,29 @@
+[package]
+name = "hera-execution"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reqwest = { version = "0.12.28", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.50", features = ["full"] }
+uuid = { version = "1.22.0", features = ["v4"] }
+anyhow = "1.0"
+lancedb = "0.26.2"
+arrow-array = "57.3.0"
+arrow-schema = "57.3.0"
+futures = "0.3.32"
+base64 = "0.22.1"
+rand = "0.9"
+scraper = "0.20"
+urlencoding = "2.1"
+yahoo_finance_api = "4.1.0"
+ta = "0.5.0"
+chrono = "0.4.44"
+lopdf = "0.39.0"
+pdf-extract = "0.10.0"
+calamine = "0.34.0"
+[lib]
+name = "hera_execution"
