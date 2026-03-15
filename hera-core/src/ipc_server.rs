@@ -197,7 +197,7 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                             result_text = "Hera Vision Engine (Moondream) is not loaded or unavailable.".to_string();
                                         }
                                     }
-                                } else if request.action == "generate_video" {
+                                } else if request.action == "generate_video" || request.action == "animate_image" {
                                     if let Some(prompt) = request.payload.get("prompt").and_then(|p| p.as_str()) {
                                         // ── Phase 1: Brain (Qwen3-VL) — Enhance the prompt ──
                                         let enhance_prompt = format!(
