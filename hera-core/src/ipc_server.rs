@@ -236,7 +236,7 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                         // ── Phase 2: Generate FLUX anchor frame (if no user image) ──
                                         let width = request.payload.get("width").and_then(|w| w.as_u64()).unwrap_or(480);
                                         let height = request.payload.get("height").and_then(|h| h.as_u64()).unwrap_or(320);
-                                        let num_frames = request.payload.get("num_frames").and_then(|n| n.as_u64()).unwrap_or(33);
+                                        let num_frames = request.payload.get("num_frames").and_then(|n| n.as_u64()).unwrap_or(81);
 
                                         // Check if user provided an image already
                                         let user_image_b64 = request.payload.get("base64_image")

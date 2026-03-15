@@ -44,7 +44,7 @@ class VideoRequest(BaseModel):
     image_base64: Optional[str] = None  # Base64-encoded anchor image for I2V
     width: int = 480
     height: int = 320
-    num_frames: int = 33
+    num_frames: int = 81
     num_inference_steps: int = 20
     guidance_scale: float = 5.0
 
