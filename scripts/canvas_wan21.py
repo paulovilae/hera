@@ -73,9 +73,9 @@ def load_pipelines():
     vace_path = Path(VACE_CACHE_DIR)
     if vace_path.exists() and any(vace_path.iterdir()):
         try:
-            from diffusers import WanImageToVideoPipeline
+            from diffusers import WanVACEPipeline
             print(f"📥 Loading Wan2.1 VACE I2V from {VACE_MODEL_ID}...")
-            vace_pipe = WanImageToVideoPipeline.from_pretrained(
+            vace_pipe = WanVACEPipeline.from_pretrained(
                 VACE_MODEL_ID,
                 torch_dtype=torch.float16,
                 cache_dir=VACE_CACHE_DIR,
@@ -135,8 +135,8 @@ async def generate_video(req: VideoRequest):
             print(f"   🖼️ Anchor image: {anchor_image.size}")
 
             output = active_pipe(
-                image=anchor_image,
                 prompt=req.prompt,
+                reference_images=[anchor_image],
                 height=req.height,
                 width=req.width,
                 num_frames=req.num_frames,
