@@ -38,7 +38,7 @@ impl Hera {
         Self {
             mcp_client: McpHttpClient::new(smartos_router_url),
             http_client: reqwest::Client::new(),
-            draw_url: "http://127.0.0.1:8810".to_string(), // Direct SwarmUI bind
+            draw_url: "http://127.0.0.1:8999".to_string(), // Direct sd.cpp bind
         }
     }
 

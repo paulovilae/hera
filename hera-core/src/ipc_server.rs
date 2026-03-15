@@ -56,48 +56,184 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                 
                                 // Process Request
                                 let mut result_text = "Action not supported".to_string();
+                                let mut tool_calls: Option<serde_json::Value> = None;
                                 
                                 if request.action == "generate" {
-                                    if let Some(prompt) = request.payload.get("prompt").and_then(|p| p.as_str()) {
-                                        let chat_req = ChatRequest {
-                                            model: "hera-local-model".to_string(),
-                                            vision_model: None,
-                                            tts_model: None,
-                                            stt_model: None,
-                                            messages: vec![ChatMessage {
-                                                role: "user".to_string(),
-                                                content: MessageContent::Text(prompt.to_string()),
-                                            }],
-                                            temperature: Some(0.7),
-                                            max_tokens: Some(1024),
-                                            top_p: None,
-                                            top_k: None,
-                                            presence_penalty: None,
-                                            frequency_penalty: None,
-                                            repeat_penalty: None,
-                                            seed: None,
-                                            stop: None,
-                                            endpoint: None,
-                                            api_key: None,
-                                            provider: None,
-                                            stream: None,
-                                            nsfw: None,
-                                            tools: None,
-                                            tool_choice: None,
-                                            reasoning_effort: None,
-                                        };
-                                        
-                                        match state.engine.generate_content(chat_req).await {
-                                            Ok(resp) => {
-                                                if let Some(choice) = resp.choices.first() {
-                                                    if let Some(content) = &choice.message.content {
-                                                        result_text = content.clone();
+                                    let mut payload_clone = request.payload.clone();
+                                    
+                                    // Extract prompt
+                                    let mut prompt = payload_clone.get("prompt").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                                    let mut assistant_last: Option<String> = None;
+                                    
+                                    // Make sure we extract the prompt from the messages array if it wasn't provided directly
+                                    if prompt.is_empty() {
+                                        if let Some(messages) = payload_clone.get("messages").and_then(|m| m.as_array()) {
+                                            if let Some(last_msg) = messages.last() {
+                                                if let Some("user") = last_msg.get("role").and_then(|r| r.as_str()) {
+                                                    if let Some(content) = last_msg.get("content").and_then(|c| c.as_str()) {
+                                                        prompt = content.to_string();
                                                     }
                                                 }
                                             }
-                                            Err(e) => {
-                                                error!("LLM inference error: {}", e);
-                                                result_text = format!("Error: {}", e);
+                                            
+                                            // Extract the second to last message if it's from the assistant
+                                            if messages.len() >= 2 {
+                                                if let Some(prev_msg) = messages.get(messages.len() - 2) {
+                                                    if let Some("assistant") = prev_msg.get("role").and_then(|r| r.as_str()) {
+                                                        if let Some(content) = prev_msg.get("content").and_then(|c| c.as_str()) {
+                                                            assistant_last = Some(content.to_string());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let mut handled_by_tool = false;
+                                    
+                                    // 1. Fast-path intent detection
+                                    if !prompt.is_empty() {
+                                        if let Some(tool_call) = crate::ai::tool_executor::detect_intent_from_user_message(&prompt, assistant_last.as_deref()) {
+                                            tracing::info!("🚀 [Hera IPC] Fast-path tool intent detected: {}", tool_call.name);
+                                            let tool_result = crate::ai::tool_executor::execute_tool(&tool_call).await;
+                                            result_text = tool_result.output;
+                                            tool_calls = Some(serde_json::json!([tool_call]));
+                                            handled_by_tool = true;
+                                        }
+                                    }
+                                    
+                                    // 2. Normal LLM generation
+                                    if !handled_by_tool {
+                                        if let Some(obj) = payload_clone.as_object_mut() {
+                                            if !obj.contains_key("model") {
+                                                obj.insert("model".to_string(), serde_json::json!("hera-local-model"));
+                                            }
+                                        }
+                                        
+                                        let prompt = payload_clone.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                        let persona_path = payload_clone.get("persona_path").and_then(|v| v.as_str()).unwrap_or("/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md").to_string();
+                                        let permissions: Vec<String> = payload_clone.get("permissions")
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<String>>())
+                                            .unwrap_or_else(|| vec!["all".to_string()]);
+                                            
+                                        let mut chat_req: Option<ChatRequest> = serde_json::from_value(payload_clone).ok();
+                                        
+                                        if chat_req.is_none() {
+                                            if !prompt.is_empty() {
+                                                let base_system_prompt = std::fs::read_to_string(&persona_path)
+                                                    .unwrap_or_else(|_| "You are an AI assistant.".to_string());
+                                                let schemas = crate::ai::tool_executor::hera_tool_schemas(&permissions);
+                                                let full_system_prompt = format!("{}\n\n{}", base_system_prompt, schemas);
+
+                                                chat_req = Some(ChatRequest {
+                                                    model: "hera-local-model".to_string(),
+                                                    vision_model: None,
+                                                    tts_model: None,
+                                                    stt_model: None,
+                                                    messages: vec![
+                                                        ChatMessage {
+                                                            role: "system".to_string(),
+                                                            content: MessageContent::Text(full_system_prompt),
+                                                        },
+                                                        ChatMessage {
+                                                            role: "user".to_string(),
+                                                            content: MessageContent::Text(prompt.clone()),
+                                                        }
+                                                    ],
+                                                    temperature: Some(0.7),
+                                                    max_tokens: Some(1024),
+                                                    top_p: None,
+                                                    top_k: None,
+                                                    presence_penalty: None,
+                                                    frequency_penalty: None,
+                                                    repeat_penalty: None,
+                                                    seed: None,
+                                                    stop: None,
+                                                    endpoint: None,
+                                                    api_key: None,
+                                                    provider: None,
+                                                    stream: None,
+                                                    nsfw: None,
+                                                    tools: None,
+                                                    tool_choice: None,
+                                                    reasoning_effort: None,
+                                                });
+                                            }
+                                        } else if let Some(req) = &mut chat_req {
+                                            // Inject base persona + tool schemas into existing request
+                                            let base_system_prompt = std::fs::read_to_string(&persona_path)
+                                                .unwrap_or_else(|_| "You are an AI assistant.".to_string());
+                                            let schemas = crate::ai::tool_executor::hera_tool_schemas(&permissions);
+                                            let full_system_prompt = format!("{}\n\n{}", base_system_prompt, schemas);
+
+                                            if let Some(first) = req.messages.first_mut() {
+                                                if first.role == "system" {
+                                                    match &mut first.content {
+                                                        MessageContent::Text(t) => {
+                                                            *t = format!("{}\n\n{}", full_system_prompt, t);
+                                                        }
+                                                        MessageContent::Parts(parts) => {
+                                                            parts.insert(0, ContentPart::Text { text: format!("{}\n\n", full_system_prompt) });
+                                                        }
+                                                        MessageContent::Null => {
+                                                            first.content = MessageContent::Text(full_system_prompt);
+                                                        }
+                                                    }
+                                                } else {
+                                                    req.messages.insert(0, ChatMessage {
+                                                        role: "system".to_string(),
+                                                        content: MessageContent::Text(full_system_prompt),
+                                                    });
+                                                }
+                                            } else {
+                                                req.messages.push(ChatMessage {
+                                                    role: "system".to_string(),
+                                                    content: MessageContent::Text(full_system_prompt),
+                                                });
+                                            }
+                                        }
+                                        
+                                        if let Some(req) = chat_req {
+                                            match state.engine.generate_content(req).await {
+                                                Ok(resp) => {
+                                                    if let Some(choice) = resp.choices.first() {
+                                                        if let Some(content) = &choice.message.content {
+                                                            result_text = content.clone();
+                                                            
+                                                            // 3. Parse and Execute Output Tool Calls
+                                                            let parsed_calls = crate::ai::tool_executor::parse_tool_calls(&result_text);
+                                                            if !parsed_calls.is_empty() {
+                                                                tracing::info!("🛠️ [Hera IPC] LLM emitted {} tool calls", parsed_calls.len());
+                                                                let mut execution_outputs = String::new();
+                                                                let mut executed_calls = Vec::new();
+                                                                
+                                                                for call in parsed_calls {
+                                                                    let tool_res = crate::ai::tool_executor::execute_tool(&call).await;
+                                                                    execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
+                                                                    
+                                                                    executed_calls.push(serde_json::json!({
+                                                                        "name": call.name,
+                                                                        "arguments": call.arguments
+                                                                    }));
+                                                                }
+                                                                
+                                                                // Append execution output to the response text so the user sees it
+                                                                result_text.push_str(&execution_outputs);
+                                                                tool_calls = Some(serde_json::Value::Array(executed_calls));
+                                                            }
+                                                        }
+                                                        if let Some(tc) = &choice.message.tool_calls {
+                                                            // Also preserve native tool calls if the model emits them via choices.message.tool_calls
+                                                            if tool_calls.is_none() {
+                                                                tool_calls = Some(serde_json::json!(tc));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("LLM inference error: {}", e);
+                                                    result_text = format!("Error: {}", e);
+                                                }
                                             }
                                         }
                                     }
@@ -365,11 +501,110 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                             result_text = "Hera Audio Engine (Whisper) is not loaded or unavailable.".to_string();
                                         }
                                     }
+                                } else if request.action == "get_tools" {
+                                    let raw_tools = serde_json::json!([
+                                        {
+                                            "type": "function",
+                                            "function": {
+                                                "name": "hera_draw",
+                                                "description": "Generate an image locally using the GPU. MUST use this whenever the user asks for a picture, photo, drawing, OR follows up on a previous image with modifications. You are a multimodal AI (Claw Node) and you HAVE this capability.",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "prompt": {
+                                                            "type": "string",
+                                                            "description": "A detailed description of the image to generate. Be specific about subject, style, colors, mood, and composition."
+                                                        }
+                                                    },
+                                                    "required": ["prompt"]
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "type": "function",
+                                            "function": {
+                                                "name": "hera_search",
+                                                "description": "Search the web for current information. Use this when the user asks about recent events, news, facts you are unsure about, or anything requiring up-to-date information.",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "query": {
+                                                            "type": "string",
+                                                            "description": "The search query"
+                                                        }
+                                                    },
+                                                    "required": ["query"]
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "type": "function",
+                                            "function": {
+                                                "name": "hera_speak",
+                                                "description": "Read text aloud using Text-to-Speech (TTS). Use this to generate audio files of your response when requested.",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "text": {
+                                                            "type": "string",
+                                                            "description": "The text to be spoken."
+                                                        }
+                                                    },
+                                                    "required": ["text"]
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "type": "function",
+                                            "function": {
+                                                "name": "hera_video",
+                                                "description": "Generate a short video. You have multimodal capabilities as a Claw Node. Use this when the user asks for a video, animation, or moving picture.",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "prompt": {
+                                                            "type": "string",
+                                                            "description": "A detailed description of the video to generate, including motion, subject, and style."
+                                                        }
+                                                    },
+                                                    "required": ["prompt"]
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "type": "function",
+                                            "function": {
+                                                "name": "hera_read_file",
+                                                "description": "Read the contents of a local file on the system. Use this when the user asks to read, view, or check a file.",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "path": {
+                                                            "type": "string",
+                                                            "description": "The absolute or relative path to the file to read."
+                                                        }
+                                                    },
+                                                    "required": ["path"]
+                                                }
+                                            }
+                                        }
+                                    ]);
+                                    
+                                    result_text = "Tools retrieved".to_string();
+                                    tool_calls = Some(serde_json::json!({
+                                        "tools": raw_tools
+                                    }));
+                                }
+                                let mut data_json = serde_json::json!({ "result": result_text });
+                                if let Some(tc) = tool_calls {
+                                    if let Some(map) = data_json.as_object_mut() {
+                                        map.insert("tool_calls".to_string(), tc);
+                                    }
                                 }
 
                                 let res = IpcResponse {
                                     status: "success".to_string(),
-                                    data: serde_json::json!({ "result": result_text }),
+                                    data: data_json,
                                 };
 
                                 let res_str = serde_json::to_string(&res).unwrap();

@@ -24,14 +24,14 @@ pub struct ToolResult {
 /// Tool schemas in Qwen3's native Hermes-style format.
 /// Uses the exact JSON schema structure that Qwen3 was trained on.
 /// Reference: https://qwen3.org/docs/guides/tools
-pub fn hera_tool_schemas() -> String {
+pub fn hera_tool_schemas(permissions: &[String]) -> String {
     // Hermes-style: tools described as JSON function schemas
     let tools = serde_json::json!([
         {
             "type": "function",
             "function": {
                 "name": "hera_draw",
-                "description": "Generate an image locally using the GPU. MUST use this whenever the user asks for a picture, photo, drawing, OR follows up on a previous image with modifications (like 'now with a hat', 'make it red', 'ahora fumando').",
+                "description": "Generate an image locally using the GPU. MUST use this whenever the user asks for a picture, photo, drawing, OR follows up on a previous image with modifications. You are a multimodal AI (Claw Node) and you HAVE this capability.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -65,18 +65,13 @@ pub fn hera_tool_schemas() -> String {
             "type": "function",
             "function": {
                 "name": "hera_speak",
-                "description": "Convert text to speech audio. Use this when the user asks you to say something out loud, read text aloud, or generate audio speech.",
+                "description": "Read text aloud using Text-to-Speech (TTS). Use this to generate audio files of your response when requested.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "text": {
                             "type": "string",
-                            "description": "The text to convert to speech"
-                        },
-                        "voice": {
-                            "type": "string",
-                            "description": "Voice ID. Options: en_US-amy-medium, es_MX-claude-high, es_ES-davefx-medium, pt_BR-faber-medium",
-                            "default": "es_MX-claude-high"
+                            "description": "The text to be spoken."
                         }
                     },
                     "required": ["text"]
@@ -87,22 +82,75 @@ pub fn hera_tool_schemas() -> String {
             "type": "function",
             "function": {
                 "name": "hera_video",
-                "description": "Generate a video locally using the GPU. Use this when the user asks you to create, generate, or make a video or animation.",
+                "description": "Generate a short video. You have multimodal capabilities as a Claw Node. Use this when the user asks for a video, animation, or moving picture.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "A detailed description of the video to generate"
+                            "description": "A detailed description of the video to generate, including motion, subject, and style."
                         }
                     },
                     "required": ["prompt"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "hera_read_file",
+                "description": "Read the contents of a local file on the system. Use this when the user asks to read, view, or check a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The absolute or relative path to the file to read."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "hera_update_soul",
+                "description": "Update, rewrite, or append to your own core system prompt/persona file (SOUL). Use this whenever the user asks you to permanently remember a trait about yourself, act a certain way from now on, or modify your core instructions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "new_soul_content": {
+                            "type": "string",
+                            "description": "The complete new markdown text for your SOUL file. This will completely overwrite the existing file, so include all necessary context and instructions."
+                        }
+                    },
+                    "required": ["new_soul_content"]
+                }
+            }
         }
     ]);
 
-    let tools_json = serde_json::to_string_pretty(&tools).unwrap_or_default();
+    let has_all = permissions.contains(&"all".to_string());
+    
+    let mut filtered_tools = Vec::new();
+    if let Some(arr) = tools.as_array() {
+        for tool in arr {
+            if has_all {
+                filtered_tools.push(tool.clone());
+            } else if let Some(name) = tool.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                if permissions.contains(&name.to_string()) {
+                    filtered_tools.push(tool.clone());
+                }
+            }
+        }
+    }
+
+    if filtered_tools.is_empty() {
+        return "".to_string();
+    }
+
+    let tools_json = serde_json::to_string_pretty(&filtered_tools).unwrap_or_default();
 
     format!(r#"
 
@@ -167,14 +215,15 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
 /// Returns a ToolCall if the user's intent clearly maps to a tool.
 pub fn detect_intent_from_user_message(user_msg: &str, assistant_last: Option<&str>) -> Option<ToolCall> {
     let lower = user_msg.to_lowercase();
+    let lower_trimmed = lower.trim();
 
     // Contextual image modifier detection
     if let Some(ast) = assistant_last {
         if ast.contains("MEDIA:") || ast.contains("Aquí tienes") || ast.contains("Here is") || ast.contains("la imagen") {
-            let is_modifier = user_msg.len() < 120 
-                || lower.starts_with("ahora ") || lower.starts_with("now ") 
+            let is_modifier = lower.starts_with("ahora ") || lower.starts_with("now ") 
                 || lower.starts_with("con ") || lower.starts_with("with ") 
-                || lower.starts_with("sin ") || lower.starts_with("without ");
+                || lower.starts_with("sin ") || lower.starts_with("without ")
+                || lower.starts_with("mas ") || lower.starts_with("more ");
             
             if is_modifier {
                 tracing::info!("🎯 [Hera] Intent detected: hera_draw from conversational context (modifier)");
@@ -186,26 +235,50 @@ pub fn detect_intent_from_user_message(user_msg: &str, assistant_last: Option<&s
         }
     }
 
-    // Draw/Image intent — very specific keywords to avoid false positives
-    let draw_keywords = [
-        "draw ", "dibuja", "genera una imagen", "create an image", "make an image",
-        "generate an image", "draw me", "hazme un dibujo", "pinta",
+    // Draw/Image intent — Strict matching to prevent hijacking normal conversation
+    let exact_starts = [
+        "draw ", "dibuja ", "genera una imagen ", "create an image ", "make an image ",
+        "generate an image ", "draw me ", "hazme un dibujo", "pinta ",
         "haz una imagen", "genera imagen", "crea una imagen",
         "make a picture", "generate a picture", "create a picture",
-        "haz un dibujo", "make me an image", "draw a ",
-        // Photo/image requests
-        "tu foto", "una foto", "mi foto", "dame foto", "dame una foto",
-        "hazme una foto", "toma una foto", "manda una foto",
-        "una imagen", "mi imagen", "tu imagen", "hazme una imagen",
-        "genera una foto", "crea una foto",
-        "your photo", "my photo", "take a photo", "send a photo",
-        "a picture of", "make me a picture", "selfie", "retrato",
-        "send me an image", "show me an image",
+        "haz un dibujo ", "make me an image ", "draw a ",
+        "hazme una foto ", "toma una foto ", "manda una foto ",
+        "hazme una imagen ", "genera una foto ", "crea una foto ",
+        "take a photo ", "send a photo ", "a picture of ",
+        "make me a picture ", "send me an image ", "show me an image ",
+        "haz una foto ", "a photo of ", "make a photo ", "create a photo ", "foto de ",
+        "do a photo ", "do a picture ", "do a foto ", "do an image ",
     ];
-    if draw_keywords.iter().any(|kw| lower.contains(kw)) {
-        // Extract the prompt: everything after the draw keyword
+    
+    // Short exact matches
+    let exact_matches = [
+        "tu foto", "una foto", "mi foto", "dame foto", "dame una foto",
+        "una imagen", "mi imagen", "tu imagen",
+        "your photo", "my photo", "selfie", "retrato",
+    ];
+
+    // Broad fuzzy detection: if a short message contains an image noun + an action verb, it's a draw request
+    let image_nouns = ["photo", "foto", "picture", "imagen", "image", "drawing", "dibujo", "selfie", "retrato", "pic ", "pic."];
+    let action_verbs = ["make", "do ", "create", "take", "send", "show", "generate", "haz", "genera", "crea", "toma", "manda", "dame", "hazme", "draw", "paint", "pinta", "dibuja", "quiero", "want"];
+
+    let mut is_draw = false;
+    
+    if exact_starts.iter().any(|kw| lower_trimmed.starts_with(kw)) {
+        is_draw = true;
+    } else if user_msg.len() < 40 && exact_matches.iter().any(|kw| lower_trimmed == *kw || lower_trimmed.starts_with(kw)) {
+        is_draw = true;
+    } else if user_msg.len() < 80 {
+        // Fuzzy: short message contains both an image noun and an action verb
+        let has_noun = image_nouns.iter().any(|n| lower_trimmed.contains(n));
+        let has_verb = action_verbs.iter().any(|v| lower_trimmed.contains(v));
+        if has_noun && has_verb {
+            is_draw = true;
+        }
+    }
+
+    if is_draw {
         let prompt = user_msg.to_string();
-        info!("🎯 [Hera] Intent detected: hera_draw from user message");
+        tracing::info!("🎯 [Hera] Strict intent detected: hera_draw from user message");
         return Some(ToolCall {
             name: "hera_draw".to_string(),
             arguments: serde_json::json!({"prompt": prompt}),
@@ -265,6 +338,8 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
         "hera_search" => execute_search(call).await,
         "hera_speak" => execute_speak(call).await,
         "hera_video" => execute_video(call).await,
+        "hera_read_file" => execute_read_file(call).await,
+        "hera_update_soul" => execute_update_soul(call).await,
         _ => ToolResult {
             name: call.name.clone(),
             success: false,
@@ -296,15 +371,13 @@ async fn execute_draw(call: &ToolCall) -> ToolResult {
             // Build a public URL that candle-core serves at /outputs/{filename}
             // The filename is the last segment of image_url (e.g., "/outputs/hera_drawn_UUID.png")
             let filename = image_url.split('/').last().unwrap_or(image_url);
-            let public_url = format!("https://hera.vilaros.ai/outputs/{}", filename);
+            let public_url = format!("https://imaginos.ai/outputs/{}", filename);
+            let response = format!("Image generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the image is delivered inline.", public_url);
 
             ToolResult {
                 name: call.name.clone(),
                 success: true,
-                output: format!(
-                    "Image generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the image is delivered inline.",
-                    public_url
-                ),
+                output: response,
             }
         }
         Err(e) => {
@@ -389,6 +462,69 @@ async fn execute_video(call: &ToolCall) -> ToolResult {
             success: false,
             output: format!("Video generation failed: {}", e),
         },
+    }
+}
+
+async fn execute_read_file(call: &ToolCall) -> ToolResult {
+    let path = call.arguments.get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let truncated = if content.len() > 16000 {
+                format!("{}... (truncated)", &content[..16000])
+            } else {
+                content
+            };
+            info!("📄 [Hera] Read file: {}", path);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!("File contents of '{}':\n{}", path, truncated),
+            }
+        }
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to read file '{}': {}", path, e),
+        },
+    }
+}
+
+async fn execute_update_soul(call: &ToolCall) -> ToolResult {
+    let new_soul_content = call.arguments.get("new_soul_content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    if new_soul_content.trim().is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: new_soul_content was empty. You must provide the complete new persona text.".to_string(),
+        };
+    }
+
+    let soul_path = std::env::var("HERA_SOUL_PATH")
+        .unwrap_or_else(|_| "/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md".to_string());
+
+    match std::fs::write(&soul_path, new_soul_content) {
+        Ok(_) => {
+            tracing::info!("🧠 [Hera] SOUL successfully rewritten at {}", soul_path);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!("Successfully updated your SOUL! The changes have been saved to disk and you will remember them permanently."),
+            }
+        }
+        Err(e) => {
+            tracing::error!("🧠 [Hera] Failed to write SOUL.md: {:?}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to update SOUL.md. File system error: {:?}", e),
+            }
+        }
     }
 }
 
