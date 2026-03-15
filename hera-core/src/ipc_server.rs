@@ -233,29 +233,86 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                         };
                                         info!("🧠 Enhanced prompt: {}", &enhanced[..enhanced.len().min(120)]);
 
-                                        // ── Phase 2: Canvas (Wan2.1) — Generate video ──
-                                        // GPU Swap: Stop FLUX to free 12GB VRAM on GPU 1 for Wan2.1
+                                        // ── Phase 2: Generate FLUX anchor frame (if no user image) ──
+                                        let width = request.payload.get("width").and_then(|w| w.as_u64()).unwrap_or(480);
+                                        let height = request.payload.get("height").and_then(|h| h.as_u64()).unwrap_or(320);
+                                        let num_frames = request.payload.get("num_frames").and_then(|n| n.as_u64()).unwrap_or(33);
+
+                                        // Check if user provided an image already
+                                        let user_image_b64 = request.payload.get("base64_image")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+
+                                        let anchor_image_b64: Option<String> = if let Some(img) = user_image_b64 {
+                                            info!("🖼️ Using user-provided image as anchor frame");
+                                            Some(img)
+                                        } else {
+                                            // Generate anchor frame via FLUX (sd.cpp on port 8999)
+                                            info!("🎨 Generating FLUX anchor frame...");
+                                            let flux_client = reqwest::Client::builder()
+                                                .timeout(std::time::Duration::from_secs(120))
+                                                .build()
+                                                .unwrap_or_default();
+                                            let flux_payload = serde_json::json!({
+                                                "prompt": enhanced,
+                                                "width": width,
+                                                "height": height,
+                                                "sample_steps": 4,
+                                                "cfg_scale": 1.0,
+                                            });
+                                            match flux_client.post("http://127.0.0.1:8999/v1/images/generations")
+                                                .json(&flux_payload)
+                                                .send()
+                                                .await
+                                            {
+                                                Ok(resp) if resp.status().is_success() => {
+                                                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                                                        // sd.cpp returns base64 image in data[0].b64_json
+                                                        let b64 = json.get("data")
+                                                            .and_then(|d| d.as_array())
+                                                            .and_then(|arr| arr.first())
+                                                            .and_then(|item| item.get("b64_json"))
+                                                            .and_then(|v| v.as_str())
+                                                            .map(|s| s.to_string());
+                                                        if b64.is_some() {
+                                                            info!("✅ FLUX anchor frame generated!");
+                                                        }
+                                                        b64
+                                                    } else { None }
+                                                }
+                                                _ => {
+                                                    info!("⚠️ FLUX anchor frame failed, falling back to T2V");
+                                                    None
+                                                }
+                                            }
+                                        };
+
+                                        // ── Phase 3: GPU Swap — Stop FLUX, generate video ──
                                         info!("🔄 GPU Swap: Stopping FLUX to free VRAM for video generation...");
                                         let _ = tokio::process::Command::new("pm2")
                                             .args(&["stop", "imagineos-draw"])
                                             .output().await;
-                                        // Wait for VRAM release
                                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                                        let width = request.payload.get("width").and_then(|w| w.as_u64()).unwrap_or(480);
-                                        let height = request.payload.get("height").and_then(|h| h.as_u64()).unwrap_or(320);
-                                        let num_frames = request.payload.get("num_frames").and_then(|n| n.as_u64()).unwrap_or(33);
 
                                         let client = reqwest::Client::builder()
                                             .timeout(std::time::Duration::from_secs(300))
                                             .build()
                                             .unwrap_or_default();
-                                        let canvas_payload = serde_json::json!({
+
+                                        let mut canvas_payload = serde_json::json!({
                                             "prompt": enhanced,
                                             "width": width,
                                             "height": height,
                                             "num_frames": num_frames,
                                         });
+
+                                        // If we have an anchor image, add it for I2V
+                                        if let Some(ref b64_img) = anchor_image_b64 {
+                                            canvas_payload["image_base64"] = serde_json::Value::String(b64_img.clone());
+                                            info!("📹 Sending anchor image to VACE I2V pipeline");
+                                        } else {
+                                            info!("📹 Using T2V pipeline (no anchor image)");
+                                        }
 
                                         match client.post("http://127.0.0.1:8091/v1/video/generate")
                                             .json(&canvas_payload)
