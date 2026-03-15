@@ -131,8 +131,20 @@ async def generate_video(req: VideoRequest):
             # Decode base64 image
             img_bytes = base64.b64decode(req.image_base64)
             anchor_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            anchor_image = anchor_image.resize((req.width, req.height))
-            print(f"   🖼️ Anchor image: {anchor_image.size}")
+            
+            # Preserve aspect ratio: fit within max 480px, round to 16px
+            orig_w, orig_h = anchor_image.size
+            max_dim = 480
+            scale = min(max_dim / orig_w, max_dim / orig_h)
+            new_w = int(orig_w * scale) // 16 * 16
+            new_h = int(orig_h * scale) // 16 * 16
+            new_w = max(new_w, 128)
+            new_h = max(new_h, 128)
+            anchor_image = anchor_image.resize((new_w, new_h))
+            # Override request dimensions to match
+            req.width = new_w
+            req.height = new_h
+            print(f"   🖼️ Anchor image: {orig_w}x{orig_h} → {new_w}x{new_h}")
 
             # Build video tensor: first frame = user image, rest = black
             black_frame = Image.new("RGB", (req.width, req.height), (0, 0, 0))
