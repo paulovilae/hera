@@ -2,15 +2,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{Level, info};
 
-use axum::{
-    routing::get,
-    Router,
-};
-use serde_json::json;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
 use hera_core::hardware::discover_docker_services;
-use hera_core::api::routes::{create_router, ApiState};
+use hera_core::ipc_server::{serve, IpcState};
 use hera_core::ai::native_engine::get_or_init_engine;
 
 #[tokio::main]
@@ -22,7 +15,7 @@ async fn main() {
     info!("🕯️ Candle Core Hardware Orchestrator - Initializing");
 
     // Load environment from .env.local FIRST — before any engine initialization
-    let env_path = std::path::Path::new("/home/paulo/Programs/apps/hera/.env.local");
+    let env_path = std::path::Path::new("./.env.local");
     if env_path.exists() {
         if let Ok(contents) = std::fs::read_to_string(env_path) {
             for line in contents.lines() {
@@ -40,21 +33,9 @@ async fn main() {
     info!("Active Local Containers: {}", services.len());
     
     // Initialize Flux Native engine lazily or synchronously
-    let flux_engine = if std::env::var("HERA_ENABLE_FLUX").unwrap_or_else(|_| "true".to_string()) == "true" {
-        info!("🎨 Initializing Native FLUX.1 Vision Engine...");
-        match hera_core::ai::engine_flux::FluxEngine::new() {
-            Ok(engine) => {
-                info!("🎨 Native FLUX.1 Vision Engine mounted to VRAM.");
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                tracing::error!("Failed to mount Native FLUX.1: {:?}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // By Sovereign Directive, Candle FLUX is deprecated due to VRAM inefficiency.
+    // Image Generation is now delegated to the native sd.cpp REST node in ipc_server.rs.
+    let flux_engine: Option<Arc<hera_core::ai::engine_flux::FluxEngine>> = None;
 
     // Initialize Parler-TTS Native engine
     let parler_engine = if std::env::var("HERA_ENABLE_PARLER").unwrap_or_else(|_| "true".to_string()) == "true" {
@@ -192,8 +173,8 @@ async fn main() {
         None
     };
 
-    // Mount the API Layer
-    let state = ApiState {
+    // Mount the Headless IPC Socket Layer
+    let state = IpcState {
         engine: Arc::new(context_engine),
         local_engine: Arc::clone(&router_engine),
         flux_engine,
@@ -203,12 +184,13 @@ async fn main() {
         micro_engine,
     };
     
-    let app = create_router(state);
-    let port = "3305";
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
-
-    info!("🚀 Core API Layer bound and listening on HTTP port {}", port);
+    // Default socket path for Vilaros OS & Imaginclaw
+    let socket_path = "/tmp/hera-core.sock";
     
-    // Block on Axum server natively
-    axum::serve(listener, app).await.unwrap();
+    info!("🚀 Core AI Layer booting in PURE SPEED mode.");
+    
+    // Block on IPC Listener natively
+    if let Err(e) = serve(socket_path, state).await {
+        tracing::error!("❌ Fatal IPC Server Error: {}", e);
+    }
 }

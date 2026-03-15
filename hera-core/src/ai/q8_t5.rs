@@ -474,7 +474,7 @@ pub struct T5EncoderModel {
 
 impl T5EncoderModel {
     pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let shared = Embedding::new_exact("token_embd.weight", cfg.vocab_size, &vb)?;
+        let shared = Embedding::new_exact("token_embd.weight", cfg.d_model, &vb)?;
         let shared = Arc::new(shared);
         let encoder = T5Stack::load(&vb, &shared, cfg)?;
         Ok(Self {

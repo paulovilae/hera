@@ -23,7 +23,11 @@ pub struct FluxEngine {
 
 impl FluxEngine {
     pub fn new() -> Result<Self> {
-        let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
+        let device_id = std::env::var("HERA_FLUX_DEVICE_ID")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse::<usize>()
+            .unwrap_or(1);
+        let device = candle_core::Device::new_cuda(device_id).unwrap_or(candle_core::Device::Cpu);
         // By default, Candle works best in bf16/f32 for FLUX
         let dtype = device.bf16_default_to_f32();
         

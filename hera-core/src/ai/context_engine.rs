@@ -46,6 +46,13 @@ impl ContextEngine {
         };
 
         if user_text.trim().is_empty() { return None; }
+        
+        // --- LATENCY OPTIMIZATION ---
+        // Bypassing the orchestrator pre-computation unless explicitly enabled via env var
+        // Saves 5-15 seconds per message for standard conversational queries.
+        if std::env::var("HERA_ENABLE_ORCHESTRATOR").unwrap_or_else(|_| "false".to_string()) != "true" {
+            return None;
+        }
         let system_prompt = r#"You are the Hera Context Orchestrator. The user asked a question. Decide if you need external context to answer it perfectly (e.g. current events, specific facts, recent data). If you need context, use the available tools explicitly by generating a JSON block within a <tool_call> tag. If you have enough info or the user's question doesn't require outside searching, reply EXACTLY with 'NO_CONTEXT_NEEDED'.
         
 AVAILABLE TOOLS:

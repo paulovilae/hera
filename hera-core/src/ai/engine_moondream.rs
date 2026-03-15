@@ -143,6 +143,7 @@ impl LLMEngine for MoondreamFfiEngine {
         let special_token = self.tokenizer.get_vocab(true).get("<|endoftext|>").copied().unwrap_or(50256);
 
         let mut model = self.model.lock().await;
+        model.text_model.clear_kv_cache();
 
         let image_tensor = if !base64_image.is_empty() {
             info!("👁️ [Vision] Parsing image...");
@@ -158,7 +159,7 @@ impl LLMEngine for MoondreamFfiEngine {
 
         info!("👁️ [Vision] Generating text...");
         let mut generated_text = String::new();
-        let mut logits_processor = candle_transformers::generation::LogitsProcessor::new(299792458, req.temperature.map(|t| t as f64).or(Some(0.7)), None);
+        let mut logits_processor = candle_transformers::generation::LogitsProcessor::new(299792458, req.temperature.map(|t| t as f64).filter(|&t| t > 0.0), None);
         
         let max_tokens = req.max_tokens.unwrap_or(250) as usize;
 
@@ -172,8 +173,16 @@ impl LLMEngine for MoondreamFfiEngine {
             model.text_model.forward(&initial_input).unwrap()
         };
 
+        let logits_sq = logits.squeeze(0).unwrap();
+        let logits_f32 = if logits_sq.rank() == 1 {
+            logits_sq
+        } else {
+            let seq_len = logits_sq.dim(0).unwrap();
+            logits_sq.get(seq_len - 1).unwrap()
+        }.to_dtype(DType::F32).unwrap();
+
         // Process the first generated token
-        let mut next_token = logits_processor.sample(&logits.squeeze(0).unwrap().to_dtype(DType::F32).unwrap()).unwrap();
+        let mut next_token = logits_processor.sample(&logits_f32).unwrap();
         token_ids.push(next_token);
 
         if let Ok(piece) = self.tokenizer.decode(&[next_token], true) {
@@ -190,7 +199,13 @@ impl LLMEngine for MoondreamFfiEngine {
             let input = Tensor::new(&[next_token], &self.device).unwrap().unsqueeze(0).unwrap();
             
             logits = model.text_model.forward(&input).unwrap();
-            let logits_f32 = logits.squeeze(0).unwrap().to_dtype(DType::F32).unwrap();
+            let logits_sq = logits.squeeze(0).unwrap();
+            let logits_f32 = if logits_sq.rank() == 1 {
+                logits_sq
+            } else {
+                let seq_len = logits_sq.dim(0).unwrap();
+                logits_sq.get(seq_len - 1).unwrap()
+            }.to_dtype(DType::F32).unwrap();
             
             next_token = logits_processor.sample(&logits_f32).unwrap();
             token_ids.push(next_token);

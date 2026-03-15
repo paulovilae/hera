@@ -5,7 +5,7 @@
 //! based on Universal RBAC capabilities.
 
 pub mod ai;
-pub mod api;
+pub mod ipc_server;
 pub mod hardware;
 pub mod semantic_object;
 pub mod sol;
