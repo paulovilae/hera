@@ -18,4 +18,7 @@ export CUDA_VISIBLE_DEVICES="${GPU_TARGET}"
     --clip_l /home/paulo/.cache/huggingface/hub/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/model.safetensors \
     --t5xxl /home/paulo/.cache/huggingface/hub/models--city96--t5-v1_1-xxl-encoder-gguf/snapshots/005a6ea51a7d0b84d677b3e633bb52a8c85a83d9/t5-v1_1-xxl-encoder-Q8_0.gguf \
     --listen-port "${LISTEN_PORT}" \
+    --steps 4 \
+    --cfg-scale 1.0 \
+    --lora-model-dir /home/paulo/models/image-stack/loras/ \
     --fa

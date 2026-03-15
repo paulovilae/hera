@@ -77,24 +77,13 @@ async fn main() {
     // Mount Sovereign Local LLM Engine
     let enable_llm = std::env::var("HERA_ENABLE_LLM").unwrap_or_else(|_| "true".to_string()) == "true";
     let local_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = if enable_llm {
-        info!("🧠 Initializing Sovereign Local LLM Engine (Qwen GGUF)...");
-        match hera_core::ai::llama_ffi_engine::LlamaFfiEngine::new(llama_backend.clone(), "/data/models/llm-stack/Qwen3.5-4B-Abliterated-Claude-4.6-Opus-Reasoning-Distilled.Q4_K_M.gguf") {
-            Ok(engine) => {
-                info!("🧠 Sovereign FFI LLM Engine mounted!");
-                Arc::new(engine)
-            }
-            Err(e) => {
-                tracing::warn!("⚠️ Local FFI LLM Engine failed to mount: {}. Using cloud-only mode.", e);
-                struct FallbackEngine;
-                #[async_trait::async_trait]
-                impl hera_core::ai::LLMEngine for FallbackEngine {
-                    async fn generate_content(&self, _req: hera_core::ai::ChatRequest) -> Result<hera_core::ai::ChatResponse, hera_core::ai::InferenceError> {
-                        Err(hera_core::ai::InferenceError::ExecutionFailed("No local LLM model loaded. Set HERA_CANDLE_MODEL_ID to a valid GGUF path.".to_string()))
-                    }
-                }
-                Arc::new(FallbackEngine) as Arc<dyn hera_core::ai::LLMEngine + Send + Sync>
-            }
-        }
+        info!("🧠 Initializing Sovereign Local LLM Engine (via Local Omni Node)...");
+        let local_omni = hera_core::ai::openai_compat::OpenAICompatEngine::new(
+            "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+            "".to_string(),
+        );
+        info!("🧠 Sovereign Native Omni Engine mounted!");
+        Arc::new(local_omni)
     } else {
         info!("🧠 Sovereign Local LLM disabled via environment flag (HERA_ENABLE_LLM).");
         struct DisabledEngine;
@@ -136,16 +125,13 @@ async fn main() {
     info!("🧠 Context Orchestrator mounted via local Sovereign Router (Qwen FFI → cloud fallback)");
     let orchestrator_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = Arc::clone(&router_engine);
 
-    // Mount Native Vision Engine (Moondream)
-    let vision_engine: Option<Arc<dyn hera_core::ai::LLMEngine + Send + Sync>> = match hera_core::ai::engine_moondream::MoondreamFfiEngine::new().await {
-        Ok(engine) => {
-            info!("👁️ Native Vision Engine (Moondream) mounted to VRAM.");
-            Some(Arc::new(engine))
-        }
-        Err(e) => {
-            tracing::error!("Failed to mount Native Vision Engine: {:?}", e);
-            None
-        }
+    // Mount Native Vision Engine (Unified Omni)
+    let vision_engine: Option<Arc<dyn hera_core::ai::LLMEngine + Send + Sync>> = {
+        info!("👁️ Native Vision Engine (Unified Local Omni) mounted via local network.");
+        Some(Arc::new(hera_core::ai::openai_compat::OpenAICompatEngine::new(
+            "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+            "".to_string(),
+        )))
     };
 
     let context_engine = hera_core::ai::context_engine::ContextEngine::new(
@@ -154,23 +140,13 @@ async fn main() {
         vision_engine.clone(),
     );
 
-    // Mount Micro-LLM Uncensored Fallback Engine
-    let micro_engine_path = "/data/models/llm-stack/Qwen3.5-4B-Abliterated-Claude-4.6-Opus-Reasoning-Distilled.Q4_K_M.gguf";
-    let micro_engine: Option<Arc<dyn hera_core::ai::LLMEngine + Send + Sync>> = if std::path::Path::new(micro_engine_path).exists() {
-        info!("🧠 Initializing Micro-LLM Uncensored Engine (Qwen 1.5B Abliterated)...");
-        match hera_core::ai::llama_ffi_engine::LlamaFfiEngine::new(llama_backend.clone(), micro_engine_path) {
-            Ok(engine) => {
-                info!("🧠 Micro-LLM Engine mounted!");
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                tracing::warn!("⚠️ Micro-LLM failed to mount: {}", e);
-                None
-            }
-        }
-    } else {
-        tracing::warn!("⚠️ Micro-LLM model NOT found. NSFW bypass will use raw prompt directly.");
-        None
+    // Mount Micro-LLM Uncensored Fallback Engine (Unified Omni)
+    let micro_engine: Option<Arc<dyn hera_core::ai::LLMEngine + Send + Sync>> = {
+        info!("🧠 Initializing Micro-LLM Engine (Unified Local Omni)...");
+        Some(Arc::new(hera_core::ai::openai_compat::OpenAICompatEngine::new(
+            "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+            "".to_string(),
+        )))
     };
 
     // Mount the Headless IPC Socket Layer

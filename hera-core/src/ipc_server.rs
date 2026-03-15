@@ -197,6 +197,98 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                             result_text = "Hera Vision Engine (Moondream) is not loaded or unavailable.".to_string();
                                         }
                                     }
+                                } else if request.action == "generate_video" {
+                                    if let Some(prompt) = request.payload.get("prompt").and_then(|p| p.as_str()) {
+                                        // ── Phase 1: Brain (Qwen3-VL) — Enhance the prompt ──
+                                        let enhance_prompt = format!(
+                                            "You are a video director AI. Given this brief idea, write a single detailed paragraph describing the exact visual scene for a text-to-video model. Include camera angle, lighting, motion, colors, and atmosphere. Only output the scene description, nothing else.\n\nIdea: {}",
+                                            prompt
+                                        );
+                                        let chat_req = ChatRequest {
+                                            model: "hera-local-model".to_string(),
+                                            vision_model: None, tts_model: None, stt_model: None,
+                                            messages: vec![ChatMessage {
+                                                role: "user".to_string(),
+                                                content: MessageContent::Text(enhance_prompt),
+                                            }],
+                                            temperature: Some(0.8), max_tokens: Some(300),
+                                            top_p: None, top_k: None, presence_penalty: None,
+                                            frequency_penalty: None, repeat_penalty: None,
+                                            seed: None, stop: None, endpoint: None,
+                                            api_key: None, provider: None, stream: None,
+                                            nsfw: None, tools: None, tool_choice: None,
+                                            reasoning_effort: None,
+                                        };
+
+                                        let enhanced = match state.engine.generate_content(chat_req).await {
+                                            Ok(resp) => {
+                                                resp.choices.first()
+                                                    .and_then(|c| c.message.content.clone())
+                                                    .unwrap_or_else(|| prompt.to_string())
+                                            }
+                                            Err(e) => {
+                                                error!("Brain prompt enhancement failed: {}, using raw prompt", e);
+                                                prompt.to_string()
+                                            }
+                                        };
+                                        info!("🧠 Enhanced prompt: {}", &enhanced[..enhanced.len().min(120)]);
+
+                                        // ── Phase 2: Canvas (Wan2.1) — Generate video ──
+                                        // GPU Swap: Stop FLUX to free 12GB VRAM on GPU 1 for Wan2.1
+                                        info!("🔄 GPU Swap: Stopping FLUX to free VRAM for video generation...");
+                                        let _ = tokio::process::Command::new("pm2")
+                                            .args(&["stop", "imagineos-draw"])
+                                            .output().await;
+                                        // Wait for VRAM release
+                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                                        let width = request.payload.get("width").and_then(|w| w.as_u64()).unwrap_or(480);
+                                        let height = request.payload.get("height").and_then(|h| h.as_u64()).unwrap_or(320);
+                                        let num_frames = request.payload.get("num_frames").and_then(|n| n.as_u64()).unwrap_or(33);
+
+                                        let client = reqwest::Client::builder()
+                                            .timeout(std::time::Duration::from_secs(300))
+                                            .build()
+                                            .unwrap_or_default();
+                                        let canvas_payload = serde_json::json!({
+                                            "prompt": enhanced,
+                                            "width": width,
+                                            "height": height,
+                                            "num_frames": num_frames,
+                                        });
+
+                                        match client.post("http://127.0.0.1:8091/v1/video/generate")
+                                            .json(&canvas_payload)
+                                            .send()
+                                            .await
+                                        {
+                                            Ok(resp) => {
+                                                if resp.status().is_success() {
+                                                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                                                        if let Some(path) = json.get("path").and_then(|p| p.as_str()) {
+                                                            result_text = path.to_string();
+                                                        } else {
+                                                            result_text = "Error: Canvas returned no video path".to_string();
+                                                        }
+                                                    } else {
+                                                        result_text = "Error: Failed to parse Canvas response".to_string();
+                                                    }
+                                                } else {
+                                                    result_text = format!("Error: Canvas returned status {}", resp.status());
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Canvas connection error: {}", e);
+                                                result_text = format!("Error: Canvas video engine unavailable: {}", e);
+                                            }
+                                        }
+
+                                        // GPU Swap: Restart FLUX after video generation
+                                        info!("🔄 GPU Swap: Restarting FLUX after video generation...");
+                                        let _ = tokio::process::Command::new("pm2")
+                                            .args(&["start", "imagineos-draw"])
+                                            .output().await;
+                                    }
                                 } else if request.action == "transcribe_audio" {
                                     if let Some(b64) = request.payload.get("base64_audio").and_then(|p| p.as_str()) {
                                         if let Some(whisper) = &state.whisper_engine {
