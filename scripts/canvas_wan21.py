@@ -138,10 +138,11 @@ async def generate_video(req: VideoRequest):
             black_frame = Image.new("RGB", (req.width, req.height), (0, 0, 0))
             video_frames = [anchor_image] + [black_frame] * (req.num_frames - 1)
 
-            # Build mask: first frame = white (keep), rest = black (generate)
-            white_frame = Image.new("L", (req.width, req.height), 255)
-            black_mask = Image.new("L", (req.width, req.height), 0)
-            mask_frames = [white_frame] + [black_mask] * (req.num_frames - 1)
+            # Build mask: VACE convention — 0=keep, 255=generate
+            # First frame = black (keep user image), rest = white (generate motion)
+            keep_mask = Image.new("L", (req.width, req.height), 0)      # keep
+            gen_mask = Image.new("L", (req.width, req.height), 255)     # generate
+            mask_frames = [keep_mask] + [gen_mask] * (req.num_frames - 1)
 
             output = active_pipe(
                 prompt=req.prompt,
