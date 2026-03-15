@@ -134,9 +134,19 @@ async def generate_video(req: VideoRequest):
             anchor_image = anchor_image.resize((req.width, req.height))
             print(f"   🖼️ Anchor image: {anchor_image.size}")
 
+            # Build video tensor: first frame = user image, rest = black
+            black_frame = Image.new("RGB", (req.width, req.height), (0, 0, 0))
+            video_frames = [anchor_image] + [black_frame] * (req.num_frames - 1)
+
+            # Build mask: first frame = white (keep), rest = black (generate)
+            white_frame = Image.new("L", (req.width, req.height), 255)
+            black_mask = Image.new("L", (req.width, req.height), 0)
+            mask_frames = [white_frame] + [black_mask] * (req.num_frames - 1)
+
             output = active_pipe(
                 prompt=req.prompt,
-                reference_images=[anchor_image],
+                video=video_frames,
+                mask=mask_frames,
                 height=req.height,
                 width=req.width,
                 num_frames=req.num_frames,
