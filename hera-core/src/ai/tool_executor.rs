@@ -128,6 +128,27 @@ pub fn hera_tool_schemas(permissions: &[String]) -> String {
                     "required": ["new_soul_content"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "memento_query",
+                "description": "Query a connected app's database via Memento to retrieve REAL data. Use this when the user asks about providers, services, clients, pricing, or any business data. Available apps: movilo (healthcare providers). ALWAYS use this instead of making up information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "app": {
+                            "type": "string",
+                            "description": "The app slug to query, e.g. 'movilo'"
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "A SQL SELECT query to run against the app's database. Available tables for movilo: movilo_providers (company_name, contact_name, provider_type, status, city), movilo_provider_services (name, original_price, movilo_price, discount_percentage, category), movilo_provider_locations (name, city, address, modality, schedule). ONLY SELECT queries allowed."
+                        }
+                    },
+                    "required": ["app", "query"]
+                }
+            }
         }
     ]);
 
@@ -340,6 +361,7 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
         "hera_video" => execute_video(call).await,
         "hera_read_file" => execute_read_file(call).await,
         "hera_update_soul" => execute_update_soul(call).await,
+        "memento_query" => execute_memento_query(call).await,
         _ => ToolResult {
             name: call.name.clone(),
             success: false,
@@ -523,6 +545,100 @@ async fn execute_update_soul(call: &ToolCall) -> ToolResult {
                 name: call.name.clone(),
                 success: false,
                 output: format!("Failed to update SOUL.md. File system error: {:?}", e),
+            }
+        }
+    }
+}
+
+async fn execute_memento_query(call: &ToolCall) -> ToolResult {
+    let app = call.arguments.get("app")
+        .and_then(|a| a.as_str())
+        .unwrap_or("movilo");
+    let query = call.arguments.get("query")
+        .and_then(|q| q.as_str())
+        .unwrap_or("");
+
+    if query.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing 'query' argument".to_string(),
+        };
+    }
+
+    info!("🧠 [Memento] Querying app '{}' with: {}", app, query);
+
+    // Connect to Memento via UDS
+    match tokio::net::UnixStream::connect("/tmp/memento.sock").await {
+        Ok(mut stream) => {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let msg = serde_json::json!({
+                "action": "query_app",
+                "payload": {
+                    "app": app,
+                    "query": query,
+                    "limit": 20
+                }
+            });
+
+            if let Err(e) = stream.write_all(msg.to_string().as_bytes()).await {
+                return ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("Failed to send to Memento: {}", e),
+                };
+            }
+
+            let mut buffer = vec![0u8; 65536];
+            match stream.read(&mut buffer).await {
+                Ok(n) if n > 0 => {
+                    let response_str = String::from_utf8_lossy(&buffer[..n]);
+                    match serde_json::from_str::<serde_json::Value>(&response_str) {
+                        Ok(res) => {
+                            if res.get("status").and_then(|s| s.as_str()) == Some("success") {
+                                let count = res.get("count").and_then(|c| c.as_i64()).unwrap_or(0);
+                                let rows = res.get("rows").cloned().unwrap_or(serde_json::json!([]));
+                                
+                                // Format results as readable text for the LLM
+                                let formatted = serde_json::to_string_pretty(&rows).unwrap_or_default();
+                                info!("🧠 [Memento] Got {} rows from '{}'", count, app);
+                                ToolResult {
+                                    name: call.name.clone(),
+                                    success: true,
+                                    output: format!("Database query returned {} results from '{}':\n{}", count, app, formatted),
+                                }
+                            } else {
+                                let error = res.get("error")
+                                    .and_then(|e| e.as_str())
+                                    .unwrap_or("Unknown error");
+                                ToolResult {
+                                    name: call.name.clone(),
+                                    success: false,
+                                    output: format!("Memento error: {}", error),
+                                }
+                            }
+                        }
+                        Err(e) => ToolResult {
+                            name: call.name.clone(),
+                            success: false,
+                            output: format!("Failed to parse Memento response: {}", e),
+                        },
+                    }
+                }
+                _ => ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: "No response from Memento".to_string(),
+                },
+            }
+        }
+        Err(e) => {
+            tracing::error!("🧠 [Memento] Failed to connect to /tmp/memento.sock: {:?}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Memento is not running. Error: {}", e),
             }
         }
     }
