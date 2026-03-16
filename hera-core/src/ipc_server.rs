@@ -90,14 +90,25 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                     }
                                     let mut handled_by_tool = false;
                                     
+                                    let permissions: Vec<String> = payload_clone.get("permissions")
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<String>>())
+                                        .unwrap_or_else(|| vec!["all".to_string()]);
+                                        
+                                    tracing::info!("🛡️ [Hera IPC] Parsed permissions: {:?}", permissions);
+                                    
                                     // 1. Fast-path intent detection
                                     if !prompt.is_empty() {
                                         if let Some(tool_call) = crate::ai::tool_executor::detect_intent_from_user_message(&prompt, assistant_last.as_deref()) {
-                                            tracing::info!("🚀 [Hera IPC] Fast-path tool intent detected: {}", tool_call.name);
-                                            let tool_result = crate::ai::tool_executor::execute_tool(&tool_call).await;
-                                            result_text = tool_result.output;
-                                            tool_calls = Some(serde_json::json!([tool_call]));
-                                            handled_by_tool = true;
+                                            if permissions.contains(&"all".to_string()) || permissions.contains(&tool_call.name) {
+                                                tracing::info!("🚀 [Hera IPC] Fast-path tool intent detected: {}", tool_call.name);
+                                                let tool_result = crate::ai::tool_executor::execute_tool(&tool_call).await;
+                                                result_text = tool_result.output;
+                                                tool_calls = Some(serde_json::json!([tool_call]));
+                                                handled_by_tool = true;
+                                            } else {
+                                                tracing::info!("⚠️ [Hera IPC] Fast-path tool intent {} denied by permissions", tool_call.name);
+                                            }
                                         }
                                     }
                                     
@@ -111,10 +122,6 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                         
                                         let prompt = payload_clone.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                         let persona_path = payload_clone.get("persona_path").and_then(|v| v.as_str()).unwrap_or("/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md").to_string();
-                                        let permissions: Vec<String> = payload_clone.get("permissions")
-                                            .and_then(|v| v.as_array())
-                                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<String>>())
-                                            .unwrap_or_else(|| vec!["all".to_string()]);
                                             
                                         let mut chat_req: Option<ChatRequest> = serde_json::from_value(payload_clone).ok();
                                         
@@ -208,13 +215,18 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                                 let mut executed_calls = Vec::new();
                                                                 
                                                                 for call in parsed_calls {
-                                                                    let tool_res = crate::ai::tool_executor::execute_tool(&call).await;
-                                                                    execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
-                                                                    
-                                                                    executed_calls.push(serde_json::json!({
-                                                                        "name": call.name,
-                                                                        "arguments": call.arguments
-                                                                    }));
+                                                                    if permissions.contains(&"all".to_string()) || permissions.contains(&call.name) {
+                                                                        let tool_res = crate::ai::tool_executor::execute_tool(&call).await;
+                                                                        execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
+                                                                        
+                                                                        executed_calls.push(serde_json::json!({
+                                                                            "name": call.name,
+                                                                            "arguments": call.arguments
+                                                                        }));
+                                                                    } else {
+                                                                        tracing::warn!("⚠️ [Hera IPC] LLM hallucinated tool {} which is denied by permissions", call.name);
+                                                                        execution_outputs.push_str(&format!("\n\nError: Not permitted to use tool '{}'", call.name));
+                                                                    }
                                                                 }
                                                                 
                                                                 // Append execution output to the response text so the user sees it

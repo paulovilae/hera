@@ -4,6 +4,7 @@
 //! from Qwen output, and dispatches tool execution to existing Hera methods.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::info;
 
 /// Tool call parsed from Qwen's output
@@ -25,132 +26,28 @@ pub struct ToolResult {
 /// Uses the exact JSON schema structure that Qwen3 was trained on.
 /// Reference: https://qwen3.org/docs/guides/tools
 pub fn hera_tool_schemas(permissions: &[String]) -> String {
-    // Hermes-style: tools described as JSON function schemas
-    let tools = serde_json::json!([
-        {
-            "type": "function",
-            "function": {
-                "name": "hera_draw",
-                "description": "Generate an image locally using the GPU. MUST use this whenever the user asks for a picture, photo, drawing, OR follows up on a previous image with modifications. You are a multimodal AI (Claw Node) and you HAVE this capability.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "A detailed description of the image to generate. Be specific about subject, style, colors, mood, and composition."
-                        }
-                    },
-                    "required": ["prompt"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "hera_search",
-                "description": "Search the web for current information. Use this when the user asks about recent events, news, facts you are unsure about, or anything requiring up-to-date information.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "hera_speak",
-                "description": "Read text aloud using Text-to-Speech (TTS). Use this to generate audio files of your response when requested.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "The text to be spoken."
-                        }
-                    },
-                    "required": ["text"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "hera_video",
-                "description": "Generate a short video. You have multimodal capabilities as a Claw Node. Use this when the user asks for a video, animation, or moving picture.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "A detailed description of the video to generate, including motion, subject, and style."
-                        }
-                    },
-                    "required": ["prompt"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "hera_read_file",
-                "description": "Read the contents of a local file on the system. Use this when the user asks to read, view, or check a file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "The absolute or relative path to the file to read."
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "hera_update_soul",
-                "description": "Update, rewrite, or append to your own core system prompt/persona file (SOUL). Use this whenever the user asks you to permanently remember a trait about yourself, act a certain way from now on, or modify your core instructions.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "new_soul_content": {
-                            "type": "string",
-                            "description": "The complete new markdown text for your SOUL file. This will completely overwrite the existing file, so include all necessary context and instructions."
-                        }
-                    },
-                    "required": ["new_soul_content"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "memento_query",
-                "description": "Query a connected app's database via Memento to retrieve REAL data. Use this when the user asks about providers, services, clients, pricing, or any business data. Available apps: movilo (healthcare providers). ALWAYS use this instead of making up information.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "app": {
-                            "type": "string",
-                            "description": "The app slug to query, e.g. 'movilo'"
-                        },
-                        "query": {
-                            "type": "string",
-                            "description": "A SQL SELECT query to run against the app's database. Available tables for movilo: movilo_providers (company_name, contact_name, provider_type, status, city), movilo_provider_services (name, original_price, movilo_price, discount_percentage, category), movilo_provider_locations (name, city, address, modality, schedule). ONLY SELECT queries allowed."
-                        }
-                    },
-                    "required": ["app", "query"]
+    let mut tools_vec: Vec<Value> = Vec::new();
+    let techne_dir = "/home/paulo/Programs/apps/OS/Tools";
+
+
+    if let Ok(entries) = std::fs::read_dir(techne_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(tool) = serde_json::from_str::<Value>(&content) {
+                        tools_vec.push(tool);
+                    } else {
+                        eprintln!("Warning: Failed to parse techne tool JSON at {:?}", path);
+                    }
                 }
             }
         }
-    ]);
+    } else {
+        eprintln!("Warning: Techne directory not found at {}", techne_dir);
+    }
+
+    let tools = Value::Array(tools_vec);
 
     let has_all = permissions.contains(&"all".to_string());
     
@@ -359,9 +256,20 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
         "hera_search" => execute_search(call).await,
         "hera_speak" => execute_speak(call).await,
         "hera_video" => execute_video(call).await,
-        "hera_read_file" => execute_read_file(call).await,
-        "hera_update_soul" => execute_update_soul(call).await,
+        "hera_read_file" | "read_file" => execute_read_file(call).await,
+        "hera_update_soul" | "update_soul" => execute_update_soul(call).await,
         "memento_query" => execute_memento_query(call).await,
+        "api_request" => execute_api_request(call).await,
+        "git_manager" => execute_git_manager(call).await,
+        "memento_vector_search" => execute_memento_vector_search(call).await,
+        "ask_user" => execute_ask_user(call).await,
+        "get_system_time" => execute_get_system_time(call).await,
+        "run_code" => execute_run_code(call).await,
+        "web_scraper" => execute_web_scraper(call).await,
+        "write_file" => execute_write_file(call).await,
+        "generate_qr_code" => execute_generate_qr_code(call).await,
+        "get_map_route" => execute_get_map_route(call).await,
+        "execute_workflow" => execute_workflow(call).await,
         _ => ToolResult {
             name: call.name.clone(),
             success: false,
@@ -639,6 +547,259 @@ async fn execute_memento_query(call: &ToolCall) -> ToolResult {
                 name: call.name.clone(),
                 success: false,
                 output: format!("Memento is not running. Error: {}", e),
+            }
+        }
+    }
+}
+
+async fn execute_api_request(call: &ToolCall) -> ToolResult {
+    let method = call.arguments.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
+    let url = call.arguments.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    let headers_str = call.arguments.get("headers").and_then(|h| h.as_str()).unwrap_or("{}");
+    let body_str = call.arguments.get("body").and_then(|b| b.as_str()).unwrap_or("");
+
+    if url.is_empty() { return ToolResult { name: call.name.clone(), success: false, output: "Missing URL".into() }; }
+
+    let client = reqwest::Client::new();
+    let mut req = match method.to_uppercase().as_str() {
+        "POST" => client.post(url),
+        "PUT" => client.put(url),
+        "DELETE" => client.delete(url),
+        _ => client.get(url),
+    };
+
+    if let Ok(headers) = serde_json::from_str::<serde_json::Value>(headers_str) {
+        if let Some(obj) = headers.as_object() {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+    }
+
+    if !body_str.is_empty() {
+        req = req.body(body_str.to_string());
+    }
+
+    match req.send().await {
+        Ok(res) => {
+            let status = res.status();
+            match res.text().await {
+                Ok(text) => ToolResult { name: call.name.clone(), success: status.is_success(), output: format!("Status: {}\nBody: {}", status, text) },
+                Err(e) => ToolResult { name: call.name.clone(), success: false, output: format!("Failed to read response body: {}", e) },
+            }
+        }
+        Err(e) => ToolResult { name: call.name.clone(), success: false, output: format!("Request failed: {}", e) },
+    }
+}
+
+async fn execute_git_manager(call: &ToolCall) -> ToolResult {
+    let command = call.arguments.get("command").and_then(|c| c.as_str()).unwrap_or("");
+    let repo_path = call.arguments.get("repo_path").and_then(|p| p.as_str()).unwrap_or("");
+
+    if repo_path.is_empty() || command.is_empty() {
+         return ToolResult { name: call.name.clone(), success: false, output: "Missing command or repo_path".into() };
+    }
+
+    let args: Vec<&str> = command.split_whitespace().collect();
+    match std::process::Command::new("git").current_dir(repo_path).args(&args).output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let success = output.status.success();
+            let res = if success { format!("{}", stdout) } else { format!("Error: {}\n{}", stderr, stdout) };
+            ToolResult { name: call.name.clone(), success, output: res }
+        }
+        Err(e) => ToolResult { name: call.name.clone(), success: false, output: format!("Failed to run git: {}", e) }
+    }
+}
+
+async fn execute_memento_vector_search(call: &ToolCall) -> ToolResult {
+    let query = call.arguments.get("query").and_then(|q| q.as_str()).unwrap_or("");
+    let limit = call.arguments.get("limit").and_then(|l| l.as_u64()).unwrap_or(3);
+
+    // Like memento_query, but action "vector_search"
+    match tokio::net::UnixStream::connect("/tmp/memento.sock").await {
+        Ok(mut stream) => {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let msg = serde_json::json!({
+                "action": "vector_search",
+                "payload": {
+                    "query": query,
+                    "limit": limit
+                }
+            });
+            if let Err(_) = stream.write_all(msg.to_string().as_bytes()).await {
+                return ToolResult { name: call.name.clone(), success: false, output: "IPC Write Failed".into() };
+            }
+            let mut buffer = vec![0u8; 65536];
+            match stream.read(&mut buffer).await {
+                Ok(n) if n > 0 => {
+                    let response_str = String::from_utf8_lossy(&buffer[..n]);
+                    ToolResult { name: call.name.clone(), success: true, output: response_str.to_string() }
+                }
+                _ => ToolResult { name: call.name.clone(), success: false, output: "No response".into() },
+            }
+        }
+        Err(e) => ToolResult { name: call.name.clone(), success: false, output: format!("Memento socket error: {}", e) },
+    }
+}
+
+async fn execute_ask_user(call: &ToolCall) -> ToolResult {
+    let question = call.arguments.get("question").and_then(|q| q.as_str()).unwrap_or("Needs human input.");
+    tracing::info!("⏸️ [Hera] Pausing flow to ask user: {}", question);
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: format!("[PAUSED_FOR_USER] Question: {}", question),
+    }
+}
+
+async fn execute_get_system_time(call: &ToolCall) -> ToolResult {
+    match std::process::Command::new("date").output() {
+        Ok(out) => ToolResult { name: call.name.clone(), success: true, output: String::from_utf8_lossy(&out.stdout).to_string() },
+        Err(e) => ToolResult { name: call.name.clone(), success: false, output: e.to_string() }
+    }
+}
+
+async fn execute_run_code(call: &ToolCall) -> ToolResult {
+    let lang = call.arguments.get("language").and_then(|l| l.as_str()).unwrap_or("python");
+    let code = call.arguments.get("code").and_then(|c| c.as_str()).unwrap_or("");
+    
+    let (ext, cmd) = if lang.to_lowercase() == "python" {
+        ("py", "python3")
+    } else {
+        return ToolResult { name: call.name.clone(), success: false, output: "Only python is supported in the local sandbox currently".into() };
+    };
+
+    let p = format!("/tmp/hera_sandbox.{}", ext);
+    if let Err(e) = std::fs::write(&p, code) { return ToolResult { name: call.name.clone(), success: false, output: format!("Failed to write: {}", e) }; }
+
+    match std::process::Command::new(cmd).arg(&p).output() {
+        Ok(out) => {
+            let out_str = String::from_utf8_lossy(&out.stdout);
+            let err_str = String::from_utf8_lossy(&out.stderr);
+            let success = out.status.success();
+            let res = if success { out_str.into() } else { format!("{}\n{}", err_str, out_str) };
+            ToolResult { name: call.name.clone(), success, output: res }
+        }
+        Err(e) => ToolResult { name: call.name.clone(), success: false, output: e.to_string() }
+    }
+}
+
+async fn execute_write_file(call: &ToolCall) -> ToolResult {
+    let path = call.arguments.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    let content = call.arguments.get("content").and_then(|c| c.as_str()).unwrap_or("");
+
+    if path.is_empty() { return ToolResult { name: call.name.clone(), success: false, output: "Missing path".into() }; }
+
+    match std::fs::write(path, content) {
+        Ok(_) => ToolResult { name: call.name.clone(), success: true, output: format!("Successfully wrote to {}", path) },
+        Err(e) => ToolResult { name: call.name.clone(), success: false, output: format!("Failed to write file: {}", e) },
+    }
+}
+
+async fn execute_web_scraper(call: &ToolCall) -> ToolResult {
+    let url = call.arguments.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    if url.is_empty() { return ToolResult { name: call.name.clone(), success: false, output: "Missing url".into() }; }
+
+    match reqwest::get(url).await {
+        Ok(res) => {
+            match res.text().await {
+                Ok(text) => {
+                    let max_len = 16000;
+                    let trunc = if text.len() > max_len { format!("{}... (truncated)", &text[..max_len]) } else { text };
+                    ToolResult { name: call.name.clone(), success: true, output: trunc }
+                }
+                Err(e) => ToolResult { name: call.name.clone(), success: false, output: e.to_string() }
+            }
+        }
+        Err(e) => ToolResult { name: call.name.clone(), success: false, output: e.to_string() }
+    }
+}
+
+async fn execute_generate_qr_code(call: &ToolCall) -> ToolResult {
+    let content = call.arguments.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    if content.is_empty() { return ToolResult { name: call.name.clone(), success: false, output: "Missing content".into() }; }
+
+    // Using a quick external API for now, could be replaced with a local Rust crate later
+    let url = format!("https://api.qrserver.com/v1/create-qr-code/?size=500x500&data={}", urlencoding::encode(content));
+    info!("🔲 [Hera] Generated QR Code URL: {}", url);
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: format!("QR Code generated successfully. Use this exact line in your reply to deliver it inline:\nMEDIA: {}", url)
+    }
+}
+
+async fn execute_get_map_route(call: &ToolCall) -> ToolResult {
+    let dest = call.arguments.get("destination").and_then(|d| d.as_str()).unwrap_or("");
+    let orig = call.arguments.get("origin").and_then(|o| o.as_str()).unwrap_or("");
+    
+    if dest.is_empty() { return ToolResult { name: call.name.clone(), success: false, output: "Missing destination".into() }; }
+
+    let url = if orig.is_empty() {
+        format!("https://www.google.com/maps/search/?api=1&query={}", urlencoding::encode(dest))
+    } else {
+        format!("https://www.google.com/maps/dir/?api=1&origin={}&destination={}", urlencoding::encode(orig), urlencoding::encode(dest))
+    };
+
+    info!("🗺️ [Hera] Generated Google Maps URL: {}", url);
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: format!("Maps link generated successfully:\n{}", url)
+    }
+}
+
+async fn execute_workflow(call: &ToolCall) -> ToolResult {
+    let app = call.arguments.get("app").and_then(|a| a.as_str()).unwrap_or_default();
+    let workflow = call.arguments.get("workflow").and_then(|w| w.as_str()).unwrap_or_default();
+    let default_payload = serde_json::json!({});
+    let payload = call.arguments.get("payload").unwrap_or(&default_payload);
+
+    if app.is_empty() || workflow.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing required 'app' or 'workflow' parameters.".to_string(),
+        };
+    }
+
+    let url = format!("http://127.0.0.1:3006/execute/{}/{}", app, workflow);
+    info!("🚀 [Hera] Proxying Workflow Execution to Argus: {}", url);
+
+    let client = reqwest::Client::new();
+    match client.post(&url).json(&payload).send().await {
+        Ok(res) => {
+            if res.status().is_success() {
+                if let Ok(json) = res.json::<serde_json::Value>().await {
+                    ToolResult {
+                        name: call.name.clone(),
+                        success: true,
+                        output: serde_json::to_string_pretty(&json).unwrap_or_default()
+                    }
+                } else {
+                    ToolResult {
+                        name: call.name.clone(),
+                        success: true,
+                        output: "Workflow executed but failed to parse Argus JSON response".to_string()
+                    }
+                }
+            } else {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("Argus returned status code {}", res.status())
+                }
+            }
+        },
+        Err(e) => {
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to reach Argus at {}: {}", url, e)
             }
         }
     }

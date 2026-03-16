@@ -165,6 +165,11 @@ async fn main() {
     
     info!("🚀 Core AI Layer booting in PURE SPEED mode.");
     
+    // Spawn REST API server in the background
+    tokio::spawn(async move {
+        hera_core::rest_api::serve_rest_api(3002).await;
+    });
+
     // Block on IPC Listener natively
     if let Err(e) = serve(socket_path, state).await {
         tracing::error!("❌ Fatal IPC Server Error: {}", e);
