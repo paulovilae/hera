@@ -200,7 +200,7 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                             }
                                         }
                                         
-                                        if let Some(req) = chat_req {
+                                        if let Some(req) = chat_req.clone() {
                                             match state.engine.generate_content(req).await {
                                                 Ok(resp) => {
                                                     if let Some(choice) = resp.choices.first() {
@@ -214,7 +214,7 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                                 let mut execution_outputs = String::new();
                                                                 let mut executed_calls = Vec::new();
                                                                 
-                                                                for call in parsed_calls {
+                                                                for call in &parsed_calls {
                                                                     if permissions.contains(&"all".to_string()) || permissions.contains(&call.name) {
                                                                         let tool_res = crate::ai::tool_executor::execute_tool(&call).await;
                                                                         execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
@@ -229,8 +229,38 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                                     }
                                                                 }
                                                                 
-                                                                // Append execution output to the response text so the user sees it
-                                                                result_text.push_str(&execution_outputs);
+                                                                let has_media_call = parsed_calls.iter().any(|c| c.name == "hera_draw" || c.name == "hera_video" || c.name == "generate_qr_code");
+
+                                                                if !has_media_call {
+                                                                    if let Some(mut req2) = chat_req.clone() {
+                                                                        req2.messages.push(ChatMessage {
+                                                                            role: "assistant".to_string(),
+                                                                            content: MessageContent::Text(result_text.clone()),
+                                                                        });
+                                                                        req2.messages.push(ChatMessage {
+                                                                            role: "user".to_string(),
+                                                                            content: MessageContent::Text(format!("Tool Execution Results: {}\n\nPlease provide a friendly, conversational, and concise response to the user based on these results. Do not output raw JSON or mention the database tables directly. Avoid outputting any tool call tags.", execution_outputs)),
+                                                                        });
+                                                                        tracing::info!("🔄 [Hera IPC] Initiating second-pass generation to format Tool Results...");
+                                                                        match state.engine.generate_content(req2).await {
+                                                                            Ok(resp2) => {
+                                                                                if let Some(ch) = resp2.choices.first() {
+                                                                                    if let Some(c) = &ch.message.content {
+                                                                                        result_text = c.clone();
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            Err(e) => {
+                                                                                tracing::error!("Second pass inference failed: {}", e);
+                                                                                result_text.push_str(&format!("\n\n[Error forming final response: {}]\n{}", e, execution_outputs));
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    // Append execution output directly for media calls
+                                                                    result_text.push_str(&execution_outputs);
+                                                                }
+                                                                
                                                                 tool_calls = Some(serde_json::Value::Array(executed_calls));
                                                             }
                                                         }
