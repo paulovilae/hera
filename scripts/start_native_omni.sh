@@ -34,6 +34,6 @@ exec "$MODEL_BIN" \
     --gpu-layers 99 \
     --split-mode none \
     --main-gpu 0 \
-    --ctx-size 8192 \
+    --ctx-size 16384 \
     --batch-size 512 \
     --threads 8

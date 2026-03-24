@@ -14,18 +14,26 @@ async fn main() {
 
     info!("🕯️ Candle Core Hardware Orchestrator - Initializing");
 
-    // Load environment from .env.local FIRST — before any engine initialization
-    let env_path = std::path::Path::new("./.env.local");
-    if env_path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(env_path) {
-            for line in contents.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') { continue; }
-                if let Some((key, val)) = line.split_once('=') {
-                    unsafe { std::env::set_var(key.trim(), val.trim()); }
-                }
-            }
-            info!("📄 Loaded environment from .env.local");
+    // Load environment before any engine initialization. Hera often runs from
+    // `Hera/hera-core`, but the actual env files may live in parent workspaces.
+    let env_candidates = [
+        "./.env.local",
+        "../.env.local",
+        "../../.env.local",
+    ];
+    load_env_from_candidates(&env_candidates);
+
+    // Last-resort recovery for cloud fallback in dev worktrees where the key was
+    // stored in sibling app env files instead of Hera's own env file.
+    if std::env::var("OPENROUTER_API_KEY").unwrap_or_default().is_empty() {
+        let fallback_candidates = [
+            "../../Apps/Vetra-v2-legacy/.env.local",
+            "../../../vetra2/.env",
+            "../../../builder/.env.local",
+        ];
+        if let Some(key) = find_env_value(&fallback_candidates, "OPENROUTER_API_KEY") {
+            unsafe { std::env::set_var("OPENROUTER_API_KEY", key); }
+            info!("🔐 Recovered OPENROUTER_API_KEY from sibling app environment");
         }
     }
 
@@ -174,4 +182,54 @@ async fn main() {
     if let Err(e) = serve(socket_path, state).await {
         tracing::error!("❌ Fatal IPC Server Error: {}", e);
     }
+}
+
+fn load_env_from_candidates(paths: &[&str]) {
+    for path in paths {
+        let env_path = std::path::Path::new(path);
+        if !env_path.exists() {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(env_path) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, val)) = line.split_once('=') {
+                    unsafe { std::env::set_var(key.trim(), normalize_env_value(val)); }
+                }
+            }
+            info!("📄 Loaded environment from {}", env_path.display());
+        }
+    }
+}
+
+fn find_env_value(paths: &[&str], key: &str) -> Option<String> {
+    for path in paths {
+        let env_path = std::path::Path::new(path);
+        let contents = std::fs::read_to_string(env_path).ok()?;
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (candidate_key, candidate_value) = line.split_once('=')?;
+            if candidate_key.trim() == key {
+                let value = normalize_env_value(candidate_value);
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_env_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
 }

@@ -27,8 +27,47 @@ impl LLMEngine for OpenAICompatEngine {
     async fn generate_content(&self, req: ChatRequest) -> Result<ChatResponse, InferenceError> {
         let active_endpoint = req.endpoint.clone().unwrap_or_else(|| self.endpoint_url.clone());
         let active_key = req.api_key.clone().unwrap_or_else(|| self.api_key.clone());
+        let mut normalized_req = req;
 
-        let mut request_builder = self.client.post(&active_endpoint).json(&req);
+        if normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-") {
+            if let Ok(explicit_model) = std::env::var("HERA_OPENAI_MODEL") {
+                if !explicit_model.trim().is_empty() {
+                    normalized_req.model = explicit_model.trim().to_string();
+                }
+            }
+        }
+
+        if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
+            && active_endpoint.contains("openrouter.ai")
+        {
+            if let Ok(cloud_model) = std::env::var("OPENROUTER_DEFAULT_MODEL") {
+                if !cloud_model.trim().is_empty() {
+                    normalized_req.model = cloud_model.trim().to_string();
+                }
+            }
+        }
+
+        if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
+            && active_endpoint.contains("127.0.0.1:8080")
+        {
+            if let Some(discovered_model) =
+                discover_first_model_id(&self.client, &active_endpoint, &active_key).await
+            {
+                normalized_req.model = discovered_model;
+            }
+        }
+
+        // Force multimodal array format to avoid strict provider crashes (e.g. OpenRouter expecting objects instead of strings)
+        for message in &mut normalized_req.messages {
+            if let crate::ai::MessageContent::Text(text) = &message.content {
+                message.content = crate::ai::MessageContent::Parts(vec![crate::ai::ContentPart::Text { text: text.clone() }]);
+            }
+        }
+
+        let payload_json = serde_json::to_string(&normalized_req).unwrap_or_default();
+        tracing::debug!("Outbound Request Payload: {}", payload_json);
+        
+        let mut request_builder = self.client.post(&active_endpoint).json(&normalized_req);
 
         // Inject Bearer token if an API key is provided for the local engine
         if !active_key.is_empty() {
@@ -58,4 +97,136 @@ impl LLMEngine for OpenAICompatEngine {
 
         Ok(oai_res)
     }
+
+    async fn generate_stream(
+        &self,
+        req: ChatRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>, InferenceError> {
+        let active_endpoint = req.endpoint.clone().unwrap_or_else(|| self.endpoint_url.clone());
+        let active_key = req.api_key.clone().unwrap_or_else(|| self.api_key.clone());
+        let mut normalized_req = req;
+
+        normalized_req.stream = Some(true); // Ensure stream is true
+
+        if normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-") {
+            if let Ok(explicit_model) = std::env::var("HERA_OPENAI_MODEL") {
+                if !explicit_model.trim().is_empty() {
+                    normalized_req.model = explicit_model.trim().to_string();
+                }
+            }
+        }
+
+        if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
+            && active_endpoint.contains("openrouter.ai")
+        {
+            if let Ok(cloud_model) = std::env::var("OPENROUTER_DEFAULT_MODEL") {
+                if !cloud_model.trim().is_empty() {
+                    normalized_req.model = cloud_model.trim().to_string();
+                }
+            }
+        }
+
+        if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
+            && active_endpoint.contains("127.0.0.1:8080")
+        {
+            if let Some(discovered_model) =
+                discover_first_model_id(&self.client, &active_endpoint, &active_key).await
+            {
+                normalized_req.model = discovered_model;
+            }
+        }
+
+        for message in &mut normalized_req.messages {
+            if let crate::ai::MessageContent::Text(text) = &message.content {
+                message.content = crate::ai::MessageContent::Parts(vec![crate::ai::ContentPart::Text { text: text.clone() }]);
+            }
+        }
+
+        let mut request_builder = self.client.post(&active_endpoint).json(&normalized_req);
+        if !active_key.is_empty() {
+            request_builder = request_builder.bearer_auth(&active_key);
+        }
+
+        let res = request_builder.send().await.map_err(|e| {
+            InferenceError::ExecutionFailed(format!("Local OpenAI compat engine unreachable: {}", e))
+        })?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let err_text = res.text().await.unwrap_or_default();
+            return Err(InferenceError::ExecutionFailed(format!(
+                "Local engine rejection ({}): {}",
+                status, err_text
+            )));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let mut stream = res.bytes_stream();
+            let mut buffer = String::new();
+            
+            while let Some(chunk_res) = stream.next().await {
+                match chunk_res {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(idx) = buffer.find('\n') {
+                            let line = buffer[..idx].trim().to_string();
+                            buffer = buffer[idx + 1..].to_string();
+                            
+                            if line.starts_with("data: ") {
+                                let json_str = &line[6..];
+                                if json_str == "[DONE]" {
+                                    continue;
+                                }
+                                match serde_json::from_str::<crate::ai::ChatStreamResponse>(json_str) {
+                                    Ok(parsed) => {
+                                        if tx.send(Ok(parsed)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to parse SSE chunk: {} -> {}", e, json_str);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(InferenceError::ExecutionFailed(format!("Stream read error: {}", e)))).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+}
+
+async fn discover_first_model_id(
+    client: &Client,
+    endpoint_url: &str,
+    api_key: &str,
+) -> Option<String> {
+    let models_url = endpoint_url.replace("/v1/chat/completions", "/v1/models");
+    let mut request_builder = client.get(models_url);
+    if !api_key.is_empty() {
+        request_builder = request_builder.bearer_auth(api_key);
+    }
+
+    let response = request_builder.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let payload: serde_json::Value = response.json().await.ok()?;
+    payload
+        .get("data")
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("id"))
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
 }

@@ -31,6 +31,49 @@ pub struct IpcResponse {
     pub data: serde_json::Value,
 }
 
+fn infer_origin_from_model(model: &str) -> &'static str {
+    let normalized = model.trim().to_lowercase();
+    let openrouter_default = std::env::var("OPENROUTER_DEFAULT_MODEL")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+
+    if !openrouter_default.is_empty() && normalized == openrouter_default {
+        "cloud"
+    } else if normalized.is_empty() {
+        "unknown"
+    } else {
+        "local"
+    }
+}
+
+async fn fetch_semantic_memory(app_name: &str) -> String {
+    if app_name.is_empty() { return String::new(); }
+    
+    if let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_millis(1000), tokio::net::UnixStream::connect("/tmp/memento.sock")).await {
+        let msg = serde_json::json!({
+            "action": "query_app",
+            "payload": { "app": app_name, "query": "semantic_context" }
+        });
+        if stream.write_all(msg.to_string().as_bytes()).await.is_ok() {
+            let mut buffer = vec![0u8; 65536];
+            if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(1500), stream.read(&mut buffer)).await {
+                if n > 0 {
+                    let raw = String::from_utf8_lossy(&buffer[..n]);
+                    if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        if let Some(ctx) = resp.get("context").and_then(|c| c.as_str()) {
+                            if !ctx.is_empty() {
+                                return format!("\n\n[MEMENTO SEMANTIC CORTEX INJECTION: {}]\n{}\n", app_name, ctx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
     // Ensure the socket file is removed before binding if it already exists from a previous bad crash
     if std::path::Path::new(socket_path).exists() {
@@ -56,6 +99,8 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                 
                                 // Process Request
                                 let mut result_text = "Action not supported".to_string();
+                                let mut response_origin = "unknown".to_string();
+                                let mut response_model = String::new();
                                 let mut tool_calls: Option<serde_json::Value> = None;
                                 
                                 if request.action == "generate" {
@@ -104,6 +149,8 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                 tracing::info!("🚀 [Hera IPC] Fast-path tool intent detected: {}", tool_call.name);
                                                 let tool_result = crate::ai::tool_executor::execute_tool(&tool_call).await;
                                                 result_text = tool_result.output;
+                                                response_origin = "tool".to_string();
+                                                response_model = tool_call.name.clone();
                                                 tool_calls = Some(serde_json::json!([tool_call]));
                                                 handled_by_tool = true;
                                             } else {
@@ -123,14 +170,18 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                         let prompt = payload_clone.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                         let persona_path = payload_clone.get("persona_path").and_then(|v| v.as_str()).unwrap_or("/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md").to_string();
                                             
-                                        let mut chat_req: Option<ChatRequest> = serde_json::from_value(payload_clone).ok();
+                                        let mut chat_req: Option<ChatRequest> = serde_json::from_value(payload_clone.clone()).ok();
                                         
                                         if chat_req.is_none() {
                                             if !prompt.is_empty() {
-                                                let base_system_prompt = std::fs::read_to_string(&persona_path)
-                                                    .unwrap_or_else(|_| "You are an AI assistant.".to_string());
-                                                let schemas = crate::ai::tool_executor::hera_tool_schemas(&permissions);
-                                                let full_system_prompt = format!("{}\n\n{}", base_system_prompt, schemas);
+                                                let app_name = payload_clone.get("app").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let memento_ctx = fetch_semantic_memory(&app_name).await;
+                                                let base_system_prompt = format!("{}{}", std::fs::read_to_string(&persona_path).unwrap_or_else(|_| "You are an AI assistant.".to_string()), memento_ctx);
+                                                let agent_identity = std::path::Path::new(&persona_path).file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+                                                let schemas = crate::ai::tool_executor::hera_tool_schemas(&permissions, agent_identity);
+                                                let think_directive = "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag.";
+                                                let json_directive = "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be ONLY the raw JSON tool call. DO NOT write conversational text or explanations before or after the JSON tool block. The UI stream will crash if text and code logic bleed together.";
+                                                let full_system_prompt = format!("{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}", base_system_prompt, schemas, think_directive, json_directive);
 
                                                 chat_req = Some(ChatRequest {
                                                     model: "hera-local-model".to_string(),
@@ -148,7 +199,7 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                         }
                                                     ],
                                                     temperature: Some(0.7),
-                                                    max_tokens: Some(1024),
+                                                    max_tokens: Some(4096),
                                                     top_p: None,
                                                     top_k: None,
                                                     presence_penalty: None,
@@ -168,10 +219,14 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                             }
                                         } else if let Some(req) = &mut chat_req {
                                             // Inject base persona + tool schemas into existing request
-                                            let base_system_prompt = std::fs::read_to_string(&persona_path)
-                                                .unwrap_or_else(|_| "You are an AI assistant.".to_string());
-                                            let schemas = crate::ai::tool_executor::hera_tool_schemas(&permissions);
-                                            let full_system_prompt = format!("{}\n\n{}", base_system_prompt, schemas);
+                                            let app_name = payload_clone.get("app").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let memento_ctx = fetch_semantic_memory(&app_name).await;
+                                            let base_system_prompt = format!("{}{}", std::fs::read_to_string(&persona_path).unwrap_or_else(|_| "You are an AI assistant.".to_string()), memento_ctx);
+                                            let agent_identity = std::path::Path::new(&persona_path).file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+                                            let schemas = crate::ai::tool_executor::hera_tool_schemas(&permissions, agent_identity);
+                                            let think_directive = "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag.";
+                                            let json_directive = "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be ONLY the raw JSON tool call. DO NOT write conversational text or explanations before or after the JSON tool block. The UI stream will crash if text and code logic bleed together.";
+                                            let full_system_prompt = format!("{}\n\n{}{}{}", base_system_prompt, schemas, think_directive, json_directive);
 
                                             if let Some(first) = req.messages.first_mut() {
                                                 if first.role == "system" {
@@ -203,6 +258,8 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                         if let Some(req) = chat_req.clone() {
                                             match state.engine.generate_content(req).await {
                                                 Ok(resp) => {
+                                                    response_model = resp.model.clone();
+                                                    response_origin = infer_origin_from_model(&resp.model).to_string();
                                                     if let Some(choice) = resp.choices.first() {
                                                         if let Some(content) = &choice.message.content {
                                                             result_text = content.clone();
@@ -244,6 +301,8 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                                         tracing::info!("🔄 [Hera IPC] Initiating second-pass generation to format Tool Results...");
                                                                         match state.engine.generate_content(req2).await {
                                                                             Ok(resp2) => {
+                                                                                response_model = resp2.model.clone();
+                                                                                response_origin = infer_origin_from_model(&resp2.model).to_string();
                                                                                 if let Some(ch) = resp2.choices.first() {
                                                                                     if let Some(c) = &ch.message.content {
                                                                                         result_text = c.clone();
@@ -274,8 +333,277 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                 }
                                                 Err(e) => {
                                                     error!("LLM inference error: {}", e);
+                                                    response_origin = "offline".to_string();
                                                     result_text = format!("Error: {}", e);
                                                 }
+                                            }
+                                        }
+                                    }
+                                } else if request.action == "generate_stream" {
+                                    let mut payload_clone = request.payload.clone();
+                                    
+                                    let mut prompt = payload_clone.get("prompt").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                                    let mut assistant_last: Option<String> = None;
+                                    
+                                    if prompt.is_empty() {
+                                        if let Some(messages) = payload_clone.get("messages").and_then(|m| m.as_array()) {
+                                            if let Some(last_msg) = messages.last() {
+                                                if let Some("user") = last_msg.get("role").and_then(|r| r.as_str()) {
+                                                    if let Some(content) = last_msg.get("content").and_then(|c| c.as_str()) {
+                                                        prompt = content.to_string();
+                                                    }
+                                                }
+                                            }
+                                            if messages.len() >= 2 {
+                                                if let Some(prev_msg) = messages.get(messages.len() - 2) {
+                                                    if let Some("assistant") = prev_msg.get("role").and_then(|r| r.as_str()) {
+                                                        if let Some(content) = prev_msg.get("content").and_then(|c| c.as_str()) {
+                                                            assistant_last = Some(content.to_string());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    let permissions: Vec<String> = payload_clone.get("permissions")
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<String>>())
+                                        .unwrap_or_else(|| vec!["all".to_string()]);
+                                        
+                                    tracing::info!("🛡️ [Hera IPC Stream] Parsed permissions: {:?}", permissions);
+                                    
+                                    // Fast-path intent detection
+                                    if !prompt.is_empty() {
+                                        if let Some(tool_call) = crate::ai::tool_executor::detect_intent_from_user_message(&prompt, assistant_last.as_deref()) {
+                                            if permissions.contains(&"all".to_string()) || permissions.contains(&tool_call.name) {
+                                                tracing::info!("🚀 [Hera IPC Stream] Fast-path tool intent detected: {}", tool_call.name);
+                                                
+                                                let status_msg = IpcResponse { status: "tool_status".to_string(), data: serde_json::json!({"name": tool_call.name.clone()}) };
+                                                let mut str_msg = serde_json::to_string(&status_msg).unwrap();
+                                                str_msg.push('\n');
+                                                let _ = stream.write_all(str_msg.as_bytes()).await;
+
+                                                let tool_result = crate::ai::tool_executor::execute_tool(&tool_call).await;
+                                                
+                                                let chunk_msg = IpcResponse { status: "chunk".to_string(), data: serde_json::json!({"text": tool_result.output}) };
+                                                let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
+                                                cstr.push('\n');
+                                                let _ = stream.write_all(cstr.as_bytes()).await;
+
+                                                let done_msg = IpcResponse { status: "done".to_string(), data: serde_json::json!({}) };
+                                                let mut dstr = serde_json::to_string(&done_msg).unwrap();
+                                                dstr.push('\n');
+                                                let _ = stream.write_all(dstr.as_bytes()).await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    if let Some(obj) = payload_clone.as_object_mut() {
+                                        if !obj.contains_key("model") {
+                                            obj.insert("model".to_string(), serde_json::json!("hera-local-model"));
+                                        }
+                                    }
+                                    
+                                    let prompt = payload_clone.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let persona_path = payload_clone.get("persona_path").and_then(|v| v.as_str()).unwrap_or("/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md").to_string();
+                                        
+                                    let mut chat_req: Option<crate::ai::ChatRequest> = serde_json::from_value(payload_clone.clone()).ok();
+                                    
+                                    if chat_req.is_none() {
+                                        if !prompt.is_empty() {
+                                            let app_name = payload_clone.get("app").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let memento_ctx = fetch_semantic_memory(&app_name).await;
+                                            let base_system_prompt = format!("{}{}", std::fs::read_to_string(&persona_path).unwrap_or_else(|_| "You are an AI assistant.".to_string()), memento_ctx);
+                                            let agent_identity = std::path::Path::new(&persona_path).file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+                                            let schemas = crate::ai::tool_executor::hera_tool_schemas(&permissions, agent_identity);
+                                            let think_directive = "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag.";
+                                            let json_directive = "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be ONLY the raw JSON tool call. DO NOT write conversational text or explanations before or after the JSON tool block. The UI stream will crash if text and code logic bleed together.";
+                                            let full_system_prompt = format!("{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}", base_system_prompt, schemas, think_directive, json_directive);
+
+                                            chat_req = Some(crate::ai::ChatRequest {
+                                                model: "hera-local-model".to_string(),
+                                                vision_model: None,
+                                                tts_model: None,
+                                                stt_model: None,
+                                                messages: vec![
+                                                    crate::ai::ChatMessage {
+                                                        role: "system".to_string(),
+                                                        content: crate::ai::MessageContent::Text(full_system_prompt),
+                                                    },
+                                                    crate::ai::ChatMessage {
+                                                        role: "user".to_string(),
+                                                        content: crate::ai::MessageContent::Text(prompt.clone()),
+                                                    }
+                                                ],
+                                                temperature: Some(0.7),
+                                                max_tokens: Some(4096),
+                                                top_p: None,
+                                                top_k: None,
+                                                presence_penalty: None,
+                                                frequency_penalty: None,
+                                                repeat_penalty: None,
+                                                seed: None,
+                                                stop: None,
+                                                endpoint: None,
+                                                api_key: None,
+                                                provider: None,
+                                                stream: None,
+                                                nsfw: None,
+                                                tools: None,
+                                                tool_choice: None,
+                                                reasoning_effort: None,
+                                            });
+                                        }
+                                    } else if let Some(req) = &mut chat_req {
+                                        let app_name = payload_clone.get("app").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                        let memento_ctx = fetch_semantic_memory(&app_name).await;
+                                        let base_system_prompt = format!("{}{}", std::fs::read_to_string(&persona_path).unwrap_or_else(|_| "You are an expert AI system running within the Sovereign OS (locally on the user's hardware). You have access to powerful tools. CRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.".to_string()), memento_ctx);
+                                        let agent_identity = std::path::Path::new(&persona_path).file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+                                        let schemas = crate::ai::tool_executor::hera_tool_schemas(&permissions, agent_identity);
+                                        let think_directive = "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag.";
+                                        let json_directive = "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be ONLY the raw JSON tool call. DO NOT write conversational text or explanations before or after the JSON tool block. The UI stream will crash if text and code logic bleed together.";
+                                        let full_system_prompt = format!("{}\n\n{}{}{}", base_system_prompt, schemas, think_directive, json_directive);
+
+                                        if let Some(first) = req.messages.first_mut() {
+                                            if first.role == "system" {
+                                                match &mut first.content {
+                                                    crate::ai::MessageContent::Text(t) => { *t = format!("{}\n\n{}", full_system_prompt, t); }
+                                                    crate::ai::MessageContent::Parts(parts) => { parts.insert(0, crate::ai::ContentPart::Text { text: format!("{}\n\n", full_system_prompt) }); }
+                                                    crate::ai::MessageContent::Null => { first.content = crate::ai::MessageContent::Text(full_system_prompt); }
+                                                }
+                                            } else {
+                                                req.messages.insert(0, crate::ai::ChatMessage {
+                                                    role: "system".to_string(),
+                                                    content: crate::ai::MessageContent::Text(full_system_prompt),
+                                                });
+                                            }
+                                        } else {
+                                            req.messages.push(crate::ai::ChatMessage {
+                                                role: "system".to_string(),
+                                                content: crate::ai::MessageContent::Text(full_system_prompt),
+                                            });
+                                        }
+                                    }
+                                    
+                                    if let Some(req) = chat_req.clone() {
+                                        let start_msg = IpcResponse { status: "stream_start".to_string(), data: serde_json::json!({}) };
+                                        let mut res_str = serde_json::to_string(&start_msg).unwrap();
+                                        res_str.push('\n');
+                                        let _ = stream.write_all(res_str.as_bytes()).await;
+
+                                        let mut final_result_text = String::new();
+                                        let mut buffer_flushed = false;
+                                        let mut is_tool_call_mode = false;
+                                        match state.engine.generate_stream(req).await {
+                                            Ok(mut rx) => {
+                                                while let Some(chunk_res) = rx.recv().await {
+                                                    if let Ok(chunk) = chunk_res {
+                                                        let chunk_text = chunk.choices.first().and_then(|c| c.delta.content.clone()).unwrap_or_default();
+                                                        if chunk_text.is_empty() { continue; }
+                                                        
+                                                        final_result_text.push_str(&chunk_text);
+                                                        
+                                                        if !buffer_flushed {
+                                                            let trimmed = final_result_text.trim_start();
+                                                            if trimmed.starts_with('<') || trimmed.starts_with('{') {
+                                                                // Looks like a tool call, suppress streaming
+                                                                is_tool_call_mode = true;
+                                                            } else if final_result_text.len() > 5 {
+                                                                // Definitely normal text, flush buffer and start streaming
+                                                                is_tool_call_mode = false;
+                                                                buffer_flushed = true;
+                                                                let chunk_msg = IpcResponse { status: "chunk".to_string(), data: serde_json::json!({"text": final_result_text}) };
+                                                                let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
+                                                                cstr.push('\n');
+                                                                let _ = stream.write_all(cstr.as_bytes()).await;
+                                                            }
+                                                        } else if !is_tool_call_mode {
+                                                            // We're in normal streaming mode, send just this chunk
+                                                            let chunk_msg = IpcResponse { status: "chunk".to_string(), data: serde_json::json!({"text": chunk_text}) };
+                                                            let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
+                                                            cstr.push('\n');
+                                                            let _ = stream.write_all(cstr.as_bytes()).await;
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                if !buffer_flushed && !is_tool_call_mode && !final_result_text.is_empty() {
+                                                    // Stream finished but was very short, flush it now
+                                                    let chunk_msg = IpcResponse { status: "chunk".to_string(), data: serde_json::json!({"text": final_result_text}) };
+                                                    let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
+                                                    cstr.push('\n');
+                                                    let _ = stream.write_all(cstr.as_bytes()).await;
+                                                }
+
+                                                let parsed_calls = crate::ai::tool_executor::parse_tool_calls(&final_result_text);
+                                                if !parsed_calls.is_empty() {
+                                                    let mut execution_outputs = String::new();
+                                                    for call in &parsed_calls {
+                                                        let status_msg = IpcResponse { status: "tool_status".to_string(), data: serde_json::json!({"name": call.name.clone()}) };
+                                                        let mut str_msg = serde_json::to_string(&status_msg).unwrap();
+                                                        str_msg.push('\n');
+                                                        let _ = stream.write_all(str_msg.as_bytes()).await;
+
+                                                        if permissions.contains(&"all".to_string()) || permissions.contains(&call.name) {
+                                                            let tool_res = crate::ai::tool_executor::execute_tool(&call).await;
+                                                            execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
+                                                        } else {
+                                                            execution_outputs.push_str(&format!("\n\nError: Not permitted to use tool '{}'", call.name));
+                                                        }
+                                                    }
+
+                                                    let has_media_call = parsed_calls.iter().any(|c| c.name == "hera_draw" || c.name == "hera_video" || c.name == "generate_qr_code");
+                                                    if !has_media_call {
+                                                        if let Some(mut req2) = chat_req.clone() {
+                                                            req2.messages.push(crate::ai::ChatMessage {
+                                                                role: "assistant".to_string(),
+                                                                content: crate::ai::MessageContent::Text(final_result_text.clone()),
+                                                            });
+                                                            req2.messages.push(crate::ai::ChatMessage {
+                                                                role: "user".to_string(),
+                                                                content: crate::ai::MessageContent::Text(format!("Tool Execution Results: {}\n\nPlease provide a friendly, conversational, and concise response to the user based on these results. Do not output raw JSON or mention the database tables directly. Avoid outputting any tool call tags.", execution_outputs)),
+                                                            });
+                                                            if let Ok(mut rx2) = state.engine.generate_stream(req2).await {
+                                                                while let Some(chunk_res2) = rx2.recv().await {
+                                                                    if let Ok(chunk2) = chunk_res2 {
+                                                                        let chunk_text = chunk2.choices.first().and_then(|c| c.delta.content.clone()).unwrap_or_default();
+                                                                        let chunk_msg = IpcResponse { status: "chunk".to_string(), data: serde_json::json!({"text": chunk_text}) };
+                                                                        let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
+                                                                        cstr.push('\n');
+                                                                        let _ = stream.write_all(cstr.as_bytes()).await;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let chunk_msg = IpcResponse { status: "chunk".to_string(), data: serde_json::json!({"text": execution_outputs}) };
+                                                        let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
+                                                        cstr.push('\n');
+                                                        let _ = stream.write_all(cstr.as_bytes()).await;
+                                                    }
+                                                } else if is_tool_call_mode && !final_result_text.is_empty() {
+                                                    // Suppressed the stream assuming it was a tool, but it wasn't a valid tool call.
+                                                    // Let's dump the entire buffered text to the frontend so they don't get a silent blank.
+                                                    let chunk_msg = IpcResponse { status: "chunk".to_string(), data: serde_json::json!({"text": final_result_text}) };
+                                                    let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
+                                                    cstr.push('\n');
+                                                    let _ = stream.write_all(cstr.as_bytes()).await;
+                                                }
+
+                                                let done_msg = IpcResponse { status: "done".to_string(), data: serde_json::json!({}) };
+                                                let mut dstr = serde_json::to_string(&done_msg).unwrap();
+                                                dstr.push('\n');
+                                                let _ = stream.write_all(dstr.as_bytes()).await;
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                let err_msg = IpcResponse { status: "error".to_string(), data: serde_json::json!({"error": e.to_string()}) };
+                                                let mut estr = serde_json::to_string(&err_msg).unwrap();
+                                                estr.push('\n');
+                                                let _ = stream.write_all(estr.as_bytes()).await;
+                                                break;
                                             }
                                         }
                                     }
@@ -354,7 +682,7 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                     ]),
                                                 }],
                                                 temperature: None,
-                                                max_tokens: Some(1024),
+                                                max_tokens: Some(4096),
                                                 top_p: None, top_k: None, presence_penalty: None, frequency_penalty: None, repeat_penalty: None, seed: None, stop: None, endpoint: None, api_key: None, provider: None, stream: None, nsfw: None, tools: None, tool_choice: None, reasoning_effort: None,
                                             };
                                             
@@ -642,6 +970,10 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                     if let Some(map) = data_json.as_object_mut() {
                                         map.insert("tool_calls".to_string(), tc);
                                     }
+                                }
+                                if let Some(map) = data_json.as_object_mut() {
+                                    map.insert("origin".to_string(), serde_json::json!(response_origin));
+                                    map.insert("model".to_string(), serde_json::json!(response_model));
                                 }
 
                                 let res = IpcResponse {

@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 /// Tool call parsed from Qwen's output
@@ -22,53 +24,222 @@ pub struct ToolResult {
     pub output: String,
 }
 
+#[derive(Debug, Clone)]
+struct ToolArtifact {
+    schema: Value,
+    consumers: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SkillArtifact {
+    skill_id: String,
+    tool_name: String,
+    description: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct AgentArtifact {
+    agent_id: String,
+    persona: String,
+}
+
+fn parse_tool_artifact(path: &Path) -> Option<ToolArtifact> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut schema = serde_json::from_str::<Value>(&content).ok()?;
+    let consumers = schema
+        .get("metadata")
+        .and_then(|metadata| metadata.get("consumers"))
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec!["all".to_string()]);
+
+    if let Some(obj) = schema.as_object_mut() {
+        obj.remove("metadata");
+    }
+
+    Some(ToolArtifact { schema, consumers })
+}
+
+fn collect_tool_schemas_from_dir(dir: &Path, tools: &mut Vec<Value>, agent_name: &str) {
+    if !dir.exists() {
+        return;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                collect_tool_schemas_from_dir(&entry_path, tools, agent_name);
+                continue;
+            }
+
+            if entry_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            match parse_tool_artifact(&entry_path) {
+                Some(artifact) => {
+                    let allowed = artifact
+                        .consumers
+                        .iter()
+                        .any(|consumer| consumer == "all" || consumer == agent_name);
+                    if allowed {
+                        tools.push(artifact.schema);
+                    } else {
+                        tracing::debug!("Skipping tool due to consumer restriction: {:?}", entry_path);
+                    }
+                }
+                None => {
+                    eprintln!("Warning: Failed to parse tool JSON at {:?}", entry_path);
+                }
+            }
+        }
+    }
+}
+
+fn parse_skill_artifact(skill_dir: &Path) -> Option<SkillArtifact> {
+    let path = skill_dir.join("SKILL.md");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut tool_name = String::new();
+    let mut description = String::new();
+    let mut in_frontmatter = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            if in_frontmatter {
+                break;
+            }
+            in_frontmatter = true;
+            continue;
+        }
+        if !in_frontmatter {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            tool_name = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        } else if let Some(value) = trimmed.strip_prefix("description:") {
+            description = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        }
+    }
+
+    if tool_name.is_empty() || description.is_empty() {
+        return None;
+    }
+
+    Some(SkillArtifact {
+        skill_id: skill_dir.file_name()?.to_string_lossy().to_string(),
+        tool_name,
+        description,
+        content,
+    })
+}
+
+fn collect_skill_artifacts() -> Vec<SkillArtifact> {
+    let skills_dir = Path::new("/home/paulo/Programs/apps/OS/Skills");
+    let mut skills = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(skills_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(skill) = parse_skill_artifact(&path) {
+                    skills.push(skill);
+                }
+            }
+        }
+    }
+    skills
+}
+
+fn find_skill_artifact(tool_name: &str) -> Option<SkillArtifact> {
+    collect_skill_artifacts()
+        .into_iter()
+        .find(|skill| skill.tool_name == tool_name)
+}
+
+fn load_agent_artifact(agent_name: &str) -> AgentArtifact {
+    let sanitized = agent_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    let agent_path = PathBuf::from(format!("/home/paulo/Programs/apps/OS/Agents/{}.md", sanitized));
+    let persona = std::fs::read_to_string(&agent_path)
+        .unwrap_or_else(|_| format!("You are an expert {}", sanitized));
+    AgentArtifact {
+        agent_id: sanitized,
+        persona,
+    }
+}
+
 /// Tool schemas in Qwen3's native Hermes-style format.
 /// Uses the exact JSON schema structure that Qwen3 was trained on.
 /// Reference: https://qwen3.org/docs/guides/tools
-pub fn hera_tool_schemas(permissions: &[String]) -> String {
+///
+/// Folder structure:
+///   OS/Tools/global/{db,ai,system,files,agents,workflow,misc}/*.json — always loaded
+///   OS/Tools/apps/{vetra,latinos,garcero,movilo}/*.json — loaded per permissions
+///
+/// Permissions:
+///   ["all"]       → loads everything (global + all apps)
+///   ["garcero"]   → loads global + apps/garcero/
+///   ["movilo"]    → loads global + apps/movilo/
+///   []            → loads nothing (no tools in prompt)
+pub fn hera_tool_schemas(permissions: &[String], agent_name: &str) -> String {
+    let base_dir = "/home/paulo/Programs/apps/OS/Tools";
     let mut tools_vec: Vec<Value> = Vec::new();
-    let techne_dir = "/home/paulo/Programs/apps/OS/Tools";
 
-
-    if let Ok(entries) = std::fs::read_dir(techne_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(tool) = serde_json::from_str::<Value>(&content) {
-                        tools_vec.push(tool);
-                    } else {
-                        eprintln!("Warning: Failed to parse techne tool JSON at {:?}", path);
-                    }
-                }
-            }
-        }
-    } else {
-        eprintln!("Warning: Techne directory not found at {}", techne_dir);
-    }
-
-    let tools = Value::Array(tools_vec);
-
-    let has_all = permissions.contains(&"all".to_string());
-    
-    let mut filtered_tools = Vec::new();
-    if let Some(arr) = tools.as_array() {
-        for tool in arr {
-            if has_all {
-                filtered_tools.push(tool.clone());
-            } else if let Some(name) = tool.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
-                if permissions.contains(&name.to_string()) {
-                    filtered_tools.push(tool.clone());
-                }
-            }
-        }
-    }
-
-    if filtered_tools.is_empty() {
+    // Empty permissions = no tools at all (e.g., Chigüí doing pure LLM generation)
+    if permissions.is_empty() {
         return "".to_string();
     }
 
-    let tools_json = serde_json::to_string_pretty(&filtered_tools).unwrap_or_default();
+    let has_all = permissions.contains(&"all".to_string());
+
+    // 1. Always load global tools (recursive through topic subfolders)
+    let global_dir = PathBuf::from(format!("{}/global", base_dir));
+    collect_tool_schemas_from_dir(&global_dir, &mut tools_vec, agent_name);
+
+    // 2. Load app-specific tools based on permissions
+    if has_all {
+        // Load ALL app tools
+        let apps_dir = PathBuf::from(format!("{}/apps", base_dir));
+        collect_tool_schemas_from_dir(&apps_dir, &mut tools_vec, agent_name);
+    } else {
+        // Load only requested app tool folders
+        for perm in permissions {
+            let app_dir = PathBuf::from(format!("{}/apps/{}", base_dir, perm));
+            collect_tool_schemas_from_dir(&app_dir, &mut tools_vec, agent_name);
+        }
+    }
+
+    // 3. Dynamic Skill Disclosure: Parse OS/Skills for SKILL.md
+    for skill in collect_skill_artifacts() {
+        let skill_tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": skill.tool_name,
+                "description": skill.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        });
+        tools_vec.push(skill_tool);
+    }
+
+    if tools_vec.is_empty() {
+        return "".to_string();
+    }
+
+    let tools_json = serde_json::to_string_pretty(&tools_vec).unwrap_or_default();
 
     format!(r#"
 
@@ -122,6 +293,42 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
             search_from = abs_end + "</tool_call>".len();
         } else {
             break;
+        }
+    }
+
+    // Fallback: If no tags were found, maybe the model just spit out raw JSON?
+    if calls.is_empty() {
+        let trimmed = text.trim();
+        if trimmed.starts_with('{') {
+            // Try extracting the first complete JSON object
+            let mut brace_count = 0;
+            let mut end_idx = 0;
+            for (i, c) in trimmed.char_indices() {
+                if c == '{' { brace_count += 1; }
+                else if c == '}' { brace_count -= 1; }
+                
+                if brace_count == 0 && i > 0 {
+                    end_idx = i + 1;
+                    break;
+                }
+            }
+            
+            if end_idx > 0 {
+                let json_str = &trimmed[..end_idx];
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let (Some(name), Some(args)) = (
+                        val.get("name").and_then(|n| n.as_str()),
+                        val.get("arguments"),
+                    ) {
+                        calls.push(ToolCall {
+                            name: name.to_string(),
+                            arguments: args.clone(),
+                        });
+                        info!("🔧 [Hera] Parsed RAW JSON tool call: {} with args: {}",
+                            name, serde_json::to_string(args).unwrap_or_default());
+                    }
+                }
+            }
         }
     }
 
@@ -243,6 +450,28 @@ pub fn detect_intent_from_user_message(user_msg: &str, assistant_last: Option<&s
         });
     }
 
+    // System status intent — catch conversational questions about server/GPU/CPU/memory
+    let status_keywords = [
+        "system status", "server status", "gpu status", "cpu status",
+        "how is the server", "como esta el server", "como está el server",
+        "estado del servidor", "estado del server", "status del server",
+        "nvidia", "vram", "gpu load", "gpu temp",
+        "como esta el gpu", "como está el gpu",
+        "cuanta ram", "cuánta ram", "how much ram",
+        "memory usage", "uso de memoria",
+        "system health", "server health",
+        "how much vram", "cuanta vram", "cuánta vram",
+        "que procesos", "qué procesos", "what processes",
+        "esta corriendo", "está corriendo", "is running",
+    ];
+    if status_keywords.iter().any(|kw| lower.contains(kw)) {
+        info!("🎯 [Hera] Intent detected: system_status from user message");
+        return Some(ToolCall {
+            name: "system_status".to_string(),
+            arguments: serde_json::json!({}),
+        });
+    }
+
     None
 }
 
@@ -250,6 +479,22 @@ pub fn detect_intent_from_user_message(user_msg: &str, assistant_last: Option<&s
 /// Returns a ToolResult with the output string.
 pub async fn execute_tool(call: &ToolCall) -> ToolResult {
     info!("🔧 [Hera] Executing tool: {}", call.name);
+
+    if call.name.starts_with("load_skill_") {
+        return execute_load_skill(call).await;
+    }
+
+    if call.name == "spawn_parallel_agents" {
+        return execute_spawn_parallel_agents(call).await;
+    }
+
+    if call.name == "create_agent" {
+        return execute_create_agent(call).await;
+    }
+
+    if call.name == "create_skill" {
+        return execute_create_skill(call).await;
+    }
 
     match call.name.as_str() {
         "hera_draw" => execute_draw(call).await,
@@ -264,6 +509,7 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
         "memento_vector_search" => execute_memento_vector_search(call).await,
         "ask_user" => execute_ask_user(call).await,
         "get_system_time" => execute_get_system_time(call).await,
+        "system_status" => execute_system_status(call).await,
         "run_code" => execute_run_code(call).await,
         "web_scraper" => execute_web_scraper(call).await,
         "write_file" => execute_write_file(call).await,
@@ -273,11 +519,302 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
         "movilo_search_providers" => execute_movilo_search_providers(call).await,
         "movilo_check_affiliation" => execute_movilo_check_affiliation(call).await,
         "movilo_validate_qr" => execute_movilo_validate_qr(call).await,
+        "bind_telegram_workspace" => execute_bind_telegram_workspace(call).await,
+        "spline_interact" => execute_spline_interact(call).await,
         _ => ToolResult {
             name: call.name.clone(),
             success: false,
             output: format!("Unknown tool: {}", call.name),
         },
+    }
+}
+
+async fn execute_bind_telegram_workspace(call: &ToolCall) -> ToolResult {
+    let bot_name = call
+        .arguments
+        .get("bot_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Vetra")
+        .trim();
+    let sender_id = call
+        .arguments
+        .get("sender_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let sender_name = call
+        .arguments
+        .get("sender_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Telegram User")
+        .trim();
+    let workspace_user = call
+        .arguments
+        .get("workspace_user")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let workspace_company = call
+        .arguments
+        .get("workspace_company")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let locale = call
+        .arguments
+        .get("locale")
+        .and_then(|value| value.as_str())
+        .unwrap_or("es")
+        .trim();
+
+    if sender_id.is_empty() || workspace_user.is_empty() || workspace_company.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: must provide 'sender_id', 'workspace_user', and 'workspace_company'.".into(),
+        };
+    }
+
+    let path = "/home/paulo/Programs/apps/OS/etc/imaginclaw/vetra_telegram_bindings.json";
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let mut store = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| serde_json::json!({ "bindings": [] })),
+        Err(_) => serde_json::json!({ "bindings": [] }),
+    };
+
+    let bindings = store
+        .get_mut("bindings")
+        .and_then(|value| value.as_array_mut())
+        .expect("bindings array should exist");
+
+    let key_bot = bot_name.to_lowercase();
+    if let Some(existing) = bindings.iter_mut().find(|item| {
+        item.get("bot_name").and_then(|value| value.as_str()).map(|value| value.eq_ignore_ascii_case(&key_bot)).unwrap_or(false)
+            && item.get("sender_id").and_then(|value| value.as_str()) == Some(sender_id)
+    }) {
+        *existing = serde_json::json!({
+            "bot_name": bot_name,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "workspace_user": workspace_user,
+            "workspace_company": workspace_company,
+            "locale": locale,
+            "created_at": existing.get("created_at").and_then(|value| value.as_i64()).unwrap_or(now),
+            "updated_at": now,
+        });
+    } else {
+        bindings.push(serde_json::json!({
+            "bot_name": bot_name,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "workspace_user": workspace_user,
+            "workspace_company": workspace_company,
+            "locale": locale,
+            "created_at": now,
+            "updated_at": now,
+        }));
+    }
+
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to create bindings directory: {}", error),
+            };
+        }
+    }
+
+    match serde_json::to_string_pretty(&store)
+        .map_err(|error| error.to_string())
+        .and_then(|raw| std::fs::write(path, raw).map_err(|error| error.to_string()))
+    {
+        Ok(_) => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!(
+                "Bound Telegram sender '{}' to workspace '{}' as '{}'.",
+                sender_id, workspace_company, workspace_user
+            ),
+        },
+        Err(error) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to persist Telegram binding: {}", error),
+        },
+    }
+}
+
+async fn execute_load_skill(call: &ToolCall) -> ToolResult {
+    if let Some(skill) = find_skill_artifact(&call.name) {
+        info!("🧠 [Hera] Progressively disclosing skill: {}", call.name);
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!(
+                "Loaded Skill Playbook '{}' (artifact '{}'):\n\n[SYSTEM SKILL IMPLANT]\nYou must now follow this skill playbook strictly:\n\n{}",
+                call.name, skill.skill_id, skill.content
+            ),
+        };
+    }
+
+    ToolResult {
+        name: call.name.clone(),
+        success: false,
+        output: format!("Could not find a SKILL.md playbook defining the skill '{}'", call.name),
+    }
+}
+
+async fn execute_spawn_parallel_agents(call: &ToolCall) -> ToolResult {
+    let agents = call.arguments.get("agents").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    let prompt = call.arguments.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+
+    if agents.is_empty() || prompt.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: must provide 'agents' array and 'prompt' string.".into()
+        };
+    }
+
+    info!("👯 [Hera] Spawning {} parallel agents for task: {}", agents.len(), prompt);
+
+    let mut tasks = Vec::new();
+    for agent_val in agents {
+        let agent_name = agent_val.as_str().unwrap_or("").to_string();
+        if agent_name.is_empty() { continue; }
+        
+        let p = prompt.to_string();
+
+        tasks.push(tokio::spawn(async move {
+            let agent = load_agent_artifact(&agent_name);
+            let persona = agent.persona;
+            
+            // Connect to local inference engine via Hera chat
+            let hera = hera_execution::agents::hera::Hera::new("http://127.0.0.1:3000");
+            
+            let payload = serde_json::json!({
+                "model": "hera",
+                "messages": [
+                    { "role": "system", "content": persona },
+                    { "role": "user", "content": p }
+                ],
+                "temperature": 0.2
+            });
+
+            match hera.chat(payload).await {
+                Ok(res) => {
+                    if let Ok(json) = res.json::<serde_json::Value>().await {
+                        let content = json.get("choices")
+                            .and_then(|c| c.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|c| c.get("message"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("No response")
+                            .to_string();
+                        format!("--- REPORT FROM {} ---\n{}\n", agent_name.to_uppercase(), content)
+                    } else {
+                        format!("--- REPORT FROM {} ---\nFailed to parse JSON response.\n", agent_name.to_uppercase())
+                    }
+                }
+                Err(e) => format!("--- REPORT FROM {} ---\nFailed to reach inference engine: {}\n", agent_name.to_uppercase(), e)
+            }
+        }));
+    }
+
+    let mut combined_report = String::new();
+    for task in tasks {
+        if let Ok(report) = task.await {
+            combined_report.push_str(&report);
+            combined_report.push_str("\n");
+        }
+    }
+
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: format!("✅ Parallel Agents Execution Complete.\n\nCONSOLIDATED REPORTS:\n================================\n{}", combined_report),
+    }
+}
+
+async fn execute_create_agent(call: &ToolCall) -> ToolResult {
+    let name = call.arguments.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+    let persona = call.arguments.get("persona").and_then(|p| p.as_str()).unwrap_or("").trim();
+
+    if name.is_empty() || persona.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: must provide 'name' and 'persona' strings.".into(),
+        };
+    }
+
+    let sanitized = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    let save_path = format!("/home/paulo/Programs/apps/OS/Agents/{}.md", sanitized);
+    match std::fs::write(&save_path, persona) {
+        Ok(_) => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Successfully created Agent Persona '{}' at {}", sanitized, save_path),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to create agent {}: {}", sanitized, e),
+        }
+    }
+}
+
+async fn execute_create_skill(call: &ToolCall) -> ToolResult {
+    let name = call.arguments.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+    let description = call.arguments.get("description").and_then(|d| d.as_str()).unwrap_or("").trim();
+    let playbook = call.arguments.get("playbook").and_then(|p| p.as_str()).unwrap_or("").trim();
+
+    if name.is_empty() || description.is_empty() || playbook.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: must provide 'name', 'description', and 'playbook' strings.".into(),
+        };
+    }
+
+    let sanitized = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    let skill_dir = format!("/home/paulo/Programs/apps/OS/Skills/{}", sanitized);
+    if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to create skill directory {}: {}", skill_dir, e),
+        };
+    }
+
+    let content = format!(
+        "---\nname: load_skill_{}\ndescription: \"{}\"\n---\n\n{}",
+        sanitized, description, playbook
+    );
+
+    let save_path = format!("{}/SKILL.md", skill_dir);
+    match std::fs::write(&save_path, content) {
+        Ok(_) => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Successfully crafted Skill '{}' at {}\nIt will be dynamically loaded on the next request sequence.", sanitized, save_path),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to write skill playbook {}: {}", save_path, e),
+        }
     }
 }
 
@@ -803,25 +1340,118 @@ async fn execute_get_system_time(call: &ToolCall) -> ToolResult {
 async fn execute_run_code(call: &ToolCall) -> ToolResult {
     let lang = call.arguments.get("language").and_then(|l| l.as_str()).unwrap_or("python");
     let code = call.arguments.get("code").and_then(|c| c.as_str()).unwrap_or("");
+    let packages: Vec<String> = call.arguments.get("packages")
+        .and_then(|p| p.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
     
-    let (ext, cmd) = if lang.to_lowercase() == "python" {
-        ("py", "python3")
-    } else {
-        return ToolResult { name: call.name.clone(), success: false, output: "Only python is supported in the local sandbox currently".into() };
-    };
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let bean_name = format!("bean_{}", timestamp);
+    let beans_dir = "/home/paulo/Programs/apps/OS/Beans";
+    let _ = std::fs::create_dir_all(beans_dir);
+    
+    // Cognitive Memory Pipeline: Record bean logic into Memento universally before execution
+    // Doing it natively blocking here; socket is fast UDS.
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect("/tmp/memento.sock") {
+        use std::io::Write;
+        let payload = serde_json::json!({
+            "action": "store_knowledge",
+            "payload": {
+                "key": bean_name.clone(),
+                "content": format!("Language: {}\nPackages: {:?}\nCode:\n{}", lang, packages, code),
+                "tags": "bean, code_interpreter"
+            }
+        });
+        let _ = stream.write_all(payload.to_string().as_bytes());
+    }
 
-    let p = format!("/tmp/hera_sandbox.{}", ext);
-    if let Err(e) = std::fs::write(&p, code) { return ToolResult { name: call.name.clone(), success: false, output: format!("Failed to write: {}", e) }; }
-
-    match std::process::Command::new(cmd).arg(&p).output() {
-        Ok(out) => {
-            let out_str = String::from_utf8_lossy(&out.stdout);
-            let err_str = String::from_utf8_lossy(&out.stderr);
-            let success = out.status.success();
-            let res = if success { out_str.into() } else { format!("{}\n{}", err_str, out_str) };
-            ToolResult { name: call.name.clone(), success, output: res }
+    if lang.to_lowercase() == "rust" {
+        let project_dir = format!("{}/{}", beans_dir, bean_name);
+        if let Err(e) = std::fs::create_dir_all(format!("{}/src", project_dir)) {
+            return ToolResult { name: call.name.clone(), success: false, output: format!("Failed to create Rust bean directory: {}", e) };
         }
-        Err(e) => ToolResult { name: call.name.clone(), success: false, output: e.to_string() }
+        
+        let mut deps = format!(r#"[dependencies]
+tokio = {{ version = "1", features = ["full", "rt-multi-thread"] }}
+reqwest = {{ version = "0.11", features = ["json"] }}
+serde = {{ version = "1.0", features = ["derive"] }}
+serde_json = "1.0"
+"#);
+        for pkg in &packages {
+            deps.push_str(&format!("{} = \"*\"\n", pkg));
+        }
+
+        let cargo_toml = format!(r#"[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
+
+{}
+"#, bean_name, deps);
+        
+        std::fs::write(format!("{}/Cargo.toml", project_dir), cargo_toml).unwrap_or_default();
+        std::fs::write(format!("{}/src/main.rs", project_dir), code).unwrap_or_default();
+        
+        match std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--release")
+            .current_dir(&project_dir)
+            .output() {
+            Ok(out) => {
+                let out_str = String::from_utf8_lossy(&out.stdout).to_string();
+                let err_str = String::from_utf8_lossy(&out.stderr).to_string();
+                let success = out.status.success();
+                
+                let mut final_out = format!("RUST ROASTED BEAN EXECUTION:\n---\nSTDOUT:\n{}\n", out_str);
+                if !success || !err_str.is_empty() {
+                    final_out.push_str(&format!("---\nSTDERR (or cargo compilation logs):\n{}\n", err_str));
+                }
+                final_out.push_str(&format!("---\nBean saved permanently in {} and recorded in Memento.", project_dir));
+                
+                ToolResult { name: call.name.clone(), success, output: final_out }
+            }
+            Err(e) => ToolResult { name: call.name.clone(), success: false, output: format!("Cargo execution failed: {}", e) }
+        }
+    } else if lang.to_lowercase() == "python" {
+        let p = format!("{}/{}.py", beans_dir, bean_name);
+        if let Err(e) = std::fs::write(&p, code) { return ToolResult { name: call.name.clone(), success: false, output: format!("Failed to write Python bean: {}", e) }; }
+
+        let mut pip_log = String::new();
+        if !packages.is_empty() {
+            let mut cmd = std::process::Command::new("python3");
+            cmd.arg("-m").arg("pip").arg("install").arg("--break-system-packages");
+            for pkg in &packages {
+                cmd.arg(pkg);
+            }
+            if let Ok(out) = cmd.output() {
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    return ToolResult { name: call.name.clone(), success: false, output: format!("Failed to install Python packages:\n{}", err) };
+                }
+                pip_log = format!("Successfully installed: {:?}", packages);
+            }
+        }
+
+        match std::process::Command::new("python3").arg(&p).output() {
+            Ok(out) => {
+                let out_str = String::from_utf8_lossy(&out.stdout).to_string();
+                let err_str = String::from_utf8_lossy(&out.stderr).to_string();
+                let success = out.status.success();
+                let mut res = if success { 
+                    if err_str.trim().is_empty() { out_str } else { format!("STDOUT:\n{}\n---\nSTDERR:\n{}", out_str, err_str) }
+                } else { 
+                    format!("PYTHON SOFT BEAN ERROR:\n{}\n{}", err_str, out_str) 
+                };
+                if !pip_log.is_empty() {
+                    res = format!("{}\n---\n{}", pip_log, res);
+                }
+                res = format!("{}\n---\nBean saved permanently at {} and logged in Memento.", res, p);
+                ToolResult { name: call.name.clone(), success, output: res }
+            }
+            Err(e) => ToolResult { name: call.name.clone(), success: false, output: e.to_string() }
+        }
+    } else {
+        ToolResult { name: call.name.clone(), success: false, output: format!("Language '{}' not supported. Use 'rust' or 'python'.", lang) }
     }
 }
 
@@ -937,6 +1567,159 @@ async fn execute_workflow(call: &ToolCall) -> ToolResult {
                 name: call.name.clone(),
                 success: false,
                 output: format!("Failed to reach Argus at {}: {}", url, e)
+            }
+        }
+    }
+}
+
+async fn execute_system_status(call: &ToolCall) -> ToolResult {
+    let mut report = String::new();
+
+    // 1. RAM from /proc/meminfo
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        let mut total = 0.0_f64;
+        let mut available = 0.0_f64;
+        for line in meminfo.lines() {
+            if line.starts_with("MemTotal:") {
+                total = line.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0) / 1024.0 / 1024.0;
+            } else if line.starts_with("MemAvailable:") {
+                available = line.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0) / 1024.0 / 1024.0;
+            }
+        }
+        let used = total - available;
+        report.push_str(&format!("RAM: {:.1}GB used / {:.1}GB total ({:.1}GB free)\n", used, total, available));
+    }
+
+    // 2. CPU Load from /proc/loadavg
+    if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
+        let parts: Vec<&str> = loadavg.split_whitespace().collect();
+        if parts.len() >= 3 {
+            report.push_str(&format!("CPU Load Average: {} (1m) {} (5m) {} (15m)\n", parts[0], parts[1], parts[2]));
+        }
+    }
+
+    // 3. Uptime
+    if let Ok(output) = std::process::Command::new("uptime").arg("-p").output() {
+        let uptime = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        report.push_str(&format!("Uptime: {}\n", uptime));
+    }
+
+    // 4. GPU status via nvidia-smi
+    match std::process::Command::new("nvidia-smi")
+        .arg("--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,memory.free")
+        .arg("--format=csv,noheader,nounits")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            report.push_str("\nGPU Status:\n");
+            for line in out_str.lines() {
+                let parts: Vec<&str> = line.split(", ").collect();
+                if parts.len() == 7 {
+                    report.push_str(&format!(
+                        "  GPU {}: {} | Temp: {}°C | Load: {}% | VRAM: {}MB / {}MB ({}MB free)\n",
+                        parts[0].trim(), parts[1].trim(), parts[2].trim(),
+                        parts[3].trim(), parts[4].trim(), parts[5].trim(), parts[6].trim()
+                    ));
+                }
+            }
+        }
+        _ => {
+            report.push_str("\nGPU: nvidia-smi not available or failed.\n");
+        }
+    }
+
+    // 5. GPU process list
+    match std::process::Command::new("nvidia-smi")
+        .arg("--query-compute-apps=pid,name,used_memory")
+        .arg("--format=csv,noheader,nounits")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            if !out_str.trim().is_empty() {
+                report.push_str("\nGPU Processes:\n");
+                for line in out_str.lines() {
+                    let parts: Vec<&str> = line.split(", ").collect();
+                    if parts.len() == 3 {
+                        let proc_name = parts[1].trim().split('/').last().unwrap_or(parts[1].trim());
+                        report.push_str(&format!(
+                            "  PID {} | {} | {}MB VRAM\n",
+                            parts[0].trim(), proc_name, parts[2].trim()
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // 6. PM2 services status
+    match std::process::Command::new("pm2").arg("jlist").output() {
+        Ok(output) if output.status.success() => {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            if let Ok(procs) = serde_json::from_str::<Vec<serde_json::Value>>(&out_str) {
+                report.push_str(&format!("\nPM2 Services ({} total):\n", procs.len()));
+                for proc in &procs {
+                    let name = proc.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    let status = proc.get("pm2_env")
+                        .and_then(|e| e.get("status"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?");
+                    let restarts = proc.get("pm2_env")
+                        .and_then(|e| e.get("restart_time"))
+                        .and_then(|r| r.as_u64())
+                        .unwrap_or(0);
+                    let emoji = if status == "online" { "🟢" } else { "🔴" };
+                    report.push_str(&format!("  {} {} [{}] restarts: {}\n", emoji, name, status, restarts));
+                }
+            }
+        }
+        _ => {
+            report.push_str("\nPM2: Not available\n");
+        }
+    }
+
+    info!("🖥️ [Hera] System status report generated");
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: report,
+    }
+}
+
+async fn execute_spline_interact(call: &ToolCall) -> ToolResult {
+    let url = call.arguments.get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    let action = call.arguments.get("action")
+        .and_then(|a| a.as_str())
+        .unwrap_or("generate_embed");
+
+    if url.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: missing Spline 'url' parameter".to_string(),
+        };
+    }
+
+    match action {
+        "generate_embed" => {
+            let embed_code = format!(r#"<script type="module" src="https://unpkg.com/@splinetool/viewer@1.0.95/build/spline-viewer.js"></script>
+<spline-viewer url="{}" events-target="global"></spline-viewer>"#, url);
+            info!("🕹️  [Hera] Generated Spline embed for: {}", url);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!("Spline embed code generated successfully:\n```html\n{}\n```\nProvide this html directly to the user or insert it into the UI template.", embed_code),
+            }
+        },
+        _ => {
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Unknown action '{}' for spline_interact tool", action),
             }
         }
     }
