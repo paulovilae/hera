@@ -1,0 +1,11 @@
+{
+  "enabled": [
+    "core",
+    "workflow",
+    "web",
+    "media",
+    "docs",
+    "market",
+    "vector"
+  ]
+}

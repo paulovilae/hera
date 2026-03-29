@@ -121,7 +121,7 @@ To invoke a tool, you MUST output exactly this format:
         let mut loop_count = 0;
         let mut accumulated_context = String::new();
         let mcp_url = std::env::var("HERA_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-        let hera = hera_execution::agents::hera::Hera::new(&mcp_url);
+        let hera = hera_web::agents::hera::Hera::new(&mcp_url);
 
         while loop_count < 3 {
             loop_count += 1;

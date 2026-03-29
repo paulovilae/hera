@@ -1,6 +1,8 @@
+#![cfg(feature = "docs")]
+
 use std::collections::HashMap;
 use crate::tools::definitions::{ToolArgument, ToolDefinition, build_tool};
-use calamine::{open_workbook_auto, Reader, Error, Data};
+use calamine::{open_workbook_auto, Reader, Data};
 use std::fs;
 use uuid::Uuid;
 

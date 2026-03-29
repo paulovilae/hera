@@ -1,3 +1,5 @@
+#![cfg(feature = "vector")]
+
 use anyhow::{Context, Result};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::connection::Connection;

@@ -64,10 +64,21 @@ impl LLMEngine for OpenAICompatEngine {
             }
         }
 
-        let payload_json = serde_json::to_string(&normalized_req).unwrap_or_default();
-        tracing::debug!("Outbound Request Payload: {}", payload_json);
+        let mut payload = serde_json::to_value(&normalized_req).unwrap_or_default();
+        // Strip Hera-internal routing fields that are NOT part of the OpenAI API spec.
+        // OpenRouter rejects `provider: "cloud"` (expects object, gets string).
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("provider");
+            obj.remove("endpoint");
+            obj.remove("api_key");
+            obj.remove("vision_model");
+            obj.remove("tts_model");
+            obj.remove("stt_model");
+            obj.remove("nsfw");
+        }
+        tracing::debug!("Outbound Request Payload: {}", payload);
         
-        let mut request_builder = self.client.post(&active_endpoint).json(&normalized_req);
+        let mut request_builder = self.client.post(&active_endpoint).json(&payload);
 
         // Inject Bearer token if an API key is provided for the local engine
         if !active_key.is_empty() {
@@ -142,7 +153,18 @@ impl LLMEngine for OpenAICompatEngine {
             }
         }
 
-        let mut request_builder = self.client.post(&active_endpoint).json(&normalized_req);
+        let mut payload = serde_json::to_value(&normalized_req).unwrap_or_default();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("provider");
+            obj.remove("endpoint");
+            obj.remove("api_key");
+            obj.remove("vision_model");
+            obj.remove("tts_model");
+            obj.remove("stt_model");
+            obj.remove("nsfw");
+        }
+
+        let mut request_builder = self.client.post(&active_endpoint).json(&payload);
         if !active_key.is_empty() {
             request_builder = request_builder.bearer_auth(&active_key);
         }
@@ -178,7 +200,7 @@ impl LLMEngine for OpenAICompatEngine {
                             if line.starts_with("data: ") {
                                 let json_str = &line[6..];
                                 if json_str == "[DONE]" {
-                                    continue;
+                                    return; // Explicitly close the stream task when [DONE] is received to prevent Keep-Alive hangs
                                 }
                                 match serde_json::from_str::<crate::ai::ChatStreamResponse>(json_str) {
                                     Ok(parsed) => {

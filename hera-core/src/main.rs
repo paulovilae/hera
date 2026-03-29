@@ -4,7 +4,7 @@ use tracing::{Level, info};
 
 use hera_core::hardware::discover_docker_services;
 use hera_core::ipc_server::{serve, IpcState};
-use hera_core::ai::native_engine::get_or_init_engine;
+use hera_core::capabilities::{CapabilityId, CapabilityRegistry};
 
 #[tokio::main]
 async fn main() {
@@ -39,6 +39,9 @@ async fn main() {
 
     let services = discover_docker_services();
     info!("Active Local Containers: {}", services.len());
+
+    let capabilities = CapabilityRegistry::detect();
+    capabilities.log_summary();
     
     // Initialize Flux Native engine lazily or synchronously
     // By Sovereign Directive, Candle FLUX is deprecated due to VRAM inefficiency.
@@ -46,7 +49,7 @@ async fn main() {
     let flux_engine: Option<Arc<hera_core::ai::engine_flux::FluxEngine>> = None;
 
     // Initialize Parler-TTS Native engine
-    let parler_engine = if std::env::var("HERA_ENABLE_PARLER").unwrap_or_else(|_| "true".to_string()) == "true" {
+    let parler_engine = if capabilities.runtime_enabled(CapabilityId::AudioTts) {
         info!("🎤 Initializing Native Parler-TTS Audio Engine...");
         match hera_core::ai::engine_parler::ParlerEngine::new() {
             Ok(engine) => {
@@ -63,7 +66,7 @@ async fn main() {
     };
 
     // Initialize Whisper Native engine
-    let whisper_engine = if std::env::var("HERA_ENABLE_WHISPER").unwrap_or_else(|_| "true".to_string()) == "true" {
+    let whisper_engine = if capabilities.runtime_enabled(CapabilityId::AudioStt) {
         info!("👂 Initializing Native Whisper STT Engine...");
         match hera_core::ai::engine_whisper::WhisperEngine::new() {
             Ok(engine) => {
@@ -83,8 +86,7 @@ async fn main() {
     let llama_backend = Arc::new(llama_cpp_2::llama_backend::LlamaBackend::init().expect("Failed to initialize global LlamaBackend"));
 
     // Mount Sovereign Local LLM Engine
-    let enable_llm = std::env::var("HERA_ENABLE_LLM").unwrap_or_else(|_| "true".to_string()) == "true";
-    let local_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = if enable_llm {
+    let local_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = if capabilities.runtime_enabled(CapabilityId::LocalLlm) {
         info!("🧠 Initializing Sovereign Local LLM Engine (via Local Omni Node)...");
         let local_omni = hera_core::ai::openai_compat::OpenAICompatEngine::new(
             "http://127.0.0.1:8080/v1/chat/completions".to_string(),
@@ -177,6 +179,9 @@ async fn main() {
     tokio::spawn(async move {
         hera_core::rest_api::serve_rest_api(3002).await;
     });
+
+    // Spawn autonomous emergency watchdog
+    hera_core::watchdog::spawn_watchdog();
 
     // Block on IPC Listener natively
     if let Err(e) = serve(socket_path, state).await {

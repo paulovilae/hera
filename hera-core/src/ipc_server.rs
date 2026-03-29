@@ -208,17 +208,18 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                         match stream.read(&mut chunk).await {
                             Ok(n) if n > 0 => {
                                 buffer.extend_from_slice(&chunk[..n]);
-                                if let Ok(request) = serde_json::from_slice::<IpcPayload>(&buffer) {
-                                    info!("📥 Received IPC Action: {}", request.action);
-                                
-                                // Process Request
-                                let mut result_text = "Action not supported".to_string();
-                                let mut response_origin = "unknown".to_string();
-                                let mut response_model = String::new();
-                                let mut tool_calls: Option<serde_json::Value> = None;
-                                
-                                if request.action == "generate" {
-                                    let mut payload_clone = request.payload.clone();
+                                match serde_json::from_slice::<IpcPayload>(&buffer) {
+                                    Ok(request) => {
+                                        info!("📥 Received IPC Action: {}", request.action);
+                                        
+                                        // Process Request
+                                        let mut result_text = "Action not supported".to_string();
+                                        let mut response_origin = "unknown".to_string();
+                                        let mut response_model = String::new();
+                                        let mut tool_calls: Option<serde_json::Value> = None;
+                                        
+                                        if request.action == "generate" {
+                                            let mut payload_clone = request.payload.clone();
                                     
                                     // Extract prompt
                                     let mut prompt = payload_clone.get("prompt").and_then(|p| p.as_str()).unwrap_or("").to_string();
@@ -1136,8 +1137,19 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                     error!("❌ Failed to write IPC response: {}", e);
                                 }
                                 break;
+                                    }
+                                    Err(e) => {
+                                        error!("❌ IPC JSON Parse Error: {} - Buffer: {}", e, String::from_utf8_lossy(&buffer));
+                                        
+                                        // Send error back to client to avoid hanging
+                                        let err_msg = IpcResponse { status: "error".to_string(), data: serde_json::json!({"error": format!("Invalid JSON: {}", e)}) };
+                                        let mut estr = serde_json::to_string(&err_msg).unwrap();
+                                        estr.push('\n');
+                                        let _ = stream.write_all(estr.as_bytes()).await;
+                                        break;
+                                    }
+                                }
                             }
-                        }
                         Ok(_) => break, // EOF
                         Err(e) => {
                             error!("❌ IPC Stream Read Error: {}", e);

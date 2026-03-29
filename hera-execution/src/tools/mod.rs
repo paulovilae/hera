@@ -1,12 +1,42 @@
 pub mod definitions;
-pub mod native_ocr;
-pub mod native_xls;
+#[cfg(feature = "docs")]
+pub use hera_docs::tools::native_ocr;
+#[cfg(feature = "docs")]
+pub use hera_docs::tools::native_xls;
 
 use definitions::{ToolArgument, ToolDefinition, build_tool};
 use std::collections::HashMap;
 
+#[cfg(feature = "docs")]
+fn map_doc_tool(tool: hera_docs::tools::definitions::ToolDefinition) -> ToolDefinition {
+    ToolDefinition {
+        name: tool.name,
+        description: tool.description,
+        input_schema: definitions::InputSchema {
+            schema_type: tool.input_schema.schema_type,
+            properties: tool
+                .input_schema
+                .properties
+                .into_iter()
+                .map(|(key, arg)| {
+                    (
+                        key,
+                        ToolArgument {
+                            arg_type: arg.arg_type,
+                            description: arg.description,
+                            enum_values: arg.enum_values,
+                        },
+                    )
+                })
+                .collect(),
+            required: tool.input_schema.required,
+        },
+    }
+}
+
 pub fn get_smartos_tools() -> Vec<ToolDefinition> {
-    vec![
+    #[allow(unused_mut)]
+    let mut tools = vec![
         build_tool(
             "smartos_rbac_check",
             "Check the RBAC role and permissions for a user. Returns their tier (admin/premium/guest), allowed actions, and GPU routing info.",
@@ -60,7 +90,13 @@ pub fn get_smartos_tools() -> Vec<ToolDefinition> {
             )]),
             vec![],
         ),
-        native_ocr::get_native_ocr_tool(),
-        native_xls::get_native_xls_tool(),
-    ]
+    ];
+
+    #[cfg(feature = "docs")]
+    {
+        tools.push(map_doc_tool(native_ocr::get_native_ocr_tool()));
+        tools.push(map_doc_tool(native_xls::get_native_xls_tool()));
+    }
+
+    tools
 }

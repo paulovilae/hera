@@ -184,53 +184,74 @@ pub async fn execute_dag(req: WorkflowRequest) -> WorkflowResponse {
                     results.insert(node.id.clone(), output_res);
                 },
                 Some("llm") => {
-                    let mut payload_map = serde_json::Map::new();
-                    
-                    // We extract parameters from node.data if available, otherwise defaults
-                    let model_opt = node.data.value.clone().unwrap_or_else(|| "nvidia/nemotron-3-nano-30b-a3b:free".to_string());
-                    
-                    payload_map.insert("model".to_string(), serde_json::Value::String(model_opt));
-                    payload_map.insert("provider".to_string(), serde_json::Value::String("local".to_string()));
-                    
-                    let mut messages = Vec::new();
-                    if let Some(sys) = &node.data.system_prompt {
-                        if !sys.is_empty() {
-                            let mut sys_msg = serde_json::Map::new();
-                            sys_msg.insert("role".to_string(), serde_json::Value::String("system".to_string()));
-                            sys_msg.insert("content".to_string(), serde_json::Value::String(sys.clone()));
-                            messages.push(serde_json::Value::Object(sys_msg));
-                        }
-                    }
-                    
-                    let mut usr_msg = serde_json::Map::new();
-                    usr_msg.insert("role".to_string(), serde_json::Value::String("user".to_string()));
-                    usr_msg.insert("content".to_string(), serde_json::Value::String(resolved_payload.clone()));
-                    messages.push(serde_json::Value::Object(usr_msg));
-                    
-                    payload_map.insert("messages".to_string(), serde_json::Value::Array(messages));
-                    payload_map.insert("temperature".to_string(), serde_json::json!(0.7));
-                    payload_map.insert("max_tokens".to_string(), serde_json::json!(1024));
-                    
-                    let client = reqwest::Client::new();
-                    let out = match client.post("http://127.0.0.1:3005/v1/chat/completions")
-                        .json(&payload_map)
-                        .send()
-                        .await 
-                    {
-                        Ok(res) if res.status().is_success() => {
-                            match res.json::<serde_json::Value>().await {
-                                Ok(json) => {
-                                    json["choices"][0]["message"]["content"]
-                                        .as_str()
-                                        .unwrap_or("Empty response")
-                                        .to_string()
-                                }
-                                Err(e) => format!("Failed to parse response: {}", e)
+                    #[cfg(feature = "web")]
+                    let out = {
+                        let mut payload_map = serde_json::Map::new();
+
+                        let model_opt = node
+                            .data
+                            .value
+                            .clone()
+                            .unwrap_or_else(|| "nvidia/nemotron-3-nano-30b-a3b:free".to_string());
+
+                        payload_map.insert("model".to_string(), serde_json::Value::String(model_opt));
+                        payload_map.insert(
+                            "provider".to_string(),
+                            serde_json::Value::String("local".to_string()),
+                        );
+
+                        let mut messages = Vec::new();
+                        if let Some(sys) = &node.data.system_prompt {
+                            if !sys.is_empty() {
+                                let mut sys_msg = serde_json::Map::new();
+                                sys_msg.insert(
+                                    "role".to_string(),
+                                    serde_json::Value::String("system".to_string()),
+                                );
+                                sys_msg.insert(
+                                    "content".to_string(),
+                                    serde_json::Value::String(sys.clone()),
+                                );
+                                messages.push(serde_json::Value::Object(sys_msg));
                             }
                         }
-                        Ok(res) => format!("LLM API Error: {}", res.status()),
-                        Err(e) => format!("Network Error: {}", e)
+
+                        let mut usr_msg = serde_json::Map::new();
+                        usr_msg.insert(
+                            "role".to_string(),
+                            serde_json::Value::String("user".to_string()),
+                        );
+                        usr_msg.insert(
+                            "content".to_string(),
+                            serde_json::Value::String(resolved_payload.clone()),
+                        );
+                        messages.push(serde_json::Value::Object(usr_msg));
+
+                        payload_map.insert("messages".to_string(), serde_json::Value::Array(messages));
+                        payload_map.insert("temperature".to_string(), serde_json::json!(0.7));
+                        payload_map.insert("max_tokens".to_string(), serde_json::json!(1024));
+
+                        let client = reqwest::Client::new();
+                        match client
+                            .post("http://127.0.0.1:3005/v1/chat/completions")
+                            .json(&payload_map)
+                            .send()
+                            .await
+                        {
+                            Ok(res) if res.status().is_success() => match res.json::<serde_json::Value>().await {
+                                Ok(json) => json["choices"][0]["message"]["content"]
+                                    .as_str()
+                                    .unwrap_or("Empty response")
+                                    .to_string(),
+                                Err(e) => format!("Failed to parse response: {}", e),
+                            },
+                            Ok(res) => format!("LLM API Error: {}", res.status()),
+                            Err(e) => format!("Network Error: {}", e),
+                        }
                     };
+
+                    #[cfg(not(feature = "web"))]
+                    let out = "The `web` feature is disabled, so workflow LLM HTTP execution is unavailable.".to_string();
 
                     current_payload = out.clone();
                     results.insert(node.id.clone(), out);
@@ -245,19 +266,17 @@ pub async fn execute_dag(req: WorkflowRequest) -> WorkflowResponse {
                     results.insert(node.id.clone(), out);
                 },
                 Some("market") => {
-                    let symbol = node.data.value.clone().unwrap_or_else(|| "AAPL".to_string());
-                    let provider = yahoo_finance_api::YahooConnector::new().unwrap();
-                    let out = match provider.get_quote_range(&symbol, "1d", "1mo").await {
-                        Ok(response) => {
-                            match response.quotes() {
-                                Ok(quotes) => {
-                                    serde_json::to_string(&quotes).unwrap_or_else(|_| "[]".to_string())
-                                }
-                                Err(e) => serde_json::json!({"error": format!("Parsing Error: {}", e)}).to_string()
-                            }
-                        }
-                        Err(e) => serde_json::json!({"error": format!("API Error: {}", e)}).to_string()
+                    #[cfg(feature = "market")]
+                    let out = {
+                        let symbol = node.data.value.clone().unwrap_or_else(|| "AAPL".to_string());
+                        hera_market::quote_range_json(&symbol, "1d", "1mo").await
                     };
+
+                    #[cfg(not(feature = "market"))]
+                    let out =
+                        "The `market` feature is disabled, so market data execution is unavailable."
+                            .to_string();
+
                     current_payload = out.clone();
                     results.insert(node.id.clone(), out);
                 },
@@ -285,24 +304,44 @@ pub async fn execute_dag(req: WorkflowRequest) -> WorkflowResponse {
                     results.insert(node.id.clone(), out);
                 },
                 Some("scrape") => {
-                    let mcp_url = std::env::var("HERA_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-                    let hera = crate::agents::hera::Hera::new(&mcp_url);
-                    let url_to_scrape = resolved_payload.trim();
-                    let out = match hera.native_web_scrape(url_to_scrape).await {
-                        Ok(text) => text,
-                        Err(e) => format!("Scrape Error: {}", e)
+                    #[cfg(all(feature = "web", feature = "agents"))]
+                    let out = {
+                        let mcp_url = std::env::var("HERA_MCP_URL")
+                            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+                        let hera = crate::agents::hera::Hera::new(&mcp_url);
+                        let url_to_scrape = resolved_payload.trim();
+                        match hera.native_web_scrape(url_to_scrape).await {
+                            Ok(text) => text,
+                            Err(e) => format!("Scrape Error: {}", e),
+                        }
                     };
+
+                    #[cfg(not(all(feature = "web", feature = "agents")))]
+                    let out =
+                        "The `web` and `agents` features are required for scrape nodes."
+                            .to_string();
+
                     current_payload = out.clone();
                     results.insert(node.id.clone(), out);
                 },
                 Some("search") => {
-                    let mcp_url = std::env::var("HERA_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-                    let hera = crate::agents::hera::Hera::new(&mcp_url);
-                    let query = resolved_payload.trim();
-                    let out = match hera.native_web_search(query).await {
-                        Ok(text) => text,
-                        Err(e) => format!("Search Error: {}", e)
+                    #[cfg(all(feature = "web", feature = "agents"))]
+                    let out = {
+                        let mcp_url = std::env::var("HERA_MCP_URL")
+                            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+                        let hera = crate::agents::hera::Hera::new(&mcp_url);
+                        let query = resolved_payload.trim();
+                        match hera.native_web_search(query).await {
+                            Ok(text) => text,
+                            Err(e) => format!("Search Error: {}", e),
+                        }
                     };
+
+                    #[cfg(not(all(feature = "web", feature = "agents")))]
+                    let out =
+                        "The `web` and `agents` features are required for search nodes."
+                            .to_string();
+
                     current_payload = out.clone();
                     results.insert(node.id.clone(), out);
                 },

@@ -1,8 +1,9 @@
+#![cfg(feature = "docs")]
+
 use std::collections::HashMap;
 use crate::tools::definitions::{ToolArgument, ToolDefinition, build_tool};
 use std::process::Command;
 use std::fs;
-use std::path::Path;
 use uuid::Uuid;
 
 /// Returns the ToolDefinition for the internal native OCR tool.

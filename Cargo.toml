@@ -1,6 +1,11 @@
 [workspace]
 members = [
     "hera-core",
-    "hera-execution"
+    "hera-execution",
+    "diakonos-core",
+    "hera-web",
+    "hera-docs",
+    "hera-vector",
+    "hera-market"
 ]
 resolver = "2"

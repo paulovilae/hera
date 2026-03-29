@@ -1,6 +1,6 @@
 pub mod bridge;
-pub mod mcp;
 pub mod tools;
+#[cfg(feature = "vector")]
 pub mod memory;
 pub mod agents;
 pub mod workflow;

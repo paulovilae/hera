@@ -34,7 +34,7 @@ impl LLMEngine for RouterEngine {
 
         // Priority 1: Sovereign AI execution (Local GPUs)
         if provider == "auto" || provider == "local" || provider == "local_direct" {
-            info!("🕯️ Routing inference execution via Local MultiModal Engine...");
+            info!("🕯️ Routing inference execution via Local MultiModal Engine (model='{}')...", local_req.model);
             match self.local_engine.generate_content(local_req).await {
                 Ok(response) => {
                     info!("✅ Local execution successful");
@@ -84,7 +84,7 @@ impl LLMEngine for RouterEngine {
         let cloud_req = prepare_cloud_request(&req);
 
         if provider == "auto" || provider == "local" || provider == "local_direct" {
-            info!("🕯️ Routing STREAMING inference via Local MultiModal Engine...");
+            info!("🕯️ Routing STREAMING inference via Local MultiModal Engine (model='{}')...", local_req.model);
             match self.local_engine.generate_stream(local_req).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
@@ -95,7 +95,7 @@ impl LLMEngine for RouterEngine {
         }
 
         if provider == "auto" || provider == "gemini" || provider == "cloud" {
-            info!("☁️ Re-routing STREAMING inference onto Cloud MultiModal Engine...");
+            info!("☁️ Re-routing STREAMING inference onto Cloud MultiModal Engine (model='{}')...", cloud_req.model);
             match self.cloud_engine.generate_stream(cloud_req).await {
                 Ok(stream) => { return Ok(stream); }
                 Err(e) => { error!("☁️ Cloud Streaming fallback also crashed: {:?}", e); }

@@ -1,1 +1,2 @@
-pub mod hera;
+#[cfg(feature = "web")]
+pub use hera_web::agents::hera;
