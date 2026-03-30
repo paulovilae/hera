@@ -759,12 +759,48 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                         }
                                     }
                                 } else if request.action == "generate_image" {
-                                    if let Some(prompt) = request.payload.get("prompt").and_then(|p| p.as_str()) {
+                                    if let Some(prompt_val) = request.payload.get("prompt").and_then(|p| p.as_str()) {
+                                        let mut prompt = prompt_val.to_string();
+                                        
+                                        // --- Auto-LoRA Router ---
+                                        let triggers_path = "/home/paulo/models/image-stack/loras/triggers.json";
+                                        if let Ok(content) = std::fs::read_to_string(triggers_path) {
+                                            if let Ok(triggers) = serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&content) {
+                                                let prompt_lower = prompt.to_lowercase();
+                                                let mut claimed_keywords = std::collections::HashSet::new();
+                                                
+                                                // 1. Explicit LoRAs claim their auto-triggers first
+                                                for (lora_name, keywords) in &triggers {
+                                                    if prompt_lower.contains(&format!("<lora:{}", lora_name.to_lowercase())) {
+                                                        for k in keywords {
+                                                            claimed_keywords.insert(k.to_lowercase());
+                                                        }
+                                                    }
+                                                }
+
+                                                // 2. Auto-inject remaining LoRAs, avoiding claimed triggers
+                                                for (lora_name, keywords) in triggers {
+                                                    if !prompt_lower.contains(&format!("<lora:{}", lora_name.to_lowercase())) {
+                                                        for keyword in keywords {
+                                                            let kw_lower = keyword.to_lowercase();
+                                                            if prompt_lower.contains(&kw_lower) && !claimed_keywords.contains(&kw_lower) {
+                                                                prompt.push_str(&format!(" <lora:{}:1.0>", lora_name));
+                                                                // Claim this keyword to prevent other LoRAs from stacking on the same generic term
+                                                                claimed_keywords.insert(kw_lower);
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // ------------------------
+
                                         let width = request.payload.get("width").and_then(|w| w.as_u64()).unwrap_or(768) as usize;
                                         let height = request.payload.get("height").and_then(|h| h.as_u64()).unwrap_or(768) as usize;
                                         
                                         if let Some(flux) = &state.flux_engine {
-                                            match flux.generate_image(prompt, width, height).await {
+                                            match flux.generate_image(&prompt, width, height).await {
                                                 Ok(image_bytes) => {
                                                     use base64::{Engine as _, engine::general_purpose};
                                                     let b64 = general_purpose::STANDARD.encode(&image_bytes);
@@ -1115,6 +1151,168 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                     tool_calls = Some(serde_json::json!({
                                         "tools": raw_tools
                                     }));
+                                } else if request.action == "download_lora" {
+                                    let url = request.payload.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                                    let custom_name = request.payload.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+                                    let lora_dir = "/home/paulo/models/image-stack/loras";
+
+                                    // Read CivitAI token from Imaginclaw .env
+                                    let civitai_token = std::fs::read_to_string("/home/paulo/Programs/apps/OS/Imaginclaw/.env")
+                                        .ok()
+                                        .and_then(|content| {
+                                            content.lines()
+                                                .find(|l| l.starts_with("CIVITAI_TOKEN"))
+                                                .map(|l| l.split('=').nth(1).unwrap_or("").trim_matches('"').to_string())
+                                        })
+                                        .unwrap_or_default();
+
+                                    if url.is_empty() {
+                                        result_text = "❌ No URL provided".to_string();
+                                    } else if civitai_token.is_empty() {
+                                        result_text = "❌ CIVITAI_TOKEN not found in .env".to_string();
+                                    } else {
+                                        // Extract model ID from CivitAI page URL: https://civitai.com/models/123456/...
+                                        let model_id_opt: Option<String> = if url.contains("civitai.com/models/") {
+                                            url.split("civitai.com/models/").nth(1)
+                                                .and_then(|s| s.split('/').next())
+                                                .map(|s| s.to_string())
+                                        } else {
+                                            None
+                                        };
+
+                                        if let Some(model_id) = model_id_opt {
+                                            info!("📦 Fetching CivitAI model metadata for ID: {}", model_id);
+                                            // Query CivitAI API for model versions
+                                            let api_url = format!("https://civitai.com/api/v1/models/{}", model_id);
+                                            let client = reqwest::Client::new();
+                                            match client.get(&api_url)
+                                                .header("Authorization", format!("Bearer {}", civitai_token))
+                                                .send().await
+                                            {
+                                                Ok(api_resp) if api_resp.status().is_success() => {
+                                                    match api_resp.json::<serde_json::Value>().await {
+                                                        Ok(model_data) => {
+                                                            // Get the first model version's first file download URL
+                                                            let download_url = model_data.get("modelVersions")
+                                                                .and_then(|v| v.as_array())
+                                                                .and_then(|arr| arr.first())
+                                                                .and_then(|ver| ver.get("files"))
+                                                                .and_then(|f| f.as_array())
+                                                                .and_then(|files| files.iter().find(|f| {
+                                                                    f.get("name").and_then(|n| n.as_str())
+                                                                        .map(|n| n.ends_with(".safetensors"))
+                                                                        .unwrap_or(false)
+                                                                }))
+                                                                .and_then(|f| f.get("downloadUrl"))
+                                                                .and_then(|u| u.as_str());
+                                                            
+                                                            let file_name = model_data.get("modelVersions")
+                                                                .and_then(|v| v.as_array())
+                                                                .and_then(|arr| arr.first())
+                                                                .and_then(|ver| ver.get("files"))
+                                                                .and_then(|f| f.as_array())
+                                                                .and_then(|files| files.iter().find(|f| {
+                                                                    f.get("name").and_then(|n| n.as_str())
+                                                                        .map(|n| n.ends_with(".safetensors"))
+                                                                        .unwrap_or(false)
+                                                                }))
+                                                                .and_then(|f| f.get("name"))
+                                                                .and_then(|n| n.as_str())
+                                                                .unwrap_or("lora.safetensors");
+
+                                                            let final_name = custom_name.clone()
+                                                                .map(|n| if n.ends_with(".safetensors") { n } else { format!("{}.safetensors", n) })
+                                                                .unwrap_or_else(|| file_name.to_string());
+
+                                                            if let Some(dl_url) = download_url {
+                                                                info!("⬇️ Downloading LoRA: {} -> {}", dl_url, final_name);
+                                                                let dest_path = format!("{}/{}", lora_dir, final_name);
+                                                                match client.get(dl_url)
+                                                                    .header("Authorization", format!("Bearer {}", civitai_token))
+                                                                    .send().await
+                                                                {
+                                                                    Ok(dl_resp) if dl_resp.status().is_success() => {
+                                                                        match dl_resp.bytes().await {
+                                                                            Ok(bytes) => {
+                                                                                match std::fs::write(&dest_path, &bytes) {
+                                                                                    Ok(_) => {
+                                                                                        let size_mb = bytes.len() as f64 / 1_048_576.0;
+                                                                                        let tag_name = final_name.trim_end_matches(".safetensors").to_string();
+                                                                                        
+                                                                                        // Extract trained words or title for auto-triggers
+                                                                                        let mut auto_tags = Vec::new();
+                                                                                        if let Some(trained) = model_data.get("modelVersions").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|v| v.get("trainedWords")).and_then(|w| w.as_array()) {
+                                                                                            for t in trained {
+                                                                                                if let Some(ts) = t.as_str() { auto_tags.push(ts.to_string()); }
+                                                                                            }
+                                                                                        }
+                                                                                        if let Some(title) = model_data.get("name").and_then(|n| n.as_str()) {
+                                                                                            auto_tags.push(title.to_string());
+                                                                                        }
+                                                                                        if auto_tags.is_empty() {
+                                                                                            auto_tags.push(tag_name.clone());
+                                                                                        }
+                                                                                        
+                                                                                        // Append to triggers.json
+                                                                                        let triggers_path = format!("{}/triggers.json", lora_dir);
+                                                                                        if let Ok(content) = std::fs::read_to_string(&triggers_path) {
+                                                                                            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
+                                                                                                if let Some(obj) = json.as_object_mut() {
+                                                                                                    obj.insert(tag_name.clone(), serde_json::json!(auto_tags));
+                                                                                                    if let Ok(new_content) = serde_json::to_string_pretty(&json) {
+                                                                                                        let _ = std::fs::write(&triggers_path, new_content);
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                        }
+
+                                                                                        result_text = format!("✅ LoRA downloaded: {} ({:.1} MB)\n⚡️ Auto-Triggers extracted: {}", final_name, size_mb, auto_tags.join(", "));
+                                                                                        info!("✅ LoRA saved: {} ({:.1} MB)", dest_path, size_mb);
+                                                                                    }
+                                                                                    Err(e) => result_text = format!("❌ Failed to save file: {}", e),
+                                                                                }
+                                                                            }
+                                                                            Err(e) => result_text = format!("❌ Download stream error: {}", e),
+                                                                        }
+                                                                    }
+                                                                    Ok(dl_resp) => result_text = format!("❌ Download failed: HTTP {}", dl_resp.status()),
+                                                                    Err(e) => result_text = format!("❌ Download request failed: {}", e),
+                                                                }
+                                                            } else {
+                                                                result_text = "❌ No .safetensors file found in model versions".to_string();
+                                                            }
+                                                        }
+                                                        Err(e) => result_text = format!("❌ Failed to parse CivitAI API response: {}", e),
+                                                    }
+                                                }
+                                                Ok(api_resp) => result_text = format!("❌ CivitAI API error: HTTP {}", api_resp.status()),
+                                                Err(e) => result_text = format!("❌ CivitAI API request failed: {}", e),
+                                            }
+                                        } else {
+                                            // Direct URL download (not CivitAI page)
+                                            let final_name = custom_name.unwrap_or_else(|| "downloaded_lora.safetensors".to_string());
+                                            let dest_path = format!("{}/{}", lora_dir, final_name);
+                                            let client = reqwest::Client::new();
+                                            match client.get(&url).send().await {
+                                                Ok(resp) if resp.status().is_success() => {
+                                                    match resp.bytes().await {
+                                                        Ok(bytes) => {
+                                                            match std::fs::write(&dest_path, &bytes) {
+                                                                Ok(_) => {
+                                                                    let size_mb = bytes.len() as f64 / 1_048_576.0;
+                                                                    result_text = format!("✅ LoRA downloaded: {} ({:.1} MB)", final_name, size_mb);
+                                                                }
+                                                                Err(e) => result_text = format!("❌ Failed to save: {}", e),
+                                                            }
+                                                        }
+                                                        Err(e) => result_text = format!("❌ Download error: {}", e),
+                                                    }
+                                                }
+                                                Ok(resp) => result_text = format!("❌ HTTP {}", resp.status()),
+                                                Err(e) => result_text = format!("❌ Request failed: {}", e),
+                                            }
+                                        }
+                                    }
                                 }
                                 let mut data_json = serde_json::json!({ "result": result_text });
                                 if let Some(tc) = tool_calls {
