@@ -10,12 +10,10 @@
 //! 3. Simulate multi-round recommendation sessions
 //! 4. Record (prompt, completion) pairs showing optimal Bayesian reasoning
 
-use serde::{Deserialize, Serialize};
-use super::preference_model::{
-    DomainSchema, FeaturePreference, Item, PreferenceDistribution,
-};
 use super::bayesian_assistant::BayesianAssistant;
 use super::benchmark::SimulatedUser;
+use super::preference_model::{DomainSchema, FeaturePreference, Item};
+use serde::{Deserialize, Serialize};
 
 // ═══════════════════════════════════════════════════════════════════
 // Predefined Domain Schemas
@@ -26,11 +24,11 @@ pub fn movilo_provider_domain() -> DomainSchema {
     DomainSchema {
         name: "movilo_providers".to_string(),
         features: vec![
-            "cost".to_string(),         // consultation cost (normalized)
-            "rating".to_string(),       // patient rating [0,1]
-            "distance".to_string(),     // distance from user
-            "wait_time".to_string(),    // average wait time
-            "experience".to_string(),   // years of experience (normalized)
+            "cost".to_string(),       // consultation cost (normalized)
+            "rating".to_string(),     // patient rating [0,1]
+            "distance".to_string(),   // distance from user
+            "wait_time".to_string(),  // average wait time
+            "experience".to_string(), // years of experience (normalized)
         ],
     }
 }
@@ -40,10 +38,10 @@ pub fn vetra_trade_domain() -> DomainSchema {
     DomainSchema {
         name: "vetra_trades".to_string(),
         features: vec![
-            "volatility".to_string(),   // price volatility
-            "yield_rate".to_string(),    // expected return
-            "risk_score".to_string(),    // calculated risk
-            "liquidity".to_string(),     // trade volume / liquidity
+            "volatility".to_string(), // price volatility
+            "yield_rate".to_string(), // expected return
+            "risk_score".to_string(), // calculated risk
+            "liquidity".to_string(),  // trade volume / liquidity
         ],
     }
 }
@@ -81,10 +79,7 @@ pub struct TraceRound {
     /// Whether the assistant was correct
     pub correct: bool,
     /// Marginal probabilities per feature after update
-    pub marginals_after: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, f64>,
-    >,
+    pub marginals_after: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
 }
 
 /// A complete interaction session trace.
@@ -156,7 +151,10 @@ fn pref_to_string(pref: &FeaturePreference) -> String {
 
 /// Convert marginals (using FeaturePreference keys) to string-keyed map for serialization.
 fn stringify_marginals(
-    marginals: &std::collections::HashMap<String, std::collections::HashMap<FeaturePreference, f64>>,
+    marginals: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<FeaturePreference, f64>,
+    >,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, f64>> {
     marginals
         .iter()
@@ -176,7 +174,10 @@ pub fn run_simulation(config: &SimulationConfig) -> Vec<InteractionTrace> {
     let mut traces = Vec::with_capacity(config.n_users);
 
     for user_idx in 0..config.n_users {
-        let user_seed = config.base_seed.wrapping_mul(user_idx as u64 + 1).wrapping_add(7919);
+        let user_seed = config
+            .base_seed
+            .wrapping_mul(user_idx as u64 + 1)
+            .wrapping_add(7919);
         let user = SimulatedUser::random(n_features, user_seed);
         let mut assistant = BayesianAssistant::new(config.domain.clone(), config.temperature);
 

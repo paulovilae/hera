@@ -1,13 +1,10 @@
+use axum::{Json, Router, extract::Path, routing::post};
+use serde::Serialize;
 use std::net::SocketAddr;
-use axum::{
-    routing::post,
-    Router, Json, extract::Path,
-};
-use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, error};
+use tracing::{error, info};
 
-use crate::ai::tool_executor::{execute_tool, ToolCall, ToolResult};
+use crate::ai::tool_executor::{ToolCall, execute_tool};
 
 #[derive(Serialize)]
 pub struct ApiResponse {
@@ -26,7 +23,10 @@ pub async fn serve_rest_api(port: u16) {
         .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("🚀 Hera REST API (Direct Execution) bound to http://{}", addr);
+    info!(
+        "🚀 Hera REST API (Direct Execution) bound to http://{}",
+        addr
+    );
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     if let Err(e) = axum::serve(listener, app).await {
@@ -38,8 +38,11 @@ async fn handle_tool_execution(
     Path(tool_name): Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    info!("⚡ [Hera REST] Direct execution request for tool: {}", tool_name);
-    
+    info!(
+        "⚡ [Hera REST] Direct execution request for tool: {}",
+        tool_name
+    );
+
     // Verify it's a valid object payload for arguments, or just package it up
     let arguments = if payload.is_object() {
         payload

@@ -104,7 +104,9 @@ impl FineTuneConfig {
         Self {
             base_model_path: PathBuf::from("/home/paulo/Programs/apps/OS/models/base.gguf"),
             training_data_path: PathBuf::from("/tmp/bayesian_training.jsonl"),
-            output_adapter_path: PathBuf::from("/home/paulo/Programs/apps/OS/models/bayesian-lora.gguf"),
+            output_adapter_path: PathBuf::from(
+                "/home/paulo/Programs/apps/OS/models/bayesian-lora.gguf",
+            ),
             hardware: tier,
             epochs: 3,
             learning_rate: 1e-4,
@@ -127,7 +129,8 @@ impl FineTuneConfig {
 
     /// Effective batch size.
     pub fn effective_batch_size(&self) -> usize {
-        self.batch_size.unwrap_or_else(|| self.hardware.batch_size())
+        self.batch_size
+            .unwrap_or_else(|| self.hardware.batch_size())
     }
 }
 
@@ -139,9 +142,17 @@ impl FineTuneConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JobStatus {
     Pending,
-    Running { progress_pct: f64, current_epoch: usize },
-    Completed { adapter_path: String, final_loss: f64 },
-    Failed { error: String },
+    Running {
+        progress_pct: f64,
+        current_epoch: usize,
+    },
+    Completed {
+        adapter_path: String,
+        final_loss: f64,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// A fine-tuning job descriptor.

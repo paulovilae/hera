@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-use std::sync::Mutex;
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
+use std::path::PathBuf;
+use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
 use crate::ai::native_engine::EngineBackend;
@@ -22,10 +22,10 @@ pub fn load_tokenizer_for_gguf() -> Result<Tokenizer, Box<dyn std::error::Error 
         return Ok(tok);
     }
 
-    let tokenizer_repo = std::env::var("HERA_CANDLE_TOKENIZER_REPO")
-        .unwrap_or_else(|_| "Qwen/Qwen3-8B".to_string());
-    let tokenizer_revision = std::env::var("HERA_CANDLE_TOKENIZER_REVISION")
-        .unwrap_or_else(|_| "main".to_string());
+    let tokenizer_repo =
+        std::env::var("HERA_CANDLE_TOKENIZER_REPO").unwrap_or_else(|_| "Qwen/Qwen3-8B".to_string());
+    let tokenizer_revision =
+        std::env::var("HERA_CANDLE_TOKENIZER_REVISION").unwrap_or_else(|_| "main".to_string());
     let api = Api::new()?;
     let repo = api.repo(Repo::with_revision(
         tokenizer_repo,
@@ -60,7 +60,13 @@ pub(crate) fn load_gguf_backend(
     if arch != "qwen2" && arch != "qwen3" && !arch.ends_with("moe") {
         return Err(format!("Unsupported Neural Architecture: '{}'. Hera Native Engine currently limits execution to sovereign 'qwen2/qwen3' topologies (Dense & MoE).", arch).into());
     }
-    let is_moe = arch.ends_with("moe") || content.metadata.contains_key("qwen2.expert_feed_forward_length") || content.metadata.contains_key("qwen3.expert_feed_forward_length");
+    let is_moe = arch.ends_with("moe")
+        || content
+            .metadata
+            .contains_key("qwen2.expert_feed_forward_length")
+        || content
+            .metadata
+            .contains_key("qwen3.expert_feed_forward_length");
 
     let backend = if is_moe {
         println!(
@@ -74,20 +80,20 @@ pub(crate) fn load_gguf_backend(
             "[LLM_ENGINE]: Loading standard Qwen3 Dense GGUF backend from {} ...",
             model_path.display()
         );
-        let model = candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(content, &mut file, device)?;
+        let model = candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(
+            content, &mut file, device,
+        )?;
         EngineBackend::Qwen3Gguf(Mutex::new(model))
     } else {
         println!(
             "[LLM_ENGINE]: Loading standard Qwen2 Dense GGUF backend from {} ...",
             model_path.display()
         );
-        let model = candle_transformers::models::quantized_qwen2::ModelWeights::from_gguf(content, &mut file, device)?;
+        let model = candle_transformers::models::quantized_qwen2::ModelWeights::from_gguf(
+            content, &mut file, device,
+        )?;
         EngineBackend::Qwen2Gguf(Mutex::new(model))
     };
 
-    Ok((
-        backend,
-        tokenizer,
-        model_id.to_string(),
-    ))
+    Ok((backend, tokenizer, model_id.to_string()))
 }

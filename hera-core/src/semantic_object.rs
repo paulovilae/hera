@@ -30,11 +30,7 @@ pub struct SemanticObject {
 }
 
 impl SemanticObject {
-    pub fn new(
-        id: impl Into<String>,
-        title: impl Into<String>,
-        object_type: ObjectType,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, title: impl Into<String>, object_type: ObjectType) -> Self {
         Self {
             id: id.into(),
             parent_id: None,

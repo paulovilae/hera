@@ -10,12 +10,9 @@
 //! Or run as a standalone binary:
 //!   cargo run -p hera-core --bin bayesian_benchmark
 
-use super::preference_model::{
-    self, DomainSchema, FeaturePreference, Item, PreferenceDistribution,
-};
 use super::bayesian_assistant::BayesianAssistant;
+use super::preference_model::{DomainSchema, FeaturePreference, Item};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════════
 // Feature Flags
@@ -262,10 +259,7 @@ pub fn run_benchmark(
                 .map(|&c| c as f64 / n_users as f64)
                 .collect(),
             overall_accuracy: total_correct as f64 / total_decisions as f64,
-            entropy_per_round: round_entropy
-                .iter()
-                .map(|&e| e / n_users as f64)
-                .collect(),
+            entropy_per_round: round_entropy.iter().map(|&e| e / n_users as f64).collect(),
         });
     }
 
@@ -418,7 +412,10 @@ mod tests {
     fn test_simulated_user_deterministic() {
         let user1 = SimulatedUser::random(3, 42);
         let user2 = SimulatedUser::random(3, 42);
-        assert_eq!(user1.preferences, user2.preferences, "Same seed = same user");
+        assert_eq!(
+            user1.preferences, user2.preferences,
+            "Same seed = same user"
+        );
 
         let user3 = SimulatedUser::random(3, 99);
         // Different seeds should almost certainly produce different users
@@ -430,14 +427,15 @@ mod tests {
     fn test_simulated_user_choose() {
         // User with StrongLow on first feature = prefers low values
         let user = SimulatedUser {
-            preferences: vec![
-                FeaturePreference::StrongLow,
-                FeaturePreference::None,
-            ],
+            preferences: vec![FeaturePreference::StrongLow, FeaturePreference::None],
         };
         let options = vec![
-            Item { features: vec![0.9, 0.5] }, // expensive
-            Item { features: vec![0.1, 0.5] }, // cheap
+            Item {
+                features: vec![0.9, 0.5],
+            }, // expensive
+            Item {
+                features: vec![0.1, 0.5],
+            }, // cheap
         ];
         assert_eq!(user.choose(&options), 1, "Should choose the cheap option");
     }

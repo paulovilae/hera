@@ -25,7 +25,10 @@ impl OpenAICompatEngine {
 #[async_trait::async_trait]
 impl LLMEngine for OpenAICompatEngine {
     async fn generate_content(&self, req: ChatRequest) -> Result<ChatResponse, InferenceError> {
-        let active_endpoint = req.endpoint.clone().unwrap_or_else(|| self.endpoint_url.clone());
+        let active_endpoint = req
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| self.endpoint_url.clone());
         let active_key = req.api_key.clone().unwrap_or_else(|| self.api_key.clone());
         let mut normalized_req = req;
 
@@ -60,7 +63,10 @@ impl LLMEngine for OpenAICompatEngine {
         // Force multimodal array format to avoid strict provider crashes (e.g. OpenRouter expecting objects instead of strings)
         for message in &mut normalized_req.messages {
             if let crate::ai::MessageContent::Text(text) = &message.content {
-                message.content = crate::ai::MessageContent::Parts(vec![crate::ai::ContentPart::Text { text: text.clone() }]);
+                message.content =
+                    crate::ai::MessageContent::Parts(vec![crate::ai::ContentPart::Text {
+                        text: text.clone(),
+                    }]);
             }
         }
 
@@ -77,7 +83,7 @@ impl LLMEngine for OpenAICompatEngine {
             obj.remove("nsfw");
         }
         tracing::debug!("Outbound Request Payload: {}", payload);
-        
+
         let mut request_builder = self.client.post(&active_endpoint).json(&payload);
 
         // Inject Bearer token if an API key is provided for the local engine
@@ -112,8 +118,14 @@ impl LLMEngine for OpenAICompatEngine {
     async fn generate_stream(
         &self,
         req: ChatRequest,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>, InferenceError> {
-        let active_endpoint = req.endpoint.clone().unwrap_or_else(|| self.endpoint_url.clone());
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>,
+        InferenceError,
+    > {
+        let active_endpoint = req
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| self.endpoint_url.clone());
         let active_key = req.api_key.clone().unwrap_or_else(|| self.api_key.clone());
         let mut normalized_req = req;
 
@@ -149,7 +161,10 @@ impl LLMEngine for OpenAICompatEngine {
 
         for message in &mut normalized_req.messages {
             if let crate::ai::MessageContent::Text(text) = &message.content {
-                message.content = crate::ai::MessageContent::Parts(vec![crate::ai::ContentPart::Text { text: text.clone() }]);
+                message.content =
+                    crate::ai::MessageContent::Parts(vec![crate::ai::ContentPart::Text {
+                        text: text.clone(),
+                    }]);
             }
         }
 
@@ -170,7 +185,10 @@ impl LLMEngine for OpenAICompatEngine {
         }
 
         let res = request_builder.send().await.map_err(|e| {
-            InferenceError::ExecutionFailed(format!("Local OpenAI compat engine unreachable: {}", e))
+            InferenceError::ExecutionFailed(format!(
+                "Local OpenAI compat engine unreachable: {}",
+                e
+            ))
         })?;
 
         let status = res.status();
@@ -188,7 +206,7 @@ impl LLMEngine for OpenAICompatEngine {
             use futures_util::StreamExt;
             let mut stream = res.bytes_stream();
             let mut buffer = String::new();
-            
+
             while let Some(chunk_res) = stream.next().await {
                 match chunk_res {
                     Ok(bytes) => {
@@ -196,27 +214,38 @@ impl LLMEngine for OpenAICompatEngine {
                         while let Some(idx) = buffer.find('\n') {
                             let line = buffer[..idx].trim().to_string();
                             buffer = buffer[idx + 1..].to_string();
-                            
+
                             if line.starts_with("data: ") {
                                 let json_str = &line[6..];
                                 if json_str == "[DONE]" {
                                     return; // Explicitly close the stream task when [DONE] is received to prevent Keep-Alive hangs
                                 }
-                                match serde_json::from_str::<crate::ai::ChatStreamResponse>(json_str) {
+                                match serde_json::from_str::<crate::ai::ChatStreamResponse>(
+                                    json_str,
+                                ) {
                                     Ok(parsed) => {
                                         if tx.send(Ok(parsed)).await.is_err() {
                                             return;
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("Failed to parse SSE chunk: {} -> {}", e, json_str);
+                                        tracing::warn!(
+                                            "Failed to parse SSE chunk: {} -> {}",
+                                            e,
+                                            json_str
+                                        );
                                     }
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(InferenceError::ExecutionFailed(format!("Stream read error: {}", e)))).await;
+                        let _ = tx
+                            .send(Err(InferenceError::ExecutionFailed(format!(
+                                "Stream read error: {}",
+                                e
+                            ))))
+                            .await;
                         break;
                     }
                 }

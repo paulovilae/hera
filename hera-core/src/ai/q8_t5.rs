@@ -1,13 +1,14 @@
 //! T5 model implementation with quantization support.
 //! Customized for GGUF parsing.
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::Activation;
+use candle_transformers::models::t5::{
+    ActivationWithOptionalGating, deserialize_feed_forward_proj_activation,
+};
+pub use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
 use std::sync::Arc;
-use candle_core::quantized::QTensor;
-use candle_transformers::models::t5::{deserialize_feed_forward_proj_activation, ActivationWithOptionalGating};
-pub use candle_transformers::quantized_var_builder::VarBuilder;
 
 #[derive(Debug, Clone)]
 pub struct QMatMul {
@@ -39,7 +40,10 @@ impl Embedding {
     pub fn new_exact(name: &str, hidden_size: usize, vb: &VarBuilder) -> Result<Self> {
         let embeddings = vb.get_no_shape(name)?.dequantize(vb.device())?;
         let inner = candle_nn::Embedding::new(embeddings, hidden_size);
-        Ok(Self { inner, span: tracing::span!(tracing::Level::TRACE, "embedding") })
+        Ok(Self {
+            inner,
+            span: tracing::span!(tracing::Level::TRACE, "embedding"),
+        })
     }
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
@@ -54,9 +58,15 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
     Ok(m)
 }
 
-fn default_relative_attention_max_distance() -> usize { 128 }
-fn default_is_decoder() -> bool { false }
-fn default_use_cache() -> bool { true }
+fn default_relative_attention_max_distance() -> usize {
+    128
+}
+fn default_is_decoder() -> bool {
+    false
+}
+fn default_use_cache() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
@@ -194,18 +204,15 @@ struct T5LayerFF {
 
 impl T5LayerFF {
     fn load(prefix: &str, vb: &VarBuilder, cfg: &Config) -> Result<Self> {
-        let layer_norm =
-            T5LayerNorm::load(cfg.layer_norm_epsilon, &format!("{}.ffn_norm.weight", prefix), vb)?;
+        let layer_norm = T5LayerNorm::load(
+            cfg.layer_norm_epsilon,
+            &format!("{}.ffn_norm.weight", prefix),
+            vb,
+        )?;
         let (dense_act, gated_dense_act) = if cfg.feed_forward_proj.gated {
-            (
-                None,
-                Some(T5DenseGatedActDense::load(prefix, vb, cfg)?),
-            )
+            (None, Some(T5DenseGatedActDense::load(prefix, vb, cfg)?))
         } else {
-            (
-                Some(T5DenseActDense::load(prefix, vb, cfg)?),
-                None,
-            )
+            (Some(T5DenseActDense::load(prefix, vb, cfg)?), None)
         };
         Ok(Self {
             dense_act,
@@ -259,11 +266,8 @@ impl T5Attention {
         let v = QMatMul::new_exact(&format!("{}.attn_v.weight", prefix), vb)?;
         let o = QMatMul::new_exact(&format!("{}.attn_o.weight", prefix), vb)?;
         let relative_attention_bias = if has_relative_attention_bias {
-            let emb = Embedding::new_exact(
-                &format!("{}.attn_rel_b.weight", prefix),
-                cfg.num_heads,
-                vb,
-            )?;
+            let emb =
+                Embedding::new_exact(&format!("{}.attn_rel_b.weight", prefix), cfg.num_heads, vb)?;
             Some(emb)
         } else {
             None
@@ -303,10 +307,12 @@ impl T5Attention {
             .contiguous()?;
         let k = k
             .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
-            .transpose(1, 2)?.contiguous()?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let v = v
             .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
-            .transpose(1, 2)?.contiguous()?;
+            .transpose(1, 2)?
+            .contiguous()?;
 
         let scores = {
             let _enter = self.span_mm.enter();
@@ -340,17 +346,26 @@ impl T5Attention {
                             (0..kv_len as u32)
                                 .map(|j| {
                                     if i < j {
-                                        if j - i < max_exact { j - i + num_buckets } else {
+                                        if j - i < max_exact {
+                                            j - i + num_buckets
+                                        } else {
                                             let b = f32::log(
                                                 (j - i) as f32 / max_exact as f32,
-                                                self.relative_attention_max_distance as f32 / max_exact as f32,
+                                                self.relative_attention_max_distance as f32
+                                                    / max_exact as f32,
                                             ) * (num_buckets - max_exact) as f32;
-                                            u32::min(max_exact + num_buckets + b as u32, self.relative_attention_num_buckets as u32 - 1)
+                                            u32::min(
+                                                max_exact + num_buckets + b as u32,
+                                                self.relative_attention_num_buckets as u32 - 1,
+                                            )
                                         }
-                                    } else if i - j < max_exact { i - j } else {
+                                    } else if i - j < max_exact {
+                                        i - j
+                                    } else {
                                         let b = f32::log(
                                             (i - j) as f32 / max_exact as f32,
-                                            self.relative_attention_max_distance as f32 / max_exact as f32,
+                                            self.relative_attention_max_distance as f32
+                                                / max_exact as f32,
                                         ) * (num_buckets - max_exact) as f32;
                                         max_exact + b as u32
                                     }
@@ -397,7 +412,11 @@ impl T5Block {
         cfg: &Config,
     ) -> Result<Self> {
         let self_attn = T5Attention::load(prefix, has_relative_attention_bias, vb, cfg)?;
-        let layer_norm = T5LayerNorm::load(cfg.layer_norm_epsilon, &format!("{}.attn_norm.weight", prefix), vb)?;
+        let layer_norm = T5LayerNorm::load(
+            cfg.layer_norm_epsilon,
+            &format!("{}.attn_norm.weight", prefix),
+            vb,
+        )?;
         let ff = T5LayerFF::load(prefix, vb, cfg)?;
         Ok(Self {
             self_attn,
@@ -434,11 +453,8 @@ impl T5Stack {
         let block = (0..cfg.num_layers)
             .map(|i| T5Block::load(&format!("enc.blk.{}", i), i == 0, vb, cfg))
             .collect::<Result<Vec<_>>>()?;
-        let final_layer_norm = T5LayerNorm::load(
-            cfg.layer_norm_epsilon,
-            "enc.output_norm.weight",
-            vb,
-        )?;
+        let final_layer_norm =
+            T5LayerNorm::load(cfg.layer_norm_epsilon, "enc.output_norm.weight", vb)?;
         Ok(Self {
             block,
             shared: shared.clone(),
@@ -447,19 +463,14 @@ impl T5Stack {
         })
     }
 
-    fn forward(
-        &mut self,
-        input_ids: &Tensor,
-    ) -> Result<Tensor> {
+    fn forward(&mut self, input_ids: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let input_embeds = self.shared.as_ref().forward(input_ids)?;
         let mut hidden_states = input_embeds;
         let mut position_bias = None;
         for block in self.block.iter_mut() {
-            (hidden_states, position_bias) = block.forward(
-                &hidden_states,
-                position_bias.as_ref(),
-            )?
+            (hidden_states, position_bias) =
+                block.forward(&hidden_states, position_bias.as_ref())?
         }
         self.final_layer_norm.forward(&hidden_states)
     }

@@ -8,9 +8,9 @@
 //! - `prompt`: the context (user history + current options)
 //! - `completion`: the Bayesian assistant's reasoning + recommendation
 
-use serde::{Deserialize, Serialize};
-use super::simulator::InteractionTrace;
 use super::preference_model::Item;
+use super::simulator::InteractionTrace;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -68,11 +68,7 @@ fn system_prompt(domain: &str) -> String {
 }
 
 /// Build a user prompt for a specific round.
-fn build_prompt(
-    trace: &InteractionTrace,
-    round_idx: usize,
-    feature_names: &[String],
-) -> String {
+fn build_prompt(trace: &InteractionTrace, round_idx: usize, feature_names: &[String]) -> String {
     let mut prompt = String::new();
 
     // Include history of previous rounds
@@ -136,7 +132,9 @@ fn build_completion(
                 if *top_prob > 0.3 {
                     completion.push_str(&format!(
                         "- {}: likely {} ({:.0}%)\n",
-                        feat, top_pref, top_prob * 100.0
+                        feat,
+                        top_pref,
+                        top_prob * 100.0
                     ));
                 }
             }
@@ -244,8 +242,8 @@ pub fn write_chatml(examples: &[TrainingExample], path: &str) -> std::io::Result
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::simulator::{self, SimulationConfig, flight_domain};
+    use super::*;
 
     fn sample_traces() -> Vec<InteractionTrace> {
         let config = SimulationConfig {
@@ -262,7 +260,11 @@ mod tests {
     #[test]
     fn test_training_data_count() {
         let traces = sample_traces();
-        let features = vec!["cost".to_string(), "duration".to_string(), "stops".to_string()];
+        let features = vec![
+            "cost".to_string(),
+            "duration".to_string(),
+            "stops".to_string(),
+        ];
         let examples = traces_to_training_data(&traces, &features);
 
         // 3 users × 3 rounds = 9 examples
@@ -272,21 +274,32 @@ mod tests {
     #[test]
     fn test_training_example_structure() {
         let traces = sample_traces();
-        let features = vec!["cost".to_string(), "duration".to_string(), "stops".to_string()];
+        let features = vec![
+            "cost".to_string(),
+            "duration".to_string(),
+            "stops".to_string(),
+        ];
         let examples = traces_to_training_data(&traces, &features);
 
         for ex in &examples {
             assert!(!ex.system.is_empty(), "System prompt should not be empty");
             assert!(!ex.prompt.is_empty(), "User prompt should not be empty");
             assert!(!ex.completion.is_empty(), "Completion should not be empty");
-            assert!(ex.completion.contains("recommend"), "Completion should contain recommendation");
+            assert!(
+                ex.completion.contains("recommend"),
+                "Completion should contain recommendation"
+            );
         }
     }
 
     #[test]
     fn test_later_rounds_include_history() {
         let traces = sample_traces();
-        let features = vec!["cost".to_string(), "duration".to_string(), "stops".to_string()];
+        let features = vec![
+            "cost".to_string(),
+            "duration".to_string(),
+            "stops".to_string(),
+        ];
         let examples = traces_to_training_data(&traces, &features);
 
         // Round 0 should NOT have "Previous interactions"
@@ -301,7 +314,11 @@ mod tests {
     #[test]
     fn test_write_jsonl_to_file() {
         let traces = sample_traces();
-        let features = vec!["cost".to_string(), "duration".to_string(), "stops".to_string()];
+        let features = vec![
+            "cost".to_string(),
+            "duration".to_string(),
+            "stops".to_string(),
+        ];
         let examples = traces_to_training_data(&traces, &features);
 
         let path = "/tmp/test_bayesian_training.jsonl";
@@ -327,7 +344,11 @@ mod tests {
     #[test]
     fn test_write_chatml_format() {
         let traces = sample_traces();
-        let features = vec!["cost".to_string(), "duration".to_string(), "stops".to_string()];
+        let features = vec![
+            "cost".to_string(),
+            "duration".to_string(),
+            "stops".to_string(),
+        ];
         let examples = traces_to_training_data(&traces, &features);
 
         let path = "/tmp/test_bayesian_chatml.jsonl";
@@ -350,7 +371,11 @@ mod tests {
     #[test]
     fn test_metadata_is_populated() {
         let traces = sample_traces();
-        let features = vec!["cost".to_string(), "duration".to_string(), "stops".to_string()];
+        let features = vec![
+            "cost".to_string(),
+            "duration".to_string(),
+            "stops".to_string(),
+        ];
         let examples = traces_to_training_data(&traces, &features);
 
         for ex in &examples {

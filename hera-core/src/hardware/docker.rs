@@ -162,8 +162,6 @@ pub fn discover_docker_services() -> Vec<DockerService> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Not mocking standard library external dependencies in simple unit test,
     // but demonstrating compiling integrity bounds.
 }

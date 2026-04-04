@@ -2,12 +2,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::ai::quantized_qwen3_moe_local::GGUFQWenMoE;
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::qwen2::ModelForCausalLM as Qwen2;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
-use crate::ai::quantized_qwen3_moe_local::GGUFQWenMoE;
 
 pub struct LlmConfig {
     pub model_id: String,
@@ -87,7 +87,6 @@ impl ModelForward for GGUFQWenMoE {
     }
 }
 
-
 pub struct NativeLlmEngine {
     backend: EngineBackend,
     pub tokenizer: Tokenizer,
@@ -162,21 +161,27 @@ fn resolve_device() -> Result<Device, Box<dyn std::error::Error + Send + Sync>> 
                 }
             } else {
                 let mut selected = None;
-                
+
                 // Smart VRAM Profiler: Probe the NVIDIA driver for free memory
                 if let Ok(output) = std::process::Command::new("nvidia-smi")
-                    .args(["--query-gpu=index,memory.free", "--format=csv,noheader,nounits"])
+                    .args([
+                        "--query-gpu=index,memory.free",
+                        "--format=csv,noheader,nounits",
+                    ])
                     .output()
                 {
                     if output.status.success() {
                         if let Ok(stdout) = String::from_utf8(output.stdout) {
                             let mut best_idx = 0;
                             let mut max_free = 0;
-                            
+
                             for line in stdout.lines() {
                                 let parts: Vec<&str> = line.split(',').collect();
                                 if parts.len() == 2 {
-                                    if let (Ok(idx), Ok(free)) = (parts[0].trim().parse::<usize>(), parts[1].trim().parse::<u64>()) {
+                                    if let (Ok(idx), Ok(free)) = (
+                                        parts[0].trim().parse::<usize>(),
+                                        parts[1].trim().parse::<u64>(),
+                                    ) {
                                         if free > max_free {
                                             max_free = free;
                                             best_idx = idx;
@@ -184,9 +189,12 @@ fn resolve_device() -> Result<Device, Box<dyn std::error::Error + Send + Sync>> 
                                     }
                                 }
                             }
-                            
+
                             if max_free > 0 {
-                                println!("[LLM_ENGINE]: 🧠 Smart VRAM Profiler selected GPU {} ({} MiB free VRAM)", best_idx, max_free);
+                                println!(
+                                    "[LLM_ENGINE]: 🧠 Smart VRAM Profiler selected GPU {} ({} MiB free VRAM)",
+                                    best_idx, max_free
+                                );
                                 if let Ok(cuda) = Device::new_cuda(best_idx) {
                                     selected = Some(cuda);
                                 }
@@ -194,7 +202,7 @@ fn resolve_device() -> Result<Device, Box<dyn std::error::Error + Send + Sync>> 
                         }
                     }
                 }
-                
+
                 // Fallback to naive iteration if nvidia-smi fails
                 if selected.is_none() {
                     for idx in 0..8 {
@@ -207,7 +215,9 @@ fn resolve_device() -> Result<Device, Box<dyn std::error::Error + Send + Sync>> 
                 match selected {
                     Some(cuda) => cuda,
                     None => {
-                        println!("[LLM_ENGINE]: CUDA not available on devices 0..7, falling back to CPU.");
+                        println!(
+                            "[LLM_ENGINE]: CUDA not available on devices 0..7, falling back to CPU."
+                        );
                         Device::Cpu
                     }
                 }
@@ -216,8 +226,6 @@ fn resolve_device() -> Result<Device, Box<dyn std::error::Error + Send + Sync>> 
     };
     Ok(device)
 }
-
-
 
 pub fn init_llm_engine(config: LlmConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let legacy_block = std::env::var("HERA_ALLOW_LEGACY_CANDLE_15")
@@ -237,7 +245,10 @@ pub fn init_llm_engine(config: LlmConfig) -> Result<(), Box<dyn std::error::Erro
     println!("[LLM_ENGINE]: Using device: {:?}", device);
 
     let is_gguf_path = config.model_id.ends_with(".gguf") || Path::new(&config.model_id).exists();
-    println!("[LLM_ENGINE]: Resolved model_id: '{}', is_gguf_path: {}", config.model_id, is_gguf_path);
+    println!(
+        "[LLM_ENGINE]: Resolved model_id: '{}', is_gguf_path: {}",
+        config.model_id, is_gguf_path
+    );
 
     let (backend, tokenizer, loaded_model_id) = if is_gguf_path {
         crate::ai::engine_gguf::load_gguf_backend(&config.model_id, &device)?
@@ -259,10 +270,7 @@ pub fn init_llm_engine(config: LlmConfig) -> Result<(), Box<dyn std::error::Erro
 }
 
 impl NativeLlmEngine {
-    pub fn generate_response_with_stats(
-        &self,
-        full_prompt: &str,
-    ) -> GenerationResult {
+    pub fn generate_response_with_stats(&self, full_prompt: &str) -> GenerationResult {
         let total_start = Instant::now();
 
         let tokenization_start = Instant::now();
@@ -306,7 +314,9 @@ impl NativeLlmEngine {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(65_536);
         let reserved_for_generation = max_new_tokens.saturating_add(1);
-        let allowed_prompt_tokens = max_context_tokens.saturating_sub(reserved_for_generation).max(1);
+        let allowed_prompt_tokens = max_context_tokens
+            .saturating_sub(reserved_for_generation)
+            .max(1);
         let truncated_prompt_tokens = prompt_tokens_original.saturating_sub(allowed_prompt_tokens);
         if tokens.len() > allowed_prompt_tokens {
             let keep_from = tokens.len() - allowed_prompt_tokens;
@@ -378,22 +388,110 @@ impl NativeLlmEngine {
             let mut q2g_lock;
             let mut q3g_lock;
             let mut q3m_lock;
-            
+
             let model: &mut dyn ModelForward = match &self.backend {
                 EngineBackend::Qwen2(mutex) => {
-                    q2_lock = match mutex.lock() { Ok(l) => l, Err(_) => { return GenerationResult { text: "Error: Failed to lock model".to_string(), stats: GenerationStats { model: self.model_id.clone(), max_context_tokens, max_new_tokens, effective_context_tokens: prompt_tokens, truncated_prompt_tokens, prompt_tokens, completion_tokens: 0, total_tokens: prompt_tokens, reading_ms, generation_ms: 0, total_ms: total_start.elapsed().as_millis(), tokens_per_second: 0.0, timed_out: false } }; } };
+                    q2_lock = match mutex.lock() {
+                        Ok(l) => l,
+                        Err(_) => {
+                            return GenerationResult {
+                                text: "Error: Failed to lock model".to_string(),
+                                stats: GenerationStats {
+                                    model: self.model_id.clone(),
+                                    max_context_tokens,
+                                    max_new_tokens,
+                                    effective_context_tokens: prompt_tokens,
+                                    truncated_prompt_tokens,
+                                    prompt_tokens,
+                                    completion_tokens: 0,
+                                    total_tokens: prompt_tokens,
+                                    reading_ms,
+                                    generation_ms: 0,
+                                    total_ms: total_start.elapsed().as_millis(),
+                                    tokens_per_second: 0.0,
+                                    timed_out: false,
+                                },
+                            };
+                        }
+                    };
                     &mut *q2_lock
                 }
                 EngineBackend::Qwen2Gguf(mutex) => {
-                    q2g_lock = match mutex.lock() { Ok(l) => l, Err(_) => { return GenerationResult { text: "Error: Failed to lock model".to_string(), stats: GenerationStats { model: self.model_id.clone(), max_context_tokens, max_new_tokens, effective_context_tokens: prompt_tokens, truncated_prompt_tokens, prompt_tokens, completion_tokens: 0, total_tokens: prompt_tokens, reading_ms, generation_ms: 0, total_ms: total_start.elapsed().as_millis(), tokens_per_second: 0.0, timed_out: false } }; } };
+                    q2g_lock = match mutex.lock() {
+                        Ok(l) => l,
+                        Err(_) => {
+                            return GenerationResult {
+                                text: "Error: Failed to lock model".to_string(),
+                                stats: GenerationStats {
+                                    model: self.model_id.clone(),
+                                    max_context_tokens,
+                                    max_new_tokens,
+                                    effective_context_tokens: prompt_tokens,
+                                    truncated_prompt_tokens,
+                                    prompt_tokens,
+                                    completion_tokens: 0,
+                                    total_tokens: prompt_tokens,
+                                    reading_ms,
+                                    generation_ms: 0,
+                                    total_ms: total_start.elapsed().as_millis(),
+                                    tokens_per_second: 0.0,
+                                    timed_out: false,
+                                },
+                            };
+                        }
+                    };
                     &mut *q2g_lock
                 }
                 EngineBackend::Qwen3Gguf(mutex) => {
-                    q3g_lock = match mutex.lock() { Ok(l) => l, Err(_) => { return GenerationResult { text: "Error: Failed to lock model".to_string(), stats: GenerationStats { model: self.model_id.clone(), max_context_tokens, max_new_tokens, effective_context_tokens: prompt_tokens, truncated_prompt_tokens, prompt_tokens, completion_tokens: 0, total_tokens: prompt_tokens, reading_ms, generation_ms: 0, total_ms: total_start.elapsed().as_millis(), tokens_per_second: 0.0, timed_out: false } }; } };
+                    q3g_lock = match mutex.lock() {
+                        Ok(l) => l,
+                        Err(_) => {
+                            return GenerationResult {
+                                text: "Error: Failed to lock model".to_string(),
+                                stats: GenerationStats {
+                                    model: self.model_id.clone(),
+                                    max_context_tokens,
+                                    max_new_tokens,
+                                    effective_context_tokens: prompt_tokens,
+                                    truncated_prompt_tokens,
+                                    prompt_tokens,
+                                    completion_tokens: 0,
+                                    total_tokens: prompt_tokens,
+                                    reading_ms,
+                                    generation_ms: 0,
+                                    total_ms: total_start.elapsed().as_millis(),
+                                    tokens_per_second: 0.0,
+                                    timed_out: false,
+                                },
+                            };
+                        }
+                    };
                     &mut *q3g_lock
                 }
                 EngineBackend::Qwen3MoeGguf(mutex) => {
-                    q3m_lock = match mutex.lock() { Ok(l) => l, Err(_) => { return GenerationResult { text: "Error: Failed to lock model".to_string(), stats: GenerationStats { model: self.model_id.clone(), max_context_tokens, max_new_tokens, effective_context_tokens: prompt_tokens, truncated_prompt_tokens, prompt_tokens, completion_tokens: 0, total_tokens: prompt_tokens, reading_ms, generation_ms: 0, total_ms: total_start.elapsed().as_millis(), tokens_per_second: 0.0, timed_out: false } }; } };
+                    q3m_lock = match mutex.lock() {
+                        Ok(l) => l,
+                        Err(_) => {
+                            return GenerationResult {
+                                text: "Error: Failed to lock model".to_string(),
+                                stats: GenerationStats {
+                                    model: self.model_id.clone(),
+                                    max_context_tokens,
+                                    max_new_tokens,
+                                    effective_context_tokens: prompt_tokens,
+                                    truncated_prompt_tokens,
+                                    prompt_tokens,
+                                    completion_tokens: 0,
+                                    total_tokens: prompt_tokens,
+                                    reading_ms,
+                                    generation_ms: 0,
+                                    total_ms: total_start.elapsed().as_millis(),
+                                    tokens_per_second: 0.0,
+                                    timed_out: false,
+                                },
+                            };
+                        }
+                    };
                     &mut *q3m_lock
                 }
             };
@@ -414,19 +512,29 @@ impl NativeLlmEngine {
                     (1, tokens.len() - 1)
                 };
                 let context = &tokens[start_pos..];
-                let input_tensor = match Tensor::new(context, &self.device).and_then(|t| t.unsqueeze(0)) {
-                    Ok(t) => t,
-                    Err(err) => { failure_reason = Some(format!("tensor_build_failed: {err}")); break; }
-                };
+                let input_tensor =
+                    match Tensor::new(context, &self.device).and_then(|t| t.unsqueeze(0)) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            failure_reason = Some(format!("tensor_build_failed: {err}"));
+                            break;
+                        }
+                    };
                 let logits = match model.forward_step(&input_tensor, index_pos) {
                     Ok(l) => l,
-                    Err(err) => { failure_reason = Some(format!("model_forward_failed: {err}")); break; }
+                    Err(err) => {
+                        failure_reason = Some(format!("model_forward_failed: {err}"));
+                        break;
+                    }
                 };
                 let mut logits = logits;
                 if logits.rank() == 3 {
                     logits = match logits.squeeze(0) {
                         Ok(l) => l,
-                        Err(err) => { failure_reason = Some(format!("logits_squeeze_r3: {err}")); break; }
+                        Err(err) => {
+                            failure_reason = Some(format!("logits_squeeze_r3: {err}"));
+                            break;
+                        }
                     };
                 }
                 if logits.rank() == 2 {
@@ -434,25 +542,43 @@ impl NativeLlmEngine {
                     if seq_len > 1 {
                         logits = match logits.get(seq_len - 1) {
                             Ok(l) => l,
-                            Err(err) => { failure_reason = Some(format!("logits_get_r2: {err}")); break; }
+                            Err(err) => {
+                                failure_reason = Some(format!("logits_get_r2: {err}"));
+                                break;
+                            }
                         };
                     } else {
                         logits = match logits.squeeze(0) {
                             Ok(l) => l,
-                            Err(err) => { failure_reason = Some(format!("logits_squeeze_r2: {err}")); break; }
+                            Err(err) => {
+                                failure_reason = Some(format!("logits_squeeze_r2: {err}"));
+                                break;
+                            }
                         };
                     }
                 }
-                let logits = if repeat_penalty == 1.0 { logits } else {
+                let logits = if repeat_penalty == 1.0 {
+                    logits
+                } else {
                     let start_at = generated_token_ids.len().saturating_sub(repeat_last_n);
-                    match candle_transformers::utils::apply_repeat_penalty(&logits, repeat_penalty, &generated_token_ids[start_at..]) {
+                    match candle_transformers::utils::apply_repeat_penalty(
+                        &logits,
+                        repeat_penalty,
+                        &generated_token_ids[start_at..],
+                    ) {
                         Ok(v) => v,
-                        Err(err) => { failure_reason = Some(format!("repeat_penalty_failed: {err}")); break; }
+                        Err(err) => {
+                            failure_reason = Some(format!("repeat_penalty_failed: {err}"));
+                            break;
+                        }
                     }
                 };
                 let next_token = match logits_processor.sample(&logits) {
                     Ok(t) => t,
-                    Err(err) => { failure_reason = Some(format!("token_sample_failed: {err}")); break; }
+                    Err(err) => {
+                        failure_reason = Some(format!("token_sample_failed: {err}"));
+                        break;
+                    }
                 };
 
                 tokens.push(next_token);
@@ -469,12 +595,20 @@ impl NativeLlmEngine {
                 index_pos += context_size;
 
                 let step_ms = step_start.elapsed().as_millis();
-                if index == 0 { reading_ms += step_ms; } else { generation_ms += step_ms; }
+                if index == 0 {
+                    reading_ms += step_ms;
+                } else {
+                    generation_ms += step_ms;
+                }
             }
         }
 
         let total_ms = total_start.elapsed().as_millis();
-        let measured_gen_ms = if generation_ms == 0 { total_ms } else { generation_ms };
+        let measured_gen_ms = if generation_ms == 0 {
+            total_ms
+        } else {
+            generation_ms
+        };
         let tokens_per_second = if measured_gen_ms > 0 {
             (completion_tokens as f64) / (measured_gen_ms as f64 / 1000.0)
         } else {
@@ -545,24 +679,43 @@ impl NativeLlmEngine {
         let tokenization_start = Instant::now();
         let tokens_res = self.tokenizer.encode(prompt, true);
         if tokens_res.is_err() {
-            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed("Tokenization of prompt failed".to_string())));
+            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                "Tokenization of prompt failed".to_string(),
+            )));
             return;
         }
 
         let mut tokens = tokens_res.unwrap().get_ids().to_vec();
-        let eos_token_id = self.tokenizer.token_to_id("<|im_end|>").or_else(|| self.tokenizer.token_to_id("<|endoftext|>"));
-        let max_new_tokens = std::env::var("HERA_MAX_NEW_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048);
-        
-        let max_context_tokens = std::env::var("HERA_MAX_CONTEXT_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(65_536);
+        let eos_token_id = self
+            .tokenizer
+            .token_to_id("<|im_end|>")
+            .or_else(|| self.tokenizer.token_to_id("<|endoftext|>"));
+        let max_new_tokens = std::env::var("HERA_MAX_NEW_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048);
+
+        let max_context_tokens = std::env::var("HERA_MAX_CONTEXT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(65_536);
         let reserved_for_generation = max_new_tokens.saturating_add(1);
-        let allowed_prompt_tokens = max_context_tokens.saturating_sub(reserved_for_generation).max(1);
+        let allowed_prompt_tokens = max_context_tokens
+            .saturating_sub(reserved_for_generation)
+            .max(1);
         if tokens.len() > allowed_prompt_tokens {
             let keep_from = tokens.len() - allowed_prompt_tokens;
             tokens = tokens.split_off(keep_from);
         }
 
-        let max_gen_ms = std::env::var("HERA_MAX_GEN_MS").ok().and_then(|v| v.parse::<u128>().ok()).unwrap_or(60_000);
-        let min_completion_tokens = std::env::var("HERA_MIN_COMPLETION_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(12);
+        let max_gen_ms = std::env::var("HERA_MAX_GEN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(60_000);
+        let min_completion_tokens = std::env::var("HERA_MIN_COMPLETION_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(12);
 
         let mut generated_token_ids: Vec<u32> = Vec::new();
         let mut index_pos = 0usize;
@@ -570,25 +723,52 @@ impl NativeLlmEngine {
         let mut generation_ms = 0u128;
         let mut prev_text_len = 0;
 
-        let sampling_seed = std::env::var("HERA_SAMPLING_SEED").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(299_792_458);
-        let top_k = std::env::var("HERA_TOP_K").ok().and_then(|v| v.parse::<usize>().ok());
-        let top_p = std::env::var("HERA_TOP_P").ok().and_then(|v| v.parse::<f64>().ok());
-        let repeat_penalty = std::env::var("HERA_REPEAT_PENALTY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
-        let repeat_last_n = std::env::var("HERA_REPEAT_LAST_N").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64);
-        
+        let sampling_seed = std::env::var("HERA_SAMPLING_SEED")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(299_792_458);
+        let top_k = std::env::var("HERA_TOP_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let top_p = std::env::var("HERA_TOP_P")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok());
+        let repeat_penalty = std::env::var("HERA_REPEAT_PENALTY")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        let repeat_last_n = std::env::var("HERA_REPEAT_LAST_N")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64);
+
         let sampling = if self.temperature <= 0.0 {
             Sampling::ArgMax
         } else {
             match (top_k, top_p) {
-                (None, None) => Sampling::All { temperature: self.temperature },
-                (Some(k), None) => Sampling::TopK { k, temperature: self.temperature },
-                (None, Some(p)) => Sampling::TopP { p, temperature: self.temperature },
-                (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature: self.temperature },
+                (None, None) => Sampling::All {
+                    temperature: self.temperature,
+                },
+                (Some(k), None) => Sampling::TopK {
+                    k,
+                    temperature: self.temperature,
+                },
+                (None, Some(p)) => Sampling::TopP {
+                    p,
+                    temperature: self.temperature,
+                },
+                (Some(k), Some(p)) => Sampling::TopKThenTopP {
+                    k,
+                    p,
+                    temperature: self.temperature,
+                },
             }
         };
-        let mut logits_processor = candle_transformers::generation::LogitsProcessor::from_sampling(sampling_seed, sampling);
+        let mut logits_processor = candle_transformers::generation::LogitsProcessor::from_sampling(
+            sampling_seed,
+            sampling,
+        );
 
-        
         {
             let mut q2_lock;
             let mut q2g_lock;
@@ -597,19 +777,51 @@ impl NativeLlmEngine {
 
             let model: &mut dyn ModelForward = match &self.backend {
                 EngineBackend::Qwen2(mutex) => {
-                    q2_lock = match mutex.lock() { Ok(l) => l, Err(_) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed("Mutex lock failed".into()))); return; } };
+                    q2_lock = match mutex.lock() {
+                        Ok(l) => l,
+                        Err(_) => {
+                            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                "Mutex lock failed".into(),
+                            )));
+                            return;
+                        }
+                    };
                     &mut *q2_lock
                 }
                 EngineBackend::Qwen2Gguf(mutex) => {
-                    q2g_lock = match mutex.lock() { Ok(l) => l, Err(_) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed("Mutex lock failed".into()))); return; } };
+                    q2g_lock = match mutex.lock() {
+                        Ok(l) => l,
+                        Err(_) => {
+                            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                "Mutex lock failed".into(),
+                            )));
+                            return;
+                        }
+                    };
                     &mut *q2g_lock
                 }
                 EngineBackend::Qwen3Gguf(mutex) => {
-                    q3g_lock = match mutex.lock() { Ok(l) => l, Err(_) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed("Mutex lock failed".into()))); return; } };
+                    q3g_lock = match mutex.lock() {
+                        Ok(l) => l,
+                        Err(_) => {
+                            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                "Mutex lock failed".into(),
+                            )));
+                            return;
+                        }
+                    };
                     &mut *q3g_lock
                 }
                 EngineBackend::Qwen3MoeGguf(mutex) => {
-                    q3m_lock = match mutex.lock() { Ok(l) => l, Err(_) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed("Mutex lock failed".into()))); return; } };
+                    q3m_lock = match mutex.lock() {
+                        Ok(l) => l,
+                        Err(_) => {
+                            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                "Mutex lock failed".into(),
+                            )));
+                            return;
+                        }
+                    };
                     &mut *q3m_lock
                 }
             };
@@ -619,26 +831,49 @@ impl NativeLlmEngine {
 
             for index in 0..max_new_tokens {
                 let step_start = Instant::now();
-                if generation_ms > max_gen_ms { break; }
+                if generation_ms > max_gen_ms {
+                    break;
+                }
 
-                let (context_size, start_pos) = if index == 0 { (tokens.len(), 0) } else { (1, tokens.len() - 1) };
-                let context = &tokens[start_pos..];
-                
-                let input_tensor = match Tensor::new(context, &self.device).and_then(|t| t.unsqueeze(0)) {
-                    Ok(t) => t,
-                    Err(e) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Tensor: {}", e)))); break; }
+                let (context_size, start_pos) = if index == 0 {
+                    (tokens.len(), 0)
+                } else {
+                    (1, tokens.len() - 1)
                 };
-                
+                let context = &tokens[start_pos..];
+
+                let input_tensor =
+                    match Tensor::new(context, &self.device).and_then(|t| t.unsqueeze(0)) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                format!("Tensor: {}", e),
+                            )));
+                            break;
+                        }
+                    };
+
                 let logits = match model.forward_step(&input_tensor, index_pos) {
                     Ok(l) => l,
-                    Err(e) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Forward: {}", e)))); break; }
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!(
+                            "Forward: {}",
+                            e
+                        ))));
+                        break;
+                    }
                 };
-                
+
                 let mut logits = logits;
                 if logits.rank() == 3 {
                     logits = match logits.squeeze(0) {
                         Ok(l) => l,
-                        Err(e) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Logits squeeze r3: {}", e)))); break; }
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                format!("Logits squeeze r3: {}", e),
+                            )));
+                            break;
+                        }
                     };
                 }
                 if logits.rank() == 2 {
@@ -646,35 +881,64 @@ impl NativeLlmEngine {
                     if seq_len > 1 {
                         logits = match logits.get(seq_len - 1) {
                             Ok(l) => l,
-                            Err(e) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Logits get r2: {}", e)))); break; }
+                            Err(e) => {
+                                let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                    format!("Logits get r2: {}", e),
+                                )));
+                                break;
+                            }
                         };
                     } else {
                         logits = match logits.squeeze(0) {
                             Ok(l) => l,
-                            Err(e) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Logits squeeze r2: {}", e)))); break; }
+                            Err(e) => {
+                                let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                    format!("Logits squeeze r2: {}", e),
+                                )));
+                                break;
+                            }
                         };
                     }
                 }
-                
-                let logits = if repeat_penalty == 1.0 { logits } else {
+
+                let logits = if repeat_penalty == 1.0 {
+                    logits
+                } else {
                     let start_at = generated_token_ids.len().saturating_sub(repeat_last_n);
-                    match candle_transformers::utils::apply_repeat_penalty(&logits, repeat_penalty, &generated_token_ids[start_at..]) {
+                    match candle_transformers::utils::apply_repeat_penalty(
+                        &logits,
+                        repeat_penalty,
+                        &generated_token_ids[start_at..],
+                    ) {
                         Ok(v) => v,
-                        Err(e) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Repeat penalty: {}", e)))); break; }
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(
+                                format!("Repeat penalty: {}", e),
+                            )));
+                            break;
+                        }
                     }
                 };
-                
+
                 let next_token = match logits_processor.sample(&logits) {
                     Ok(t) => t,
-                    Err(e) => { let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Sampling: {}", e)))); break; }
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!(
+                            "Sampling: {}",
+                            e
+                        ))));
+                        break;
+                    }
                 };
 
                 tokens.push(next_token);
-                
+
                 if Some(next_token) == eos_token_id && completion_tokens >= min_completion_tokens {
                     break;
                 }
-                if Some(next_token) == eos_token_id { continue; }
+                if Some(next_token) == eos_token_id {
+                    continue;
+                }
 
                 completion_tokens += 1;
                 generated_token_ids.push(next_token);
@@ -685,7 +949,7 @@ impl NativeLlmEngine {
                     if decoded.len() > prev_text_len {
                         let new_text = decoded[prev_text_len..].to_string();
                         prev_text_len = decoded.len();
-                        
+
                         let _ = tx.blocking_send(Ok(crate::ai::ChatStreamResponse {
                             id: chat_id.clone(),
                             object: "chat.completion.chunk".to_string(),
@@ -704,11 +968,12 @@ impl NativeLlmEngine {
                         }));
                     }
                 }
-                
-                if index > 0 { generation_ms += step_start.elapsed().as_millis(); }
+
+                if index > 0 {
+                    generation_ms += step_start.elapsed().as_millis();
+                }
             }
         }
-
 
         let total_ms = total_start.elapsed().as_millis();
         let _tokenization_ms = tokenization_start.elapsed().as_millis();
@@ -754,15 +1019,15 @@ impl NativeLlmEngine {
     }
 }
 
-use crate::ai::{ChatRequest, ChatResponse, ChatChoice, ChatResponseMessage, InferenceError, LLMEngine, MessageContent, ContentPart, ChatUsage};
+use crate::ai::{
+    ChatChoice, ChatRequest, ChatResponse, ChatResponseMessage, ChatUsage, ContentPart,
+    InferenceError, LLMEngine, MessageContent,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[async_trait::async_trait]
 impl LLMEngine for NativeLlmEngine {
-    async fn generate_content(
-        &self,
-        req: ChatRequest,
-    ) -> Result<ChatResponse, InferenceError> {
+    async fn generate_content(&self, req: ChatRequest) -> Result<ChatResponse, InferenceError> {
         // Build the prompt string using ChatML format
         let mut full_prompt = String::new();
 
@@ -809,12 +1074,24 @@ impl LLMEngine for NativeLlmEngine {
         full_prompt.push_str("<|im_start|>assistant\n");
 
         unsafe {
-            if let Some(t) = req.temperature { std::env::set_var("HERA_CANDLE_TEMPERATURE", t.to_string()); }
-            if let Some(mt) = req.max_tokens { std::env::set_var("HERA_MAX_NEW_TOKENS", mt.to_string()); }
-            if let Some(p) = req.top_p { std::env::set_var("HERA_TOP_P", p.to_string()); }
-            if let Some(k) = req.top_k { std::env::set_var("HERA_TOP_K", k.to_string()); }
-            if let Some(rp) = req.repeat_penalty { std::env::set_var("HERA_REPEAT_PENALTY", rp.to_string()); }
-            if let Some(s) = req.seed { std::env::set_var("HERA_SAMPLING_SEED", s.to_string()); }
+            if let Some(t) = req.temperature {
+                std::env::set_var("HERA_CANDLE_TEMPERATURE", t.to_string());
+            }
+            if let Some(mt) = req.max_tokens {
+                std::env::set_var("HERA_MAX_NEW_TOKENS", mt.to_string());
+            }
+            if let Some(p) = req.top_p {
+                std::env::set_var("HERA_TOP_P", p.to_string());
+            }
+            if let Some(k) = req.top_k {
+                std::env::set_var("HERA_TOP_K", k.to_string());
+            }
+            if let Some(rp) = req.repeat_penalty {
+                std::env::set_var("HERA_REPEAT_PENALTY", rp.to_string());
+            }
+            if let Some(s) = req.seed {
+                std::env::set_var("HERA_SAMPLING_SEED", s.to_string());
+            }
         }
 
         // Execute natively through Candle tensors
@@ -859,9 +1136,12 @@ impl LLMEngine for NativeLlmEngine {
     async fn generate_stream(
         &self,
         req: ChatRequest,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>, InferenceError> {
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>,
+        InferenceError,
+    > {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
-        
+
         // Build the prompt string using ChatML format
         let mut full_prompt = String::new();
 
@@ -908,12 +1188,24 @@ impl LLMEngine for NativeLlmEngine {
         full_prompt.push_str("<|im_start|>assistant\n");
 
         unsafe {
-            if let Some(t) = req.temperature { std::env::set_var("HERA_CANDLE_TEMPERATURE", t.to_string()); }
-            if let Some(mt) = req.max_tokens { std::env::set_var("HERA_MAX_NEW_TOKENS", mt.to_string()); }
-            if let Some(p) = req.top_p { std::env::set_var("HERA_TOP_P", p.to_string()); }
-            if let Some(k) = req.top_k { std::env::set_var("HERA_TOP_K", k.to_string()); }
-            if let Some(rp) = req.repeat_penalty { std::env::set_var("HERA_REPEAT_PENALTY", rp.to_string()); }
-            if let Some(s) = req.seed { std::env::set_var("HERA_SAMPLING_SEED", s.to_string()); }
+            if let Some(t) = req.temperature {
+                std::env::set_var("HERA_CANDLE_TEMPERATURE", t.to_string());
+            }
+            if let Some(mt) = req.max_tokens {
+                std::env::set_var("HERA_MAX_NEW_TOKENS", mt.to_string());
+            }
+            if let Some(p) = req.top_p {
+                std::env::set_var("HERA_TOP_P", p.to_string());
+            }
+            if let Some(k) = req.top_k {
+                std::env::set_var("HERA_TOP_K", k.to_string());
+            }
+            if let Some(rp) = req.repeat_penalty {
+                std::env::set_var("HERA_REPEAT_PENALTY", rp.to_string());
+            }
+            if let Some(s) = req.seed {
+                std::env::set_var("HERA_SAMPLING_SEED", s.to_string());
+            }
         }
 
         tokio::task::spawn_blocking(move || {
@@ -922,7 +1214,7 @@ impl LLMEngine for NativeLlmEngine {
                 .unwrap_or_default()
                 .as_secs();
             let chat_id = format!("chatcmpl-{}", created);
-            
+
             if let Ok(arc_engine) = get_or_init_engine() {
                 arc_engine.generate_response_stream(&full_prompt, tx, chat_id, created);
             }
@@ -936,10 +1228,7 @@ pub struct LazyNativeEngine;
 
 #[async_trait::async_trait]
 impl LLMEngine for LazyNativeEngine {
-    async fn generate_content(
-        &self,
-        req: ChatRequest,
-    ) -> Result<ChatResponse, InferenceError> {
+    async fn generate_content(&self, req: ChatRequest) -> Result<ChatResponse, InferenceError> {
         let req_clone = req.clone();
         let engine_result = tokio::task::spawn_blocking(move || {
             unsafe {
@@ -950,14 +1239,18 @@ impl LLMEngine for LazyNativeEngine {
         .await
         .map_err(|e| InferenceError::ExecutionFailed(format!("Task spawn panic: {}", e)))?;
 
-        let engine = engine_result.map_err(|e| InferenceError::ExecutionFailed(format!("Engine init failed: {}", e)))?;
+        let engine = engine_result
+            .map_err(|e| InferenceError::ExecutionFailed(format!("Engine init failed: {}", e)))?;
         engine.generate_content(req).await
     }
 
     async fn generate_stream(
         &self,
         req: ChatRequest,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>, InferenceError> {
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>,
+        InferenceError,
+    > {
         let req_clone = req.clone();
         let engine_result = tokio::task::spawn_blocking(move || {
             unsafe {
@@ -968,7 +1261,8 @@ impl LLMEngine for LazyNativeEngine {
         .await
         .map_err(|e| InferenceError::ExecutionFailed(format!("Task spawn panic: {}", e)))?;
 
-        let engine = engine_result.map_err(|e| InferenceError::ExecutionFailed(format!("Engine init failed: {}", e)))?;
+        let engine = engine_result
+            .map_err(|e| InferenceError::ExecutionFailed(format!("Engine init failed: {}", e)))?;
         engine.generate_stream(req).await
     }
 }

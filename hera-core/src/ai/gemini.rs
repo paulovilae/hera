@@ -191,18 +191,22 @@ impl LLMEngine for GeminiEngine {
             });
         }
 
-        let generation_config =
-            if req.temperature.is_some() || req.top_p.is_some() || req.max_tokens.is_some() || req.top_k.is_some() || req.stop.is_some() {
-                Some(GeminiGenerationConfig {
-                    temperature: req.temperature,
-                    top_p: req.top_p,
-                    top_k: req.top_k,
-                    max_output_tokens: req.max_tokens,
-                    stop_sequences: req.stop,
-                })
-            } else {
-                None
-            };
+        let generation_config = if req.temperature.is_some()
+            || req.top_p.is_some()
+            || req.max_tokens.is_some()
+            || req.top_k.is_some()
+            || req.stop.is_some()
+        {
+            Some(GeminiGenerationConfig {
+                temperature: req.temperature,
+                top_p: req.top_p,
+                top_k: req.top_k,
+                max_output_tokens: req.max_tokens,
+                stop_sequences: req.stop,
+            })
+        } else {
+            None
+        };
 
         let gemini_req = GeminiGenerateRequest {
             contents: gemini_contents,

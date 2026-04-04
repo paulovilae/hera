@@ -1,10 +1,10 @@
-use hera_core::ai::tool_executor::{execute_tool, hera_tool_schemas, ToolCall};
+use hera_core::ai::tool_executor::{ToolCall, execute_tool, hera_tool_schemas};
 use rmcp::{
+    ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
-    ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -57,6 +57,90 @@ struct SpawnParallelAgentsParams {
     agents: Vec<String>,
     #[schemars(description = "Prompt sent to each agent")]
     prompt: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PersistResearchFindingParams {
+    #[schemars(description = "Stable research project identifier")]
+    project_id: String,
+    #[schemars(description = "Human-readable project title")]
+    project_title: String,
+    #[schemars(description = "Stable session identifier")]
+    session_id: String,
+    #[schemars(description = "Stable concept identifier")]
+    concept_id: String,
+    #[schemars(description = "Canonical concept name")]
+    canonical_name: String,
+    #[schemars(description = "Stable claim identifier")]
+    claim_id: String,
+    #[schemars(description = "Grounded claim text")]
+    claim_text: String,
+    #[schemars(description = "Stable evidence identifier")]
+    evidence_id: String,
+    #[schemars(description = "Supporting evidence snippet")]
+    snippet: String,
+    #[schemars(description = "Optional project goal", default)]
+    goal: Option<String>,
+    #[schemars(description = "Optional session brief", default)]
+    brief: Option<String>,
+    #[schemars(description = "Optional source kind", default)]
+    source_kind: Option<String>,
+    #[schemars(description = "Optional source reference", default)]
+    source_ref: Option<String>,
+    #[schemars(description = "Optional locator", default)]
+    locator: Option<String>,
+    #[schemars(description = "Optional concept summary", default)]
+    concept_summary: Option<String>,
+    #[schemars(description = "Optional claim type", default)]
+    claim_type: Option<String>,
+    #[schemars(description = "Optional relation edge identifier", default)]
+    edge_id: Option<String>,
+    #[schemars(description = "Optional related concept identifier", default)]
+    related_concept_id: Option<String>,
+    #[schemars(description = "Optional relation type", default)]
+    relation_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PersistChannelResearchFindingParams {
+    #[schemars(description = "Stable research project identifier")]
+    project_id: String,
+    #[schemars(description = "Human-readable project title")]
+    project_title: String,
+    #[schemars(description = "Stable session identifier")]
+    session_id: String,
+    #[schemars(description = "Stable concept identifier")]
+    concept_id: String,
+    #[schemars(description = "Canonical concept name")]
+    canonical_name: String,
+    #[schemars(description = "Stable claim identifier")]
+    claim_id: String,
+    #[schemars(description = "Grounded claim text")]
+    claim_text: String,
+    #[schemars(description = "Stable evidence identifier")]
+    evidence_id: String,
+    #[schemars(description = "Supporting evidence snippet")]
+    snippet: String,
+    #[schemars(description = "Source kind such as chat_reply or page")]
+    source_kind: String,
+    #[schemars(description = "Stable source URI for the channel/page")]
+    source_uri: String,
+    #[schemars(description = "Human-readable source label")]
+    source_label: String,
+    #[schemars(description = "Origin channel such as telegram or web_widget")]
+    channel: String,
+    #[schemars(description = "Optional project goal", default)]
+    goal: Option<String>,
+    #[schemars(description = "Optional session brief", default)]
+    brief: Option<String>,
+    #[schemars(description = "Optional short finding summary", default)]
+    summary: Option<String>,
+    #[schemars(description = "Optional locator", default)]
+    locator: Option<String>,
+    #[schemars(description = "Optional concept summary", default)]
+    concept_summary: Option<String>,
+    #[schemars(description = "Optional claim type", default)]
+    claim_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -134,12 +218,16 @@ impl HeraMcp {
         }
     }
 
-    #[tool(description = "Send a text generation request to Hera via its Unix socket. This is the sovereign local-first generation entrypoint for external MCP clients.")]
+    #[tool(
+        description = "Send a text generation request to Hera via its Unix socket. This is the sovereign local-first generation entrypoint for external MCP clients."
+    )]
     async fn generate_text(&self, Parameters(params): Parameters<GenerateTextParams>) -> String {
         send_ipc_generate(&params).await
     }
 
-    #[tool(description = "Execute any existing Hera tool by exact name with a JSON arguments object. This reuses Hera's canonical tool executor rather than reimplementing tool logic.")]
+    #[tool(
+        description = "Execute any existing Hera tool by exact name with a JSON arguments object. This reuses Hera's canonical tool executor rather than reimplementing tool logic."
+    )]
     async fn execute_tool(&self, Parameters(params): Parameters<ExecuteToolParams>) -> String {
         let call = ToolCall {
             name: params.name,
@@ -162,7 +250,9 @@ impl HeraMcp {
         result.output
     }
 
-    #[tool(description = "Spawn multiple OS/Agents personas in parallel through Hera's canonical spawn_parallel_agents tool.")]
+    #[tool(
+        description = "Spawn multiple OS/Agents personas in parallel through Hera's canonical spawn_parallel_agents tool."
+    )]
     async fn spawn_parallel_agents(
         &self,
         Parameters(params): Parameters<SpawnParallelAgentsParams>,
@@ -178,7 +268,79 @@ impl HeraMcp {
         result.output
     }
 
-    #[tool(description = "Return the currently available Hera tool schemas for a given external agent identity and permission scope.")]
+    #[tool(
+        description = "Persist a complete research finding into Memento semantic memory as project, session, concept, claim, evidence, and optionally a relation edge."
+    )]
+    async fn persist_research_finding(
+        &self,
+        Parameters(params): Parameters<PersistResearchFindingParams>,
+    ) -> String {
+        let call = ToolCall {
+            name: "persist_research_finding".to_string(),
+            arguments: json!({
+                "project_id": params.project_id,
+                "project_title": params.project_title,
+                "session_id": params.session_id,
+                "concept_id": params.concept_id,
+                "canonical_name": params.canonical_name,
+                "claim_id": params.claim_id,
+                "claim_text": params.claim_text,
+                "evidence_id": params.evidence_id,
+                "snippet": params.snippet,
+                "goal": params.goal,
+                "brief": params.brief,
+                "source_kind": params.source_kind,
+                "source_ref": params.source_ref,
+                "locator": params.locator,
+                "concept_summary": params.concept_summary,
+                "claim_type": params.claim_type,
+                "edge_id": params.edge_id,
+                "related_concept_id": params.related_concept_id,
+                "relation_type": params.relation_type
+            }),
+        };
+        let result = execute_tool(&call).await;
+        result.output
+    }
+
+    #[tool(
+        description = "Persist one grounded reusable finding from a channel conversation into Memento semantic memory with explicit source metadata."
+    )]
+    async fn persist_channel_research_finding(
+        &self,
+        Parameters(params): Parameters<PersistChannelResearchFindingParams>,
+    ) -> String {
+        let call = ToolCall {
+            name: "persist_channel_research_finding".to_string(),
+            arguments: json!({
+                "project_id": params.project_id,
+                "project_title": params.project_title,
+                "session_id": params.session_id,
+                "concept_id": params.concept_id,
+                "canonical_name": params.canonical_name,
+                "claim_id": params.claim_id,
+                "claim_text": params.claim_text,
+                "evidence_id": params.evidence_id,
+                "snippet": params.snippet,
+                "source_kind": params.source_kind,
+                "source_uri": params.source_uri,
+                "source_label": params.source_label,
+                "channel": params.channel,
+                "goal": params.goal,
+                "brief": params.brief,
+                "summary": params.summary,
+                "locator": params.locator,
+                "concept_summary": params.concept_summary,
+                "claim_type": params.claim_type
+            }),
+        };
+        let result = execute_tool(&call).await;
+        result.output
+    }
+
+    #[tool(
+        description = "Return the currently available Hera tool schemas for a given external agent identity and permission scope."
+    )]
     async fn list_tool_schemas(
         &self,
         Parameters(params): Parameters<ListToolSchemasParams>,
@@ -210,12 +372,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Hera MCP Bridge");
 
-    let service = HeraMcp::new()
-        .serve(stdio())
-        .await
-        .inspect_err(|error| {
-            tracing::error!("Hera MCP serving error: {:?}", error);
-        })?;
+    let service = HeraMcp::new().serve(stdio()).await.inspect_err(|error| {
+        tracing::error!("Hera MCP serving error: {:?}", error);
+    })?;
 
     service.waiting().await?;
     Ok(())

@@ -230,10 +230,7 @@ impl FeedbackStats {
             }
 
             // Per-model stats
-            let model_stats = stats
-                .by_model
-                .entry(interaction.model.clone())
-                .or_default();
+            let model_stats = stats.by_model.entry(interaction.model.clone()).or_default();
             model_stats.total += 1;
             match interaction.feedback {
                 FeedbackSignal::Like => model_stats.likes += 1,
@@ -287,16 +284,51 @@ mod tests {
 
     fn sample_interactions() -> Vec<AiInteraction> {
         vec![
-            AiInteraction::new("movilo", "user-1", "search", "gemini-2.5", "Find a dentist", "Dr. Garcia")
-                .with_feedback(FeedbackSignal::Like),
-            AiInteraction::new("movilo", "user-1", "search", "gemini-2.5", "Find a cardiologist", "Dr. Lopez")
-                .with_feedback(FeedbackSignal::Dislike),
-            AiInteraction::new("vetra", "user-2", "analysis", "qwen-2.5", "Analyze AAPL", "Buy signal")
-                .with_feedback(FeedbackSignal::Like),
-            AiInteraction::new("imaginclaw", "user-1", "chat", "gemini-2.5", "Hello", "Hi there!")
-                .with_feedback(FeedbackSignal::NoFeedback),
-            AiInteraction::new("vetra", "user-2", "analysis", "qwen-2.5", "Analyze MSFT", "Hold")
-                .with_feedback(FeedbackSignal::Like),
+            AiInteraction::new(
+                "movilo",
+                "user-1",
+                "search",
+                "gemini-2.5",
+                "Find a dentist",
+                "Dr. Garcia",
+            )
+            .with_feedback(FeedbackSignal::Like),
+            AiInteraction::new(
+                "movilo",
+                "user-1",
+                "search",
+                "gemini-2.5",
+                "Find a cardiologist",
+                "Dr. Lopez",
+            )
+            .with_feedback(FeedbackSignal::Dislike),
+            AiInteraction::new(
+                "vetra",
+                "user-2",
+                "analysis",
+                "qwen-2.5",
+                "Analyze AAPL",
+                "Buy signal",
+            )
+            .with_feedback(FeedbackSignal::Like),
+            AiInteraction::new(
+                "imaginclaw",
+                "user-1",
+                "chat",
+                "gemini-2.5",
+                "Hello",
+                "Hi there!",
+            )
+            .with_feedback(FeedbackSignal::NoFeedback),
+            AiInteraction::new(
+                "vetra",
+                "user-2",
+                "analysis",
+                "qwen-2.5",
+                "Analyze MSFT",
+                "Hold",
+            )
+            .with_feedback(FeedbackSignal::Like),
         ]
     }
 
@@ -316,8 +348,12 @@ mod tests {
     #[test]
     fn test_interaction_creation() {
         let interaction = AiInteraction::new(
-            "movilo", "user-42", "search", "gemini-2.5",
-            "Find me a doctor", "Dr. Garcia is available",
+            "movilo",
+            "user-42",
+            "search",
+            "gemini-2.5",
+            "Find me a doctor",
+            "Dr. Garcia is available",
         );
         assert_eq!(interaction.source_app, "movilo");
         assert_eq!(interaction.user_id, "user-42");
@@ -332,8 +368,12 @@ mod tests {
         features.insert("length".to_string(), 0.6);
 
         let interaction = AiInteraction::new(
-            "hera", "user-1", "general", "local-llm",
-            "What is Rust?", "Rust is a systems programming language",
+            "hera",
+            "user-1",
+            "general",
+            "local-llm",
+            "What is Rust?",
+            "Rust is a systems programming language",
         )
         .with_features(features);
 
@@ -344,8 +384,12 @@ mod tests {
     #[test]
     fn test_memento_payload_format() {
         let interaction = AiInteraction::new(
-            "movilo", "user-1", "search", "gemini-2.5",
-            "Find a dentist", "Dr. Garcia",
+            "movilo",
+            "user-1",
+            "search",
+            "gemini-2.5",
+            "Find a dentist",
+            "Dr. Garcia",
         )
         .with_feedback(FeedbackSignal::Like);
 
@@ -404,8 +448,12 @@ mod tests {
     fn test_truncation() {
         let long_prompt = "A".repeat(500);
         let interaction = AiInteraction::new(
-            "hera", "user-1", "chat", "llm",
-            &long_prompt, "Short response",
+            "hera",
+            "user-1",
+            "chat",
+            "llm",
+            &long_prompt,
+            "Short response",
         );
         assert!(interaction.prompt_summary.len() <= 204); // 200 + "…" (3 bytes UTF-8)
     }

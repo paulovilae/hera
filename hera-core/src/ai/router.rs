@@ -34,7 +34,10 @@ impl LLMEngine for RouterEngine {
 
         // Priority 1: Sovereign AI execution (Local GPUs)
         if provider == "auto" || provider == "local" || provider == "local_direct" {
-            info!("🕯️ Routing inference execution via Local MultiModal Engine (model='{}')...", local_req.model);
+            info!(
+                "🕯️ Routing inference execution via Local MultiModal Engine (model='{}')...",
+                local_req.model
+            );
             match self.local_engine.generate_content(local_req).await {
                 Ok(response) => {
                     info!("✅ Local execution successful");
@@ -71,34 +74,53 @@ impl LLMEngine for RouterEngine {
         }
 
         Err(InferenceError::ExecutionFailed(
-            "All available multimodal bounds collapsed (Local & Cloud). Cannot proceed.".to_string(),
+            "All available multimodal bounds collapsed (Local & Cloud). Cannot proceed."
+                .to_string(),
         ))
     }
 
     async fn generate_stream(
         &self,
         req: ChatRequest,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>, InferenceError> {
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<Result<crate::ai::ChatStreamResponse, InferenceError>>,
+        InferenceError,
+    > {
         let provider = req.provider.as_deref().unwrap_or("auto");
         let local_req = prepare_local_request(&req);
         let cloud_req = prepare_cloud_request(&req);
 
         if provider == "auto" || provider == "local" || provider == "local_direct" {
-            info!("🕯️ Routing STREAMING inference via Local MultiModal Engine (model='{}')...", local_req.model);
+            info!(
+                "🕯️ Routing STREAMING inference via Local MultiModal Engine (model='{}')...",
+                local_req.model
+            );
             match self.local_engine.generate_stream(local_req).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
-                    if provider == "local" || provider == "local_direct" { return Err(e); }
-                    warn!("⚠️ Local streaming failed: {:?}. Attempting seamless cloud failover...", e);
+                    if provider == "local" || provider == "local_direct" {
+                        return Err(e);
+                    }
+                    warn!(
+                        "⚠️ Local streaming failed: {:?}. Attempting seamless cloud failover...",
+                        e
+                    );
                 }
             }
         }
 
         if provider == "auto" || provider == "gemini" || provider == "cloud" {
-            info!("☁️ Re-routing STREAMING inference onto Cloud MultiModal Engine (model='{}')...", cloud_req.model);
+            info!(
+                "☁️ Re-routing STREAMING inference onto Cloud MultiModal Engine (model='{}')...",
+                cloud_req.model
+            );
             match self.cloud_engine.generate_stream(cloud_req).await {
-                Ok(stream) => { return Ok(stream); }
-                Err(e) => { error!("☁️ Cloud Streaming fallback also crashed: {:?}", e); }
+                Ok(stream) => {
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    error!("☁️ Cloud Streaming fallback also crashed: {:?}", e);
+                }
             }
         }
 
