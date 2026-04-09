@@ -7,10 +7,8 @@
 //! updates it via Bayes' rule after each interaction, and recommends
 //! items that maximize expected utility under current beliefs.
 
+use super::preference_model::{self, DomainSchema, Item, PreferenceDistribution};
 use serde::{Deserialize, Serialize};
-use super::preference_model::{
-    self, DomainSchema, Item, PreferenceDistribution,
-};
 
 // ═══════════════════════════════════════════════════════════════════
 // Recommendation Result
@@ -95,11 +93,7 @@ impl BayesianAssistant {
     /// Observe the user's actual choice and update beliefs accordingly.
     ///
     /// Returns the interaction record for this round.
-    pub fn observe(
-        &mut self,
-        options: &[Item],
-        user_choice_index: usize,
-    ) -> InteractionRecord {
+    pub fn observe(&mut self, options: &[Item], user_choice_index: usize) -> InteractionRecord {
         // Get our recommendation before updating
         let recommendation = self.recommend(options);
 
@@ -152,8 +146,7 @@ impl BayesianAssistant {
 
     /// Reset the assistant back to uniform prior (clears history).
     pub fn reset(&mut self) {
-        self.distribution =
-            preference_model::uniform_prior(self.distribution.domain.clone());
+        self.distribution = preference_model::uniform_prior(self.distribution.domain.clone());
         self.round = 0;
         self.history.clear();
     }
@@ -200,9 +193,15 @@ mod tests {
 
     fn sample_options() -> Vec<Item> {
         vec![
-            Item { features: vec![0.8, 0.3, 0.0] }, // expensive, short, direct
-            Item { features: vec![0.3, 0.7, 0.5] }, // cheap, long, 1 stop
-            Item { features: vec![0.5, 0.5, 1.0] }, // medium, medium, many stops
+            Item {
+                features: vec![0.8, 0.3, 0.0],
+            }, // expensive, short, direct
+            Item {
+                features: vec![0.3, 0.7, 0.5],
+            }, // cheap, long, 1 stop
+            Item {
+                features: vec![0.5, 0.5, 1.0],
+            }, // medium, medium, many stops
         ]
     }
 
@@ -230,9 +229,15 @@ mod tests {
 
             for round in 0..5 {
                 let options = vec![
-                    Item { features: vec![0.9, 0.5, 0.3] }, // expensive
-                    Item { features: vec![0.1, 0.5, 0.6] }, // cheap (user picks this)
-                    Item { features: vec![0.5, 0.5, 0.1] }, // medium
+                    Item {
+                        features: vec![0.9, 0.5, 0.3],
+                    }, // expensive
+                    Item {
+                        features: vec![0.1, 0.5, 0.6],
+                    }, // cheap (user picks this)
+                    Item {
+                        features: vec![0.5, 0.5, 0.1],
+                    }, // medium
                 ];
 
                 let rec = assistant.recommend(&options);
@@ -327,8 +332,12 @@ mod tests {
         // First, train the assistant with 5 rounds of consistent data
         for _ in 0..5 {
             let options = vec![
-                Item { features: vec![0.9, 0.5, 0.5] },
-                Item { features: vec![0.1, 0.5, 0.5] }, // cheap
+                Item {
+                    features: vec![0.9, 0.5, 0.5],
+                },
+                Item {
+                    features: vec![0.1, 0.5, 0.5],
+                }, // cheap
             ];
             assistant.observe(&options, 1);
         }
@@ -362,8 +371,12 @@ mod tests {
         // User consistently picks low cost
         for _ in 0..5 {
             let options = vec![
-                Item { features: vec![0.9, 0.5, 0.5] }, // expensive
-                Item { features: vec![0.1, 0.5, 0.5] }, // cheap
+                Item {
+                    features: vec![0.9, 0.5, 0.5],
+                }, // expensive
+                Item {
+                    features: vec![0.1, 0.5, 0.5],
+                }, // cheap
             ];
             assistant.observe(&options, 1);
         }

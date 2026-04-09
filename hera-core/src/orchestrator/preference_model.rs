@@ -143,14 +143,16 @@ impl PreferenceDistribution {
         if log_vals.is_empty() {
             return f64::NEG_INFINITY;
         }
-        let max_val = log_vals
-            .iter()
-            .cloned()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let max_val = log_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         if max_val == f64::NEG_INFINITY {
             return f64::NEG_INFINITY;
         }
-        max_val + log_vals.iter().map(|&v| (v - max_val).exp()).sum::<f64>().ln()
+        max_val
+            + log_vals
+                .iter()
+                .map(|&v| (v - max_val).exp())
+                .sum::<f64>()
+                .ln()
     }
 }
 
@@ -256,11 +258,7 @@ pub fn entropy(dist: &PreferenceDistribution) -> f64 {
         .iter()
         .map(|&lp| {
             let p = lp.exp();
-            if p > 0.0 {
-                p * lp
-            } else {
-                0.0
-            }
+            if p > 0.0 { p * lp } else { 0.0 }
         })
         .sum::<f64>()
 }
@@ -327,8 +325,12 @@ mod tests {
     fn test_bayesian_update_shifts_posterior() {
         let prior = uniform_prior(test_domain());
         let options = vec![
-            Item { features: vec![0.9, 0.5] }, // expensive, medium
-            Item { features: vec![0.1, 0.5] }, // cheap, medium
+            Item {
+                features: vec![0.9, 0.5],
+            }, // expensive, medium
+            Item {
+                features: vec![0.1, 0.5],
+            }, // cheap, medium
         ];
 
         // User picks the cheap option
@@ -359,21 +361,34 @@ mod tests {
         let mut dist = prior;
         for _ in 0..3 {
             let options = vec![
-                Item { features: vec![0.8, 0.5] }, // expensive
-                Item { features: vec![0.2, 0.5] }, // cheap
-                Item { features: vec![0.5, 0.5] }, // medium
+                Item {
+                    features: vec![0.8, 0.5],
+                }, // expensive
+                Item {
+                    features: vec![0.2, 0.5],
+                }, // cheap
+                Item {
+                    features: vec![0.5, 0.5],
+                }, // medium
             ];
             dist = bayesian_update(&dist, 1, &options, 2.0); // user picks cheap
         }
 
         // Now predict: should pick the cheap option
         let test_options = vec![
-            Item { features: vec![0.9, 0.6] }, // expensive
-            Item { features: vec![0.1, 0.4] }, // cheap
+            Item {
+                features: vec![0.9, 0.6],
+            }, // expensive
+            Item {
+                features: vec![0.1, 0.4],
+            }, // cheap
         ];
 
         let prediction = predict_best(&dist, &test_options);
-        assert_eq!(prediction, 1, "Should predict the cheap option after consistent evidence");
+        assert_eq!(
+            prediction, 1,
+            "Should predict the cheap option after consistent evidence"
+        );
     }
 
     #[test]
@@ -382,8 +397,12 @@ mod tests {
         let initial_entropy = entropy(&prior);
 
         let options = vec![
-            Item { features: vec![0.9, 0.3] },
-            Item { features: vec![0.1, 0.7] },
+            Item {
+                features: vec![0.9, 0.3],
+            },
+            Item {
+                features: vec![0.1, 0.7],
+            },
         ];
 
         let round1 = bayesian_update(&prior, 0, &options, 1.0);
@@ -406,15 +425,22 @@ mod tests {
     fn test_numerical_stability_extreme_values() {
         let prior = uniform_prior(test_domain());
         let options = vec![
-            Item { features: vec![0.0, 0.0] },
-            Item { features: vec![1.0, 1.0] },
+            Item {
+                features: vec![0.0, 0.0],
+            },
+            Item {
+                features: vec![1.0, 1.0],
+            },
         ];
 
         // High temperature — should not produce NaN
         let posterior = bayesian_update(&prior, 0, &options, 100.0);
         for &lp in &posterior.log_probs {
             assert!(!lp.is_nan(), "Log-prob should not be NaN");
-            assert!(!lp.is_infinite() || lp == f64::NEG_INFINITY, "Only -inf is acceptable");
+            assert!(
+                !lp.is_infinite() || lp == f64::NEG_INFINITY,
+                "Only -inf is acceptable"
+            );
         }
 
         let total: f64 = posterior.log_probs.iter().map(|lp| lp.exp()).sum();

@@ -1,18 +1,18 @@
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::io::{Write, Read};
 
 /// Example demonstrating how the OS / Imaginclaw interacts with the Headless Daemon.
 /// Run this with: `cargo run --example mock_ipc_client`
 /// Ensure Hera Core is running before executing this!
 fn main() {
     println!("🔌 Attempting to connect to Hera Core Headless Unix Socket...");
-    
+
     let socket_path = "/tmp/hera-core.sock";
-    
+
     match UnixStream::connect(socket_path) {
         Ok(mut stream) => {
             println!("✅ Successfully connected to Hera Core at {}", socket_path);
-            
+
             // Craft a mock JSON-RPC Payload
             let payload = r#"
             {
@@ -24,7 +24,9 @@ fn main() {
             "#;
 
             println!("📤 Sending Payload: {}", payload);
-            stream.write_all(payload.as_bytes()).expect("Failed to write to stream");
+            stream
+                .write_all(payload.as_bytes())
+                .expect("Failed to write to stream");
 
             // Read Response
             let mut response = String::new();

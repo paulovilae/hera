@@ -13,7 +13,6 @@
 //! - If a user immediately refines their search filters -> Negative
 
 use super::preference_model::{Item, PreferenceDistribution};
-use super::simulator::movilo_provider_domain;
 use serde::{Deserialize, Serialize};
 
 /// Represents a Movilo Provider as received from the DB/API.
@@ -24,11 +23,11 @@ pub struct MoviloProvider {
     pub provider_type: String,
     pub city: String,
     // Typical features
-    pub rating: f64,          // 1.0 to 5.0
-    pub min_price: f64,       // In COP (e.g. 50000.0)
-    pub distance_km: f64,     // e.g. 2.5
-    pub wait_days: f64,       // e.g. 1.0
-    pub years_experience: f64,// e.g. 10.0
+    pub rating: f64,           // 1.0 to 5.0
+    pub min_price: f64,        // In COP (e.g. 50000.0)
+    pub distance_km: f64,      // e.g. 2.5
+    pub wait_days: f64,        // e.g. 1.0
+    pub years_experience: f64, // e.g. 10.0
 }
 
 /// A ranked recommendation.
@@ -56,8 +55,8 @@ impl MoviloProvider {
         let max_exp = 30.0;
 
         // Normalize features to [0.0, 1.0] where 1.0 is "highest manifestation of the trait"
-        // Note: For cost/distance/wait, a *lower* actual value might be preferred, 
-        // but the feature value itself just represents magnitude. The PreferenceDistribution 
+        // Note: For cost/distance/wait, a *lower* actual value might be preferred,
+        // but the feature value itself just represents magnitude. The PreferenceDistribution
         // will learn `StrongLow` if the user prefers cheap/close providers.
         let f_cost = (self.min_price / max_price).clamp(0.0, 1.0);
         let f_rating = (self.rating / 5.0).clamp(0.0, 1.0);
@@ -81,7 +80,7 @@ pub fn rank_providers(
     }
 
     let items: Vec<Item> = providers.iter().map(|p| p.to_bayesian_item()).collect();
-    
+
     // Calculate expected utility for each item
     let mut ranked: Vec<RankedProvider> = providers
         .iter()
@@ -105,7 +104,11 @@ pub fn rank_providers(
         .collect();
 
     // Sort descending by expected utility
-    ranked.sort_by(|a, b| b.bayesian_score.partial_cmp(&a.bayesian_score).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.bayesian_score
+            .partial_cmp(&a.bayesian_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     ranked
 }
@@ -133,18 +136,18 @@ impl MoviloImplicitAction {
     /// Dislike = 0.0 (Strong Negative)
     pub fn to_feedback_score(&self) -> f64 {
         match self {
-            Self::DwellLongOrBook => 1.0,        // Strong Like
-            Self::DwellShortBounce => 0.1,       // Strong Dislike (misleading info)
-            Self::ImmediateSearchRefine => 0.2,  // Dislike (results irrelevant)
-            Self::NoAction => 0.4,               // Mild Dislike (didn't catch eye)
+            Self::DwellLongOrBook => 1.0,       // Strong Like
+            Self::DwellShortBounce => 0.1,      // Strong Dislike (misleading info)
+            Self::ImmediateSearchRefine => 0.2, // Dislike (results irrelevant)
+            Self::NoAction => 0.4,              // Mild Dislike (didn't catch eye)
         }
     }
-    
+
     /// Convert to a discrete choice index [0 = Dislike, 1 = Like]
     pub fn to_choice_index(&self) -> usize {
         match self {
             Self::DwellLongOrBook => 1,
-            _ => 0, 
+            _ => 0,
         }
     }
 }
@@ -200,7 +203,7 @@ mod tests {
     fn test_conversion_to_bayesian_item() {
         let provider = &sample_providers()[0];
         let item = provider.to_bayesian_item();
-        
+
         assert_eq!(item.features.len(), 5);
         // Cost: 250k / 300k = ~0.833
         assert!((item.features[0] - 0.833).abs() < 0.01);
@@ -237,14 +240,24 @@ mod tests {
         }
 
         // Normalize log_probs
-        let max_lp = prior.log_probs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let log_sum_exp = max_lp + prior.log_probs.iter().map(|&v| (v - max_lp).exp()).sum::<f64>().ln();
+        let max_lp = prior
+            .log_probs
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let log_sum_exp = max_lp
+            + prior
+                .log_probs
+                .iter()
+                .map(|&v| (v - max_lp).exp())
+                .sum::<f64>()
+                .ln();
         for lp in &mut prior.log_probs {
             *lp -= log_sum_exp;
         }
 
         let ranked = rank_providers(&providers, &prior);
-        
+
         // The cheapest provider (prov-2) should be ranked first
         assert_eq!(ranked[0].provider.id, "prov-2");
         assert_eq!(ranked[0].provider.company_name, "Barrio Dental");
@@ -255,10 +268,19 @@ mod tests {
 
     #[test]
     fn test_implicit_feedback_to_scores() {
-        assert_eq!(MoviloImplicitAction::DwellLongOrBook.to_feedback_score(), 1.0);
-        assert_eq!(MoviloImplicitAction::DwellShortBounce.to_feedback_score(), 0.1);
-        
+        assert_eq!(
+            MoviloImplicitAction::DwellLongOrBook.to_feedback_score(),
+            1.0
+        );
+        assert_eq!(
+            MoviloImplicitAction::DwellShortBounce.to_feedback_score(),
+            0.1
+        );
+
         assert_eq!(MoviloImplicitAction::DwellLongOrBook.to_choice_index(), 1);
-        assert_eq!(MoviloImplicitAction::ImmediateSearchRefine.to_choice_index(), 0);
+        assert_eq!(
+            MoviloImplicitAction::ImmediateSearchRefine.to_choice_index(),
+            0
+        );
     }
 }

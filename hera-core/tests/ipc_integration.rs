@@ -1,5 +1,5 @@
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::io::{Write, Read};
 
 #[test]
 fn test_hera_ipc_socket_reachability() {
@@ -14,10 +14,10 @@ fn test_hera_ipc_socket_reachability() {
         "payload": {}
     }
     "#;
-    
+
     // Validate we can serialize the basic protocol format expected by ipc_server.rs
     assert!(payload.contains("action"));
     assert!(payload.contains("payload"));
-    
+
     println!("✅ Verified IPC Protocol Serialization Layout");
 }

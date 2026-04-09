@@ -1,7 +1,7 @@
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::Linear;
+use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::{Embedding, Module};
 use candle_transformers::fused_moe::{FusedMoeGGUF, MoeCfg};
 use candle_transformers::models::quantized_qwen3::{Gguf, RotaryEmbedding};
@@ -101,7 +101,7 @@ impl QuantizedAttention {
         let attention_wo = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
         let q_norm = Some(gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?);
         let k_norm = Some(gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?);
-        
+
         let kv_cache = ConcatKvCache::new(2);
         Ok(QuantizedAttention {
             attention_wq,
@@ -416,11 +416,7 @@ impl GGUFQWenMoE {
                         Some(w) => (i + offset) as i64 - j as i64 <= w as i64,
                         None => true,
                     };
-                    if past_ok && sw_ok {
-                        0.
-                    } else {
-                        minf
-                    }
+                    if past_ok && sw_ok { 0. } else { minf }
                 })
             })
             .collect();

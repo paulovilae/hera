@@ -4,6 +4,28 @@
 **Stack:** Pure Rust (Candle Framework / Llama.cpp)
 **Network Status:** Headless IPC Daemon (Portless)
 
+## Bundle Position
+
+`Hera Core` is not the full Ava assistant by itself.
+
+It is one component inside the canonical Ava bundle:
+
+- `Argus`
+- `Sentinel`
+- `Imaginclaw`
+- `Hera/hera-core`
+- `Hera/diakonos-core`
+- `Memento`
+
+Before diagnosing assistant capability or adding features, read:
+
+- [Ava Bundle Capabilities Matrix](/home/paulo/Programs/apps/OS/docs/AVA_BUNDLE_CAPABILITIES_MATRIX.md)
+
+Mandatory rule:
+
+- Do not treat missing orchestration, approvals, channel handling, memory UX, or task UX as missing `Hera` execution capability without checking the full bundle first.
+- Do not duplicate memory, edge, or orchestration behavior inside `Hera` when those belong to `Memento`, `Sentinel`, or `Imaginclaw`.
+
 ## Characteristics
 Hera is the pure computational brain of the Vilaros ecosystem. Stripped of all web server and UI overhead, Hera runs as a highly optimized, headless background daemon.
 

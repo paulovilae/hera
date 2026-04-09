@@ -1,8 +1,8 @@
-use std::sync::Mutex;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::Api};
+use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
 use crate::ai::native_engine::EngineBackend;
@@ -34,7 +34,11 @@ pub(crate) fn load_hub_backend(
         DType::F16
     };
     let mut vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[weights_filename.clone()], active_dtype, &active_device)?
+        VarBuilder::from_mmaped_safetensors(
+            &[weights_filename.clone()],
+            active_dtype,
+            &active_device,
+        )?
     };
     let mut model = Qwen2::new(&qwen_config, vb)?;
 
@@ -45,7 +49,9 @@ pub(crate) fn load_hub_backend(
         if let Err(err) = warmup {
             let err_str = err.to_string();
             if err_str.contains("no cuda implementation for rms-norm") {
-                println!("[LLM_ENGINE]: CUDA backend missing rms-norm kernel. Falling back to CPU.");
+                println!(
+                    "[LLM_ENGINE]: CUDA backend missing rms-norm kernel. Falling back to CPU."
+                );
                 active_device = Device::Cpu;
                 active_dtype = DType::F32;
                 vb = unsafe {

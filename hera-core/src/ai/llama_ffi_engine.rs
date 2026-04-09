@@ -1,12 +1,14 @@
-use crate::ai::{ChatRequest, ChatResponse, ChatChoice, ChatResponseMessage, ChatUsage, InferenceError, LLMEngine, MessageContent, ContentPart, ChatStreamResponse, ChatStreamChoice, ChatStreamDelta};
+use crate::ai::{
+    ChatChoice, ChatRequest, ChatResponse, ChatResponseMessage, ChatStreamChoice, ChatStreamDelta,
+    ChatStreamResponse, ChatUsage, ContentPart, InferenceError, LLMEngine, MessageContent,
+};
 use async_trait::async_trait;
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::params::LlamaModelParams;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{info, error};
+use tokio::sync::mpsc;
+use tracing::info;
 
 pub struct LlamaFfiEngine {
     backend: Arc<LlamaBackend>,
@@ -19,7 +21,7 @@ impl LlamaFfiEngine {
         let model_params = LlamaModelParams::default().with_n_gpu_layers(99);
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
             .map_err(|e| format!("Failed to load model: {}", e))?;
-            
+
         info!("✅ [FFI] Model loaded natively via C-Bindings into VRAM.");
 
         Ok(Self {
@@ -36,7 +38,7 @@ impl LLMEngine for LlamaFfiEngine {
         stream_req.stream = Some(true); // Ensure stream mode
 
         let mut rx = self.generate_stream(stream_req).await?;
-        
+
         let mut full_content = String::new();
         let mut prompt_tokens = 0;
         let mut new_tokens = 0;
@@ -45,11 +47,10 @@ impl LLMEngine for LlamaFfiEngine {
         while let Some(res) = rx.recv().await {
             match res {
                 Ok(chunk) => {
-                    if let Some(choice) = chunk.choices.first() {
-                        if let Some(content) = &choice.delta.content {
+                    if let Some(choice) = chunk.choices.first()
+                        && let Some(content) = &choice.delta.content {
                             full_content.push_str(content);
                         }
-                    }
                     if let Some(stats) = chunk.stats {
                         prompt_tokens = stats.prompt_tokens as u32;
                         new_tokens = stats.completion_tokens as u32;
@@ -61,21 +62,19 @@ impl LLMEngine for LlamaFfiEngine {
         }
 
         Ok(ChatResponse {
-            id: format!("chatcmpl-ffi"),
+            id: "chatcmpl-ffi".to_string(),
             object: "chat.completion".to_string(),
             created: 0,
             model: "qwen-3.5-35b-ffi".to_string(),
-            choices: vec![
-                ChatChoice {
-                    index: 0,
-                    message: ChatResponseMessage {
-                        role: "assistant".to_string(),
-                        content: Some(full_content),
-                        tool_calls: None,
-                    },
-                    finish_reason: Some("stop".to_string()),
-                }
-            ],
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: "assistant".to_string(),
+                    content: Some(full_content),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
             usage: Some(ChatUsage {
                 prompt_tokens,
                 completion_tokens: new_tokens,
@@ -89,55 +88,76 @@ impl LLMEngine for LlamaFfiEngine {
         req: ChatRequest,
     ) -> Result<mpsc::Receiver<Result<ChatStreamResponse, InferenceError>>, InferenceError> {
         let (tx, rx) = mpsc::channel::<Result<ChatStreamResponse, InferenceError>>(32);
-        
-        let prompt = req.messages.iter()
+
+        let prompt = req
+            .messages
+            .iter()
             .map(|m| {
                 let role = &m.role;
                 let text = match &m.content {
                     MessageContent::Text(t) => t.clone(),
-                    MessageContent::Parts(p) => p.iter().filter_map(|part| match part {
-                        ContentPart::Text { text } => Some(text.clone()),
-                        _ => None,
-                    }).collect::<Vec<_>>().join(" "),
+                    MessageContent::Parts(p) => p
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentPart::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
                     MessageContent::Null => String::new(),
                 };
                 format!("<|im_start|>{role}\n{text}<|im_end|>\n")
             })
             .collect::<Vec<_>>()
             .join("");
-            
+
         let max_tokens = req.max_tokens.unwrap_or(1024) as i32;
-        // ⚠️ Removing the <think> tag injection. The Qwen llama.cpp tokenization natively segfaults on specific 
+        // ⚠️ Removing the <think> tag injection. The Qwen llama.cpp tokenization natively segfaults on specific
         // byte alignments when trailing `<think>\n` is appended without trailing whitespace.
-        let mut final_prompt = format!("{prompt}<|im_start|>assistant\n");
+        let final_prompt = format!("{prompt}<|im_start|>assistant\n");
 
         let model = self.model.clone();
         let backend = self.backend.clone();
 
-        info!("🧠 [FFI] Tokenizing prompt for STREAMING generation... ({} bytes)", final_prompt.len());
+        info!(
+            "🧠 [FFI] Tokenizing prompt for STREAMING generation... ({} bytes)",
+            final_prompt.len()
+        );
         let snippet = final_prompt.chars().take(500).collect::<String>();
         info!("🧠 [FFI] Prompt snippet: {:?}", snippet);
 
         tokio::task::spawn_blocking(move || {
             let start_time = std::time::Instant::now();
-            
-            eprintln!(">> Calling model.str_to_token with AddBos::Never ON EXACT BYTE LENGTH: {}", final_prompt.len());
-            let mut tokens = match model.str_to_token(&final_prompt, llama_cpp_2::model::AddBos::Never) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!(">> Tokenization Error: {}", e);
-                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Tokenize error: {}", e))));
-                    return;
-                }
-            };
+
+            eprintln!(
+                ">> Calling model.str_to_token with AddBos::Never ON EXACT BYTE LENGTH: {}",
+                final_prompt.len()
+            );
+            let mut tokens =
+                match model.str_to_token(&final_prompt, llama_cpp_2::model::AddBos::Never) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!(">> Tokenization Error: {}", e);
+                        let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!(
+                            "Tokenize error: {}",
+                            e
+                        ))));
+                        return;
+                    }
+                };
 
             // 🛡️ Batch Overflow Protection: truncate prompt to leave room for generation
             let max_ctx: usize = 32768;
             let generation_headroom = max_tokens as usize + 64; // leave space for output
             let max_prompt_tokens = max_ctx.saturating_sub(generation_headroom);
             if tokens.len() > max_prompt_tokens {
-                eprintln!(">> ⚠️ [FFI] Prompt has {} tokens, truncating to {} (max_ctx={}, headroom={})", 
-                    tokens.len(), max_prompt_tokens, max_ctx, generation_headroom);
+                eprintln!(
+                    ">> ⚠️ [FFI] Prompt has {} tokens, truncating to {} (max_ctx={}, headroom={})",
+                    tokens.len(),
+                    max_prompt_tokens,
+                    max_ctx,
+                    generation_headroom
+                );
                 tokens.truncate(max_prompt_tokens);
             }
 
@@ -147,11 +167,14 @@ impl LLMEngine for LlamaFfiEngine {
             let ctx_params = llama_cpp_2::context::params::LlamaContextParams::default()
                 .with_n_ctx(Some(std::num::NonZeroU32::new(32768).unwrap()))
                 .with_n_batch(8192);
-                
+
             let mut ctx = match model.new_context(&backend, ctx_params) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Context alloc error: {}", e))));
+                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!(
+                        "Context alloc error: {}",
+                        e
+                    ))));
                     return;
                 }
             };
@@ -163,13 +186,17 @@ impl LLMEngine for LlamaFfiEngine {
             if tokens.len() > 1 {
                 let prompt_tokens_no_last = &tokens[..tokens.len() - 1];
                 for chunk in prompt_tokens_no_last.chunks(safe_batch_size) {
-                    let mut prompt_batch = llama_cpp_2::llama_batch::LlamaBatch::new(chunk.len(), 1);
+                    let mut prompt_batch =
+                        llama_cpp_2::llama_batch::LlamaBatch::new(chunk.len(), 1);
                     for &token in chunk {
                         prompt_batch.add(token, n_cur, &[0], false).unwrap();
                         n_cur += 1;
                     }
                     if let Err(e) = ctx.decode(&mut prompt_batch) {
-                        let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Prompt decode error at pos {}: {}", n_cur, e))));
+                        let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!(
+                            "Prompt decode error at pos {}: {}",
+                            n_cur, e
+                        ))));
                         return;
                     }
                 }
@@ -182,7 +209,10 @@ impl LLMEngine for LlamaFfiEngine {
                 batch.add(last_token, n_cur, &[0], true).unwrap();
                 n_cur += 1;
                 if let Err(e) = ctx.decode(&mut batch) {
-                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Final prompt decode error: {}", e))));
+                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!(
+                        "Final prompt decode error: {}",
+                        e
+                    ))));
                     return;
                 }
             }
@@ -198,11 +228,14 @@ impl LLMEngine for LlamaFfiEngine {
                 // so `batch.n_tokens() - 1` is exactly 0.
                 let candidates_iter = ctx.candidates_ith(batch.n_tokens() - 1);
                 eprintln!(">> Building LlamaTokenDataArray");
-                let mut candidates = llama_cpp_2::token::data_array::LlamaTokenDataArray::from_iter(candidates_iter, false);
+                let mut candidates = llama_cpp_2::token::data_array::LlamaTokenDataArray::from_iter(
+                    candidates_iter,
+                    false,
+                );
                 eprintln!(">> Sampling token");
                 let token_id = candidates.sample_token_greedy();
                 eprintln!(">> Sampled token ID: {}", token_id.0);
-                
+
                 if token_id == model.token_eos() || model.is_eog_token(token_id) {
                     eprintln!(">> Hit EOS or EOG");
                     break;
@@ -217,12 +250,18 @@ impl LLMEngine for LlamaFfiEngine {
 
                 batch.clear();
                 if let Err(e) = batch.add(token_id, n_cur, &[0], true) {
-                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Batch add generation error: {}", e))));
+                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!(
+                        "Batch add generation error: {}",
+                        e
+                    ))));
                     break;
                 }
-                    
+
                 if let Err(e) = ctx.decode(&mut batch) {
-                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!("Decode step error: {}", e))));
+                    let _ = tx.blocking_send(Err(InferenceError::ExecutionFailed(format!(
+                        "Decode step error: {}",
+                        e
+                    ))));
                     break;
                 }
 
@@ -242,11 +281,11 @@ impl LLMEngine for LlamaFfiEngine {
                     }],
                     stats: None,
                 };
-                
+
                 if tx.blocking_send(Ok(resp)).is_err() {
                     break; // Client disconnected
                 }
-                    
+
                 n_cur += 1;
                 generated_tokens += 1;
             }

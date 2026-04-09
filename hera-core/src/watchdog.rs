@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 /// Path where the watchdog writes emergency alerts for external consumers
 const ALERT_FILE: &str = "/tmp/hera-watchdog-alerts.jsonl";
@@ -51,7 +51,10 @@ impl WatchdogState {
 /// Call this once from `main.rs` after all engines are initialized.
 pub fn spawn_watchdog() {
     tokio::spawn(async move {
-        info!("🐕 [Watchdog] Autonomous emergency watchdog started (tick: {}s)", TICK_INTERVAL_SECS);
+        info!(
+            "🐕 [Watchdog] Autonomous emergency watchdog started (tick: {}s)",
+            TICK_INTERVAL_SECS
+        );
         let mut state = WatchdogState::new();
 
         // Initial delay — let all services finish booting
@@ -100,7 +103,10 @@ async fn watchdog_tick(state: &mut WatchdogState) -> Result<(), String> {
                 warn!("🐕 [Watchdog] Warning: {}", emergency.message);
             }
             Severity::Critical => {
-                error!("🐕 [Watchdog] ⚠️ CRITICAL (needs human): {}", emergency.message);
+                error!(
+                    "🐕 [Watchdog] ⚠️ CRITICAL (needs human): {}",
+                    emergency.message
+                );
                 write_alert(emergency);
             }
         }
@@ -111,9 +117,9 @@ async fn watchdog_tick(state: &mut WatchdogState) -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 enum Severity {
-    AutoHealed,  // Fixed automatically, just logged
-    Warning,     // Something degraded but not critical
-    Critical,    // Can't auto-fix, escalate to user
+    AutoHealed, // Fixed automatically, just logged
+    Warning,    // Something degraded but not critical
+    Critical,   // Can't auto-fix, escalate to user
 }
 
 #[derive(Debug, Clone)]
@@ -140,11 +146,13 @@ fn check_pm2_services(state: &mut WatchdogState, emergencies: &mut Vec<Emergency
 
     for proc in &procs {
         let name = proc.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-        let status = proc.get("pm2_env")
+        let status = proc
+            .get("pm2_env")
             .and_then(|e| e.get("status"))
             .and_then(|s| s.as_str())
             .unwrap_or("?");
-        let restarts = proc.get("pm2_env")
+        let restarts = proc
+            .get("pm2_env")
             .and_then(|e| e.get("restart_time"))
             .and_then(|r| r.as_u64())
             .unwrap_or(0);
@@ -156,7 +164,7 @@ fn check_pm2_services(state: &mut WatchdogState, emergencies: &mut Vec<Emergency
             if *attempt_count < MAX_AUTO_RESTARTS {
                 // Attempt auto-restart
                 let restart_result = std::process::Command::new("pm2")
-                    .args(&["restart", name])
+                    .args(["restart", name])
                     .output();
 
                 *attempt_count += 1;
@@ -221,7 +229,7 @@ fn check_pm2_services(state: &mut WatchdogState, emergencies: &mut Vec<Emergency
 /// Check disk space — services crash silently when disk is full
 fn check_disk_space(emergencies: &mut Vec<Emergency>) {
     let output = match std::process::Command::new("df")
-        .args(&["-h", "--output=target,pcent,avail", "/", "/home"])
+        .args(["-h", "--output=target,pcent,avail", "/", "/home"])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -266,7 +274,10 @@ fn check_disk_space(emergencies: &mut Vec<Emergency>) {
 /// Check GPU VRAM exhaustion
 fn check_vram(emergencies: &mut Vec<Emergency>) {
     let output = match std::process::Command::new("nvidia-smi")
-        .args(&["--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=index,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -310,7 +321,8 @@ fn check_wireguard(emergencies: &mut Vec<Emergency>) {
             severity: Severity::Critical,
             category: "WIREGUARD_DOWN".to_string(),
             service: "wg0".to_string(),
-            message: "WireGuard tunnel is DOWN — external traffic cannot reach services".to_string(),
+            message: "WireGuard tunnel is DOWN — external traffic cannot reach services"
+                .to_string(),
             action_taken: "escalated to user (requires sudo)".to_string(),
         });
     }
@@ -320,7 +332,16 @@ fn check_wireguard(emergencies: &mut Vec<Emergency>) {
 fn check_sentinel(state: &mut WatchdogState, emergencies: &mut Vec<Emergency>) {
     // Quick TCP probe to port 3000
     let probe = std::process::Command::new("curl")
-        .args(&["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "2", "http://127.0.0.1:3000/"])
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--connect-timeout",
+            "2",
+            "http://127.0.0.1:3000/",
+        ])
         .output();
 
     match probe {
@@ -328,9 +349,14 @@ fn check_sentinel(state: &mut WatchdogState, emergencies: &mut Vec<Emergency>) {
             let code_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let code: u16 = code_str.parse().unwrap_or(0);
             if code == 0 {
-                let attempt_count = state.restart_counts.entry("sentinel".to_string()).or_insert(0);
+                let attempt_count = state
+                    .restart_counts
+                    .entry("sentinel".to_string())
+                    .or_insert(0);
                 if *attempt_count < MAX_AUTO_RESTARTS {
-                    let _ = std::process::Command::new("pm2").args(&["restart", "sentinel"]).output();
+                    let _ = std::process::Command::new("pm2")
+                        .args(["restart", "sentinel"])
+                        .output();
                     *attempt_count += 1;
                     emergencies.push(Emergency {
                         severity: Severity::AutoHealed,
@@ -360,7 +386,9 @@ fn check_sentinel(state: &mut WatchdogState, emergencies: &mut Vec<Emergency>) {
 /// Log a watchdog event to the persistent log file
 fn log_watchdog_event(emergency: &Emergency) {
     let now = {
-        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         format!("{}", d.as_secs())
     };
     let severity_str = match emergency.severity {
@@ -399,7 +427,9 @@ fn log_watchdog_event(emergency: &Emergency) {
 /// (Telegram bots, WhatsApp gateways, Imaginclaw UI can poll this)
 fn write_alert(emergency: &Emergency) {
     let now = {
-        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         format!("{}", d.as_secs())
     };
     let alert = serde_json::json!({

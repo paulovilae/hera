@@ -163,8 +163,8 @@ impl LLMEngine for GeminiEngine {
                             ContentPart::ImageUrl { image_url } => {
                                 // Extract Data URI component: "data:image/jpeg;base64,...str"
                                 let url = image_url.url;
-                                if let Some(stripped) = url.strip_prefix("data:") {
-                                    if let Some((mime, b64)) = stripped.split_once(";base64,") {
+                                if let Some(stripped) = url.strip_prefix("data:")
+                                    && let Some((mime, b64)) = stripped.split_once(";base64,") {
                                         gemini_parts.push(GeminiPart {
                                             text: None,
                                             inline_data: Some(GeminiInlineData {
@@ -174,7 +174,6 @@ impl LLMEngine for GeminiEngine {
                                         });
                                         continue;
                                     }
-                                }
                                 // Fallback if format is mangled
                                 return Err(InferenceError::InvalidContext(
                                     "Malformed base64 injected to Gemini model".into(),
@@ -191,18 +190,22 @@ impl LLMEngine for GeminiEngine {
             });
         }
 
-        let generation_config =
-            if req.temperature.is_some() || req.top_p.is_some() || req.max_tokens.is_some() || req.top_k.is_some() || req.stop.is_some() {
-                Some(GeminiGenerationConfig {
-                    temperature: req.temperature,
-                    top_p: req.top_p,
-                    top_k: req.top_k,
-                    max_output_tokens: req.max_tokens,
-                    stop_sequences: req.stop,
-                })
-            } else {
-                None
-            };
+        let generation_config = if req.temperature.is_some()
+            || req.top_p.is_some()
+            || req.max_tokens.is_some()
+            || req.top_k.is_some()
+            || req.stop.is_some()
+        {
+            Some(GeminiGenerationConfig {
+                temperature: req.temperature,
+                top_p: req.top_p,
+                top_k: req.top_k,
+                max_output_tokens: req.max_tokens,
+                stop_sequences: req.stop,
+            })
+        } else {
+            None
+        };
 
         let gemini_req = GeminiGenerateRequest {
             contents: gemini_contents,

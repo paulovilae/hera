@@ -137,6 +137,11 @@ impl CapabilityRegistry {
 fn env_flag(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }

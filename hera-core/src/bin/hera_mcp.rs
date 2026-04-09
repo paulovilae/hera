@@ -1,10 +1,10 @@
-use hera_core::ai::tool_executor::{execute_tool, hera_tool_schemas, ToolCall};
+use hera_core::ai::tool_executor::{ToolCall, execute_tool, hera_tool_schemas};
 use rmcp::{
+    ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
-    ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -134,12 +134,16 @@ impl HeraMcp {
         }
     }
 
-    #[tool(description = "Send a text generation request to Hera via its Unix socket. This is the sovereign local-first generation entrypoint for external MCP clients.")]
+    #[tool(
+        description = "Send a text generation request to Hera via its Unix socket. This is the sovereign local-first generation entrypoint for external MCP clients."
+    )]
     async fn generate_text(&self, Parameters(params): Parameters<GenerateTextParams>) -> String {
         send_ipc_generate(&params).await
     }
 
-    #[tool(description = "Execute any existing Hera tool by exact name with a JSON arguments object. This reuses Hera's canonical tool executor rather than reimplementing tool logic.")]
+    #[tool(
+        description = "Execute any existing Hera tool by exact name with a JSON arguments object. This reuses Hera's canonical tool executor rather than reimplementing tool logic."
+    )]
     async fn execute_tool(&self, Parameters(params): Parameters<ExecuteToolParams>) -> String {
         let call = ToolCall {
             name: params.name,
@@ -162,7 +166,9 @@ impl HeraMcp {
         result.output
     }
 
-    #[tool(description = "Spawn multiple OS/Agents personas in parallel through Hera's canonical spawn_parallel_agents tool.")]
+    #[tool(
+        description = "Spawn multiple OS/Agents personas in parallel through Hera's canonical spawn_parallel_agents tool."
+    )]
     async fn spawn_parallel_agents(
         &self,
         Parameters(params): Parameters<SpawnParallelAgentsParams>,
@@ -178,7 +184,9 @@ impl HeraMcp {
         result.output
     }
 
-    #[tool(description = "Return the currently available Hera tool schemas for a given external agent identity and permission scope.")]
+    #[tool(
+        description = "Return the currently available Hera tool schemas for a given external agent identity and permission scope."
+    )]
     async fn list_tool_schemas(
         &self,
         Parameters(params): Parameters<ListToolSchemasParams>,
@@ -210,12 +218,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Hera MCP Bridge");
 
-    let service = HeraMcp::new()
-        .serve(stdio())
-        .await
-        .inspect_err(|error| {
-            tracing::error!("Hera MCP serving error: {:?}", error);
-        })?;
+    let service = HeraMcp::new().serve(stdio()).await.inspect_err(|error| {
+        tracing::error!("Hera MCP serving error: {:?}", error);
+    })?;
 
     service.waiting().await?;
     Ok(())
