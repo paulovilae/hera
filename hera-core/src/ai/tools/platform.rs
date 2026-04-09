@@ -1,0 +1,1045 @@
+//! Platform tool executors: desktop, draw, search, speak, video, files, agents, skills, soul, user interaction
+use crate::ai::tool_executor::{find_skill_artifact, load_agent_artifact, ToolCall, ToolResult};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tracing::info;
+
+pub(crate) async fn execute_desktop_click(call: &ToolCall) -> ToolResult {
+    let x = call
+        .arguments
+        .get("x")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let y = call
+        .arguments
+        .get("y")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let button_str = call
+        .arguments
+        .get("button")
+        .and_then(|v| v.as_str())
+        .unwrap_or("left");
+
+    use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
+    let Ok(mut enigo) = Enigo::new(&Settings::default()) else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Failed to initialize Enigo (Settings instantiation error).".to_string(),
+        };
+    };
+
+    if let Err(e) = enigo.move_mouse(x, y, Coordinate::Abs) {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to move mouse: {:?}", e),
+        };
+    }
+
+    let button = match button_str {
+        "right" => Button::Right,
+        "middle" => Button::Middle,
+        _ => Button::Left,
+    };
+
+    if let Err(e) = enigo.button(button, Direction::Click) {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to click mouse: {:?}", e),
+        };
+    }
+
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: format!("Clicked {} at ({}, {})", button_str, x, y),
+    }
+}
+
+pub(crate) async fn execute_desktop_type(call: &ToolCall) -> ToolResult {
+    let text_val = call
+        .arguments
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let key_val = call
+        .arguments
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    let Ok(mut enigo) = Enigo::new(&Settings::default()) else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Failed to initialize Enigo (Settings instantiation error).".to_string(),
+        };
+    };
+
+    if !key_val.is_empty() {
+        let enigo_key = match key_val.to_lowercase().as_str() {
+            "enter" | "return" => Key::Return,
+            "escape" | "esc" => Key::Escape,
+            "tab" => Key::Tab,
+            "backspace" => Key::Backspace,
+            "space" => Key::Space,
+            "up" => Key::UpArrow,
+            "down" => Key::DownArrow,
+            "left" => Key::LeftArrow,
+            "right" => Key::RightArrow,
+            _ => {
+                return ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("Unsupported exact key: {}", key_val),
+                };
+            }
+        };
+        if let Err(e) = enigo.key(enigo_key, Direction::Click) {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to press key: {:?}", e),
+            };
+        }
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Pressed key: {}", key_val),
+        };
+    }
+
+    if !text_val.is_empty() {
+        if let Err(e) = enigo.text(text_val) {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to type text: {:?}", e),
+            };
+        }
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Typed text: {}", text_val),
+        };
+    }
+
+    ToolResult {
+        name: call.name.clone(),
+        success: false,
+        output: "Must provide 'text' or 'key' to type.".to_string(),
+    }
+}
+
+pub(crate) async fn execute_load_skill(call: &ToolCall) -> ToolResult {
+    if let Some(skill) = find_skill_artifact(&call.name) {
+        info!("🧠 [Hera] Progressively disclosing skill: {}", call.name);
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!(
+                "Loaded Skill Playbook '{}' (artifact '{}'):\n\n[SYSTEM SKILL IMPLANT]\nYou must now follow this skill playbook strictly:\n\n{}",
+                call.name, skill.skill_id, skill.content
+            ),
+        };
+    }
+
+    ToolResult {
+        name: call.name.clone(),
+        success: false,
+        output: format!(
+            "Could not find a SKILL.md playbook defining the skill '{}'",
+            call.name
+        ),
+    }
+}
+
+pub(crate) async fn execute_spawn_parallel_agents(call: &ToolCall) -> ToolResult {
+    let agents = call
+        .arguments
+        .get("agents")
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+
+    if agents.is_empty() || prompt.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: must provide 'agents' array and 'prompt' string.".into(),
+        };
+    }
+
+    info!(
+        "👯 [Hera] Spawning {} parallel agents for task: {}",
+        agents.len(),
+        prompt
+    );
+
+    let mut tasks = Vec::new();
+    for agent_val in agents {
+        let agent_name = agent_val.as_str().unwrap_or("").to_string();
+        if agent_name.is_empty() {
+            continue;
+        }
+
+        let p = prompt.to_string();
+
+        tasks.push(tokio::spawn(async move {
+            let agent = load_agent_artifact(&agent_name);
+            let persona = agent.persona;
+
+            // Connect to local inference engine via Hera chat
+            let hera = hera_web::agents::hera::Hera::new("http://127.0.0.1:3000");
+
+            let payload = serde_json::json!({
+                "model": "hera",
+                "messages": [
+                    { "role": "system", "content": persona },
+                    { "role": "user", "content": p }
+                ],
+                "temperature": 0.2
+            });
+
+            match hera.chat(payload).await {
+                Ok(res) => {
+                    if let Ok(json) = res.json::<serde_json::Value>().await {
+                        let content = json
+                            .get("choices")
+                            .and_then(|c| c.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|c| c.get("message"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("No response")
+                            .to_string();
+                        format!(
+                            "--- REPORT FROM {} ---\n{}\n",
+                            agent_name.to_uppercase(),
+                            content
+                        )
+                    } else {
+                        format!(
+                            "--- REPORT FROM {} ---\nFailed to parse JSON response.\n",
+                            agent_name.to_uppercase()
+                        )
+                    }
+                }
+                Err(e) => format!(
+                    "--- REPORT FROM {} ---\nFailed to reach inference engine: {}\n",
+                    agent_name.to_uppercase(),
+                    e
+                ),
+            }
+        }));
+    }
+
+    let mut combined_report = String::new();
+    for task in tasks {
+        if let Ok(report) = task.await {
+            combined_report.push_str(&report);
+            combined_report.push('\n');
+        }
+    }
+
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: format!(
+            "✅ Parallel Agents Execution Complete.\n\nCONSOLIDATED REPORTS:\n================================\n{}",
+            combined_report
+        ),
+    }
+}
+
+pub(crate) async fn execute_create_agent(call: &ToolCall) -> ToolResult {
+    let name = call
+        .arguments
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .trim();
+    let persona = call
+        .arguments
+        .get("persona")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if name.is_empty() || persona.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: must provide 'name' and 'persona' strings.".into(),
+        };
+    }
+
+    let sanitized = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    let save_path = format!("/home/paulo/Programs/apps/OS/Agents/{}.md", sanitized);
+    match std::fs::write(&save_path, persona) {
+        Ok(_) => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!(
+                "Successfully created Agent Persona '{}' at {}",
+                sanitized, save_path
+            ),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to create agent {}: {}", sanitized, e),
+        },
+    }
+}
+
+pub(crate) async fn execute_create_skill(call: &ToolCall) -> ToolResult {
+    let name = call
+        .arguments
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .trim();
+    let description = call
+        .arguments
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .trim();
+    let playbook = call
+        .arguments
+        .get("playbook")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if name.is_empty() || description.is_empty() || playbook.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: must provide 'name', 'description', and 'playbook' strings.".into(),
+        };
+    }
+
+    let sanitized = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    let skill_dir = format!("/home/paulo/Programs/apps/OS/Skills/{}", sanitized);
+    if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to create skill directory {}: {}", skill_dir, e),
+        };
+    }
+
+    let content = format!(
+        "---\nname: load_skill_{}\ndescription: \"{}\"\n---\n\n{}",
+        sanitized, description, playbook
+    );
+
+    let save_path = format!("{}/SKILL.md", skill_dir);
+    match std::fs::write(&save_path, content) {
+        Ok(_) => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!(
+                "Successfully crafted Skill '{}' at {}\nIt will be dynamically loaded on the next request sequence.",
+                sanitized, save_path
+            ),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to write skill playbook {}: {}", save_path, e),
+        },
+    }
+}
+
+pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("A beautiful digital artwork");
+    let width = call
+        .arguments
+        .get("width")
+        .and_then(|w| w.as_u64())
+        .map(|w| w as u32);
+    let height = call
+        .arguments
+        .get("height")
+        .and_then(|h| h.as_u64())
+        .map(|h| h as u32);
+
+    let request = diakonos_core::protocol::DiakonosRequest {
+        action: "draw_image".to_string(),
+        payload: serde_json::json!({
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+        }),
+    };
+
+    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
+        .await
+    {
+        Ok(response) if response.status == "success" => {
+            let res = response.data;
+            let image_url = res
+                .get("image_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("(no URL)");
+            info!("🎨 [Hera] Image generated: {}", image_url);
+
+            // Build a public URL that candle-core serves at /outputs/{filename}
+            // The filename is the last segment of image_url (e.g., "/outputs/hera_drawn_UUID.png")
+            let filename = image_url.split('/').next_back().unwrap_or(image_url);
+            let public_url = format!("https://imaginos.ai/outputs/{}", filename);
+            let response = format!(
+                "Image generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the image is delivered inline.",
+                public_url
+            );
+
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: response,
+            }
+        }
+        Ok(response) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: response
+                .data
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Diakonos draw error")
+                .to_string(),
+        },
+        Err(e) => {
+            tracing::error!("🎨 [Hera] Image generation failed: {:?}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Image generation failed: {}", e),
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_search(call: &ToolCall) -> ToolResult {
+    let query = call
+        .arguments
+        .get("query")
+        .and_then(|q| q.as_str())
+        .unwrap_or("");
+    let request = diakonos_core::protocol::DiakonosRequest {
+        action: "web_search".to_string(),
+        payload: serde_json::json!({ "query": query }),
+    };
+
+    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
+        .await
+    {
+        Ok(response) if response.status == "success" => {
+            let results = response
+                .data
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            info!("🌐 [Hera] Search completed for: {}", query);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!("Search results for '{}':\n{}", query, results),
+            }
+        }
+        Ok(response) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: response
+                .data
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Diakonos search error")
+                .to_string(),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Search failed: {}", e),
+        },
+    }
+}
+
+pub(crate) async fn execute_speak(call: &ToolCall) -> ToolResult {
+    let text = call
+        .arguments
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    let voice = call.arguments.get("voice").and_then(|v| v.as_str());
+
+    let request = diakonos_core::protocol::DiakonosRequest {
+        action: "speak_text".to_string(),
+        payload: serde_json::json!({
+            "text": text,
+            "voice": voice
+        }),
+    };
+
+    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
+        .await
+    {
+        Ok(response) if response.status == "success" => {
+            let result = response.data;
+            info!("🔊 [Hera] Speech synthesized");
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Speech generated successfully: {}",
+                    serde_json::to_string(&result).unwrap_or_default()
+                ),
+            }
+        }
+        Ok(response) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: response
+                .data
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Diakonos TTS error")
+                .to_string(),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("TTS failed: {}", e),
+        },
+    }
+}
+
+pub(crate) async fn execute_video(call: &ToolCall) -> ToolResult {
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("A smooth cinematic video");
+
+    let request = diakonos_core::protocol::DiakonosRequest {
+        action: "generate_video".to_string(),
+        payload: serde_json::json!({ "prompt": prompt }),
+    };
+
+    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
+        .await
+    {
+        Ok(response) if response.status == "success" => {
+            let result = response.data;
+            info!("🎬 [Hera] Video generated");
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Video generated successfully: {}",
+                    serde_json::to_string(&result).unwrap_or_default()
+                ),
+            }
+        }
+        Ok(response) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: response
+                .data
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Diakonos video error")
+                .to_string(),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Video generation failed: {}", e),
+        },
+    }
+}
+
+pub(crate) async fn execute_read_file(call: &ToolCall) -> ToolResult {
+    let path = call
+        .arguments
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    let request = diakonos_core::protocol::DiakonosRequest {
+        action: "read_file".to_string(),
+        payload: serde_json::json!({ "path": path }),
+    };
+
+    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
+        .await
+    {
+        Ok(response) if response.status == "success" => {
+            let truncated = response
+                .data
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            info!("📄 [Hera] Read file: {}", path);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!("File contents of '{}':\n{}", path, truncated),
+            }
+        }
+        Ok(response) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: response
+                .data
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Diakonos read_file error")
+                .to_string(),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to read file '{}': {}", path, e),
+        },
+    }
+}
+
+pub(crate) async fn execute_update_soul(call: &ToolCall) -> ToolResult {
+    let new_soul_content = call
+        .arguments
+        .get("new_soul_content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    if new_soul_content.trim().is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output:
+                "Error: new_soul_content was empty. You must provide the complete new persona text."
+                    .to_string(),
+        };
+    }
+
+    let soul_path = std::env::var("HERA_SOUL_PATH").unwrap_or_else(|_| {
+        "/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md".to_string()
+    });
+
+    match std::fs::write(&soul_path, new_soul_content) {
+        Ok(_) => {
+            tracing::info!("🧠 [Hera] SOUL successfully rewritten at {}", soul_path);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: "Successfully updated your SOUL! The changes have been saved to disk and you will remember them permanently.".to_string(),
+            }
+        }
+        Err(e) => {
+            tracing::error!("🧠 [Hera] Failed to write SOUL.md: {:?}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to update SOUL.md. File system error: {:?}", e),
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_ask_user(call: &ToolCall) -> ToolResult {
+    let question = call
+        .arguments
+        .get("question")
+        .and_then(|q| q.as_str())
+        .unwrap_or("Needs human input.");
+    tracing::info!("⏸️ [Hera] Pausing flow to ask user: {}", question);
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: format!("[PAUSED_FOR_USER] Question: {}", question),
+    }
+}
+
+pub(crate) async fn execute_get_system_time(call: &ToolCall) -> ToolResult {
+    match std::process::Command::new("date").output() {
+        Ok(out) => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: String::from_utf8_lossy(&out.stdout).to_string(),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: e.to_string(),
+        },
+    }
+}
+
+pub(crate) async fn execute_run_code(call: &ToolCall) -> ToolResult {
+    let lang = call
+        .arguments
+        .get("language")
+        .and_then(|l| l.as_str())
+        .unwrap_or("python");
+    let code = call
+        .arguments
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let packages: Vec<String> = call
+        .arguments
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let bean_name = format!("bean_{}", timestamp);
+    let beans_dir = "/home/paulo/Programs/apps/OS/Beans";
+    let _ = std::fs::create_dir_all(beans_dir);
+
+    // Cognitive Memory Pipeline: Record bean logic into Memento universally before execution
+    // Doing it natively blocking here; socket is fast UDS.
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect("/tmp/memento.sock") {
+        use std::io::Write;
+        let payload = serde_json::json!({
+            "action": "store_knowledge",
+            "payload": {
+                "key": bean_name.clone(),
+                "content": format!("Language: {}\nPackages: {:?}\nCode:\n{}", lang, packages, code),
+                "tags": "bean, code_interpreter"
+            }
+        });
+        let _ = stream.write_all(payload.to_string().as_bytes());
+    }
+
+    if lang.to_lowercase() == "rust" {
+        let project_dir = format!("{}/{}", beans_dir, bean_name);
+        if let Err(e) = std::fs::create_dir_all(format!("{}/src", project_dir)) {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to create Rust bean directory: {}", e),
+            };
+        }
+
+        let mut deps = r#"[dependencies]
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+"#.to_string();
+        for pkg in &packages {
+            deps.push_str(&format!("{} = \"*\"\n", pkg));
+        }
+
+        let cargo_toml = format!(
+            r#"[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
+
+{}
+"#,
+            bean_name, deps
+        );
+
+        std::fs::write(format!("{}/Cargo.toml", project_dir), cargo_toml).unwrap_or_default();
+        std::fs::write(format!("{}/src/main.rs", project_dir), code).unwrap_or_default();
+
+        match std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--release")
+            .current_dir(&project_dir)
+            .output()
+        {
+            Ok(out) => {
+                let out_str = String::from_utf8_lossy(&out.stdout).to_string();
+                let err_str = String::from_utf8_lossy(&out.stderr).to_string();
+                let success = out.status.success();
+
+                let mut final_out =
+                    format!("RUST ROASTED BEAN EXECUTION:\n---\nSTDOUT:\n{}\n", out_str);
+                if !success || !err_str.is_empty() {
+                    final_out.push_str(&format!(
+                        "---\nSTDERR (or cargo compilation logs):\n{}\n",
+                        err_str
+                    ));
+                }
+                final_out.push_str(&format!(
+                    "---\nBean saved permanently in {} and recorded in Memento.",
+                    project_dir
+                ));
+
+                ToolResult {
+                    name: call.name.clone(),
+                    success,
+                    output: final_out,
+                }
+            }
+            Err(e) => ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Cargo execution failed: {}", e),
+            },
+        }
+    } else if lang.to_lowercase() == "python" {
+        let p = format!("{}/{}.py", beans_dir, bean_name);
+        if let Err(e) = std::fs::write(&p, code) {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to write Python bean: {}", e),
+            };
+        }
+
+        let mut pip_log = String::new();
+        if !packages.is_empty() {
+            let mut cmd = std::process::Command::new("python3");
+            cmd.arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg("--break-system-packages");
+            for pkg in &packages {
+                cmd.arg(pkg);
+            }
+            if let Ok(out) = cmd.output() {
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    return ToolResult {
+                        name: call.name.clone(),
+                        success: false,
+                        output: format!("Failed to install Python packages:\n{}", err),
+                    };
+                }
+                pip_log = format!("Successfully installed: {:?}", packages);
+            }
+        }
+
+        match std::process::Command::new("python3").arg(&p).output() {
+            Ok(out) => {
+                let out_str = String::from_utf8_lossy(&out.stdout).to_string();
+                let err_str = String::from_utf8_lossy(&out.stderr).to_string();
+                let success = out.status.success();
+                let mut res = if success {
+                    if err_str.trim().is_empty() {
+                        out_str
+                    } else {
+                        format!("STDOUT:\n{}\n---\nSTDERR:\n{}", out_str, err_str)
+                    }
+                } else {
+                    format!("PYTHON SOFT BEAN ERROR:\n{}\n{}", err_str, out_str)
+                };
+                if !pip_log.is_empty() {
+                    res = format!("{}\n---\n{}", pip_log, res);
+                }
+                res = format!(
+                    "{}\n---\nBean saved permanently at {} and logged in Memento.",
+                    res, p
+                );
+                ToolResult {
+                    name: call.name.clone(),
+                    success,
+                    output: res,
+                }
+            }
+            Err(e) => ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: e.to_string(),
+            },
+        }
+    } else {
+        ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Language '{}' not supported. Use 'rust' or 'python'.", lang),
+        }
+    }
+}
+
+pub(crate) async fn execute_write_file(call: &ToolCall) -> ToolResult {
+    let path = call
+        .arguments
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    let content = call
+        .arguments
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    if path.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing path".into(),
+        };
+    }
+
+    match std::fs::write(path, content) {
+        Ok(_) => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Successfully wrote to {}", path),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to write file: {}", e),
+        },
+    }
+}
+
+pub(crate) async fn execute_web_scraper(call: &ToolCall) -> ToolResult {
+    let url = call
+        .arguments
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    if url.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing url".into(),
+        };
+    }
+
+    let request = diakonos_core::protocol::DiakonosRequest {
+        action: "web_scrape".to_string(),
+        payload: serde_json::json!({ "url": url }),
+    };
+
+    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
+        .await
+    {
+        Ok(response) if response.status == "success" => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: response
+                .data
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        Ok(response) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: response
+                .data
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Diakonos web scrape error")
+                .to_string(),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: e.to_string(),
+        },
+    }
+}
+
+pub(crate) async fn execute_spline_interact(call: &ToolCall) -> ToolResult {
+    let url = call
+        .arguments
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    let action = call
+        .arguments
+        .get("action")
+        .and_then(|a| a.as_str())
+        .unwrap_or("generate_embed");
+
+    if url.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Error: missing Spline 'url' parameter".to_string(),
+        };
+    }
+
+    match action {
+        "generate_embed" => {
+            let embed_code = format!(
+                r#"<script type="module" src="https://unpkg.com/@splinetool/viewer@1.0.95/build/spline-viewer.js"></script>
+<spline-viewer url="{}" events-target="global"></spline-viewer>"#,
+                url
+            );
+            info!("🕹️  [Hera] Generated Spline embed for: {}", url);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Spline embed code generated successfully:\n```html\n{}\n```\nProvide this html directly to the user or insert it into the UI template.",
+                    embed_code
+                ),
+            }
+        }
+        _ => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Unknown action '{}' for spline_interact tool", action),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_tool_call() {
+        let text = r#"I'll draw that for you!
+<tool_call>
+{"name": "hera_draw", "arguments": {"prompt": "a beautiful sunset over the ocean", "width": 1024, "height": 1024}}
+</tool_call>"#;
+
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "hera_draw");
+        assert_eq!(
+            calls[0].arguments["prompt"],
+            "a beautiful sunset over the ocean"
+        );
+    }
+
+    #[test]
+    fn test_no_tool_call() {
+        let text = "Hello! How can I help you today?";
+        let calls = parse_tool_calls(text);
+        assert!(calls.is_empty());
+    }
+}

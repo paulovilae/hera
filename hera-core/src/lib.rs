@@ -6,10 +6,11 @@
 
 pub mod ai;
 pub mod capabilities;
-pub mod ipc_server;
 pub mod hardware;
+pub mod ipc;
+pub mod ipc_server;
 pub mod orchestrator;
+pub mod rest_api;
 pub mod semantic_object;
 pub mod sol;
-pub mod rest_api;
 pub mod watchdog;

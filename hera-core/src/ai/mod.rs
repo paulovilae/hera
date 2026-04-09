@@ -4,21 +4,23 @@
 //! Transparently maps these requests down into optimized native execution clients
 //! (e.g., Gemini HTTP endpoints, local Llama GPU endpoints).
 
-pub mod gemini;
-pub mod openai_compat;
-pub mod router;
 pub mod context_engine;
-pub mod engine_moondream;
-pub mod native_engine;
+pub mod engine_faster_whisper;
+pub mod engine_flux;
 pub mod engine_gguf;
 pub mod engine_hub;
-pub mod engine_flux;
+pub mod engine_moondream;
 pub mod engine_parler;
 pub mod engine_whisper;
-pub mod quantized_qwen3_moe_local;
-pub mod q8_t5;
+pub mod gemini;
 pub mod llama_ffi_engine;
+pub mod native_engine;
+pub mod openai_compat;
+pub mod q8_t5;
+pub mod quantized_qwen3_moe_local;
+pub mod router;
 pub mod tool_executor;
+pub mod tools;
 
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +64,7 @@ pub struct ChatRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nsfw: Option<bool>,
-    
+
     // Execution Layer bindings
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<serde_json::Value>>,
@@ -154,9 +156,22 @@ pub trait LLMEngine {
     async fn generate_stream(
         &self,
         _req: ChatRequest,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<ChatStreamResponse, crate::ai::InferenceError>>, crate::ai::InferenceError> {
-        Err(crate::ai::InferenceError::ExecutionFailed("Streaming not natively supported by this engine layer yet".to_string()))
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<Result<ChatStreamResponse, crate::ai::InferenceError>>,
+        crate::ai::InferenceError,
+    > {
+        Err(crate::ai::InferenceError::ExecutionFailed(
+            "Streaming not natively supported by this engine layer yet".to_string(),
+        ))
     }
+}
+
+#[async_trait::async_trait]
+pub trait SpeechToTextEngine {
+    async fn transcribe_audio(
+        &self,
+        wav_bytes: &[u8],
+    ) -> Result<String, crate::ai::InferenceError>;
 }
 
 // --- Streaming API Schema ---
