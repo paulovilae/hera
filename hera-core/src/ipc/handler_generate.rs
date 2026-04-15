@@ -5,9 +5,11 @@ use super::context::{
     is_lightweight_conversation, parse_payload,
 };
 use super::helpers::infer_origin_from_model;
+use super::llm_audit::{append_llm_audit_event, build_event};
 use super::types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
 use crate::ai::{ChatMessage, ChatRequest, MessageContent};
 
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
@@ -17,8 +19,14 @@ pub async fn handle_generate(
     state: &IpcState,
     stream: &mut UnixStream,
 ) -> HandlerOutcome {
+    let started_at = Instant::now();
     let mut payload_clone = request.payload.clone();
     let parsed = parse_payload(&payload_clone);
+    let provider_requested = payload_clone
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("auto")
+        .to_string();
 
     // 1. Fast-path intent detection
     if !parsed.prompt.is_empty() {
@@ -110,8 +118,8 @@ pub async fn handle_generate(
         );
         match state.engine.generate_content(req).await {
             Ok(resp) => {
-                let response_model = resp.model.clone();
-                let response_origin = infer_origin_from_model(&resp.model).to_string();
+                let mut response_model = resp.model.clone();
+                let mut response_origin = infer_origin_from_model(&resp.model).to_string();
                 let origin_emoji = match response_origin.as_str() {
                     "cloud" => "☁️",
                     "local" => "🏠",
@@ -215,6 +223,8 @@ pub async fn handle_generate(
                                                 p2_origin,
                                                 resp2.model
                                             );
+                                            response_model = resp2.model.clone();
+                                            response_origin = p2_origin.to_string();
                                             if let Some(ch) = resp2.choices.first() {
                                                 if let Some(c) = &ch.message.content {
                                                     result_text = c.clone();
@@ -244,6 +254,27 @@ pub async fn handle_generate(
                     }
                 }
 
+                append_llm_audit_event(&build_event(
+                    "generate",
+                    &parsed.app_name,
+                    &parsed.persona_path,
+                    &parsed.prompt,
+                    est_tokens,
+                    started_at.elapsed().as_millis() as u64,
+                    None,
+                    lightweight_mode,
+                    &provider_requested,
+                    &response_origin,
+                    &response_model,
+                    true,
+                    tool_calls
+                        .as_ref()
+                        .and_then(|value| value.as_array().map(|items| items.len()))
+                        .unwrap_or(0),
+                    result_text.len(),
+                    None,
+                ));
+
                 return HandlerOutcome::Result {
                     result_text,
                     origin: response_origin,
@@ -253,6 +284,23 @@ pub async fn handle_generate(
             }
             Err(e) => {
                 tracing::error!("LLM inference error: {}", e);
+                append_llm_audit_event(&build_event(
+                    "generate",
+                    &parsed.app_name,
+                    &parsed.persona_path,
+                    &parsed.prompt,
+                    est_tokens,
+                    started_at.elapsed().as_millis() as u64,
+                    None,
+                    lightweight_mode,
+                    &provider_requested,
+                    "offline",
+                    "",
+                    false,
+                    0,
+                    0,
+                    Some(e.to_string()),
+                ));
                 return HandlerOutcome::Result {
                     result_text: format!("Error: {}", e),
                     origin: "offline".to_string(),

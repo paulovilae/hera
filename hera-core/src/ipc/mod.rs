@@ -16,6 +16,7 @@ pub mod handler_media;
 pub mod handler_stream;
 pub mod handler_tools;
 pub mod helpers;
+pub mod llm_audit;
 pub mod types;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

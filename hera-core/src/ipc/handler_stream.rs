@@ -4,9 +4,12 @@ use super::context::{
     build_full_system_prompt, build_new_chat_request, inject_system_prompt,
     is_lightweight_conversation, parse_payload,
 };
+use super::helpers::infer_origin_from_model;
+use super::llm_audit::{append_llm_audit_event, build_event};
 use super::types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
 use crate::ai::{ChatMessage, ChatRequest, MessageContent};
 
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
@@ -16,8 +19,14 @@ pub async fn handle_generate_stream(
     state: &IpcState,
     stream: &mut UnixStream,
 ) -> HandlerOutcome {
+    let started_at = Instant::now();
     let payload_clone = request.payload.clone();
     let parsed = parse_payload(&payload_clone);
+    let provider_requested = payload_clone
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("auto")
+        .to_string();
 
     // Fast-path intent detection
     if !parsed.prompt.is_empty() {
@@ -120,11 +129,19 @@ pub async fn handle_generate_stream(
         let mut final_result_text = String::new();
         let mut buffer_flushed = false;
         let mut is_tool_call_mode = false;
+        let mut first_token_ms = None;
+        let mut response_model = String::new();
+        let mut response_origin = "unknown".to_string();
+        let mut executed_tool_count = 0usize;
 
         match state.engine.generate_stream(req).await {
             Ok(mut rx) => {
                 while let Some(chunk_res) = rx.recv().await {
                     if let Ok(chunk) = chunk_res {
+                        if response_model.is_empty() && !chunk.model.is_empty() {
+                            response_model = chunk.model.clone();
+                            response_origin = infer_origin_from_model(&chunk.model).to_string();
+                        }
                         let chunk_text = chunk
                             .choices
                             .first()
@@ -132,6 +149,9 @@ pub async fn handle_generate_stream(
                             .unwrap_or_default();
                         if chunk_text.is_empty() {
                             continue;
+                        }
+                        if first_token_ms.is_none() {
+                            first_token_ms = Some(started_at.elapsed().as_millis() as u64);
                         }
 
                         final_result_text.push_str(&chunk_text);
@@ -184,6 +204,7 @@ pub async fn handle_generate_stream(
                 if !parsed_calls.is_empty() {
                     let mut execution_outputs = String::new();
                     for call in &parsed_calls {
+                        executed_tool_count += 1;
                         let status_msg = IpcResponse {
                             status: "tool_status".to_string(),
                             data: serde_json::json!({"name": call.name.clone()}),
@@ -291,6 +312,24 @@ pub async fn handle_generate_stream(
                 let mut dstr = serde_json::to_string(&done_msg).unwrap();
                 dstr.push('\n');
                 let _ = stream.write_all(dstr.as_bytes()).await;
+
+                append_llm_audit_event(&build_event(
+                    "generate_stream",
+                    &parsed.app_name,
+                    &parsed.persona_path,
+                    &parsed.prompt,
+                    est_tokens,
+                    started_at.elapsed().as_millis() as u64,
+                    first_token_ms,
+                    lightweight_mode,
+                    &provider_requested,
+                    &response_origin,
+                    &response_model,
+                    true,
+                    executed_tool_count,
+                    final_result_text.len(),
+                    None,
+                ));
             }
             Err(e) => {
                 let err_msg = IpcResponse {
@@ -300,6 +339,23 @@ pub async fn handle_generate_stream(
                 let mut estr = serde_json::to_string(&err_msg).unwrap();
                 estr.push('\n');
                 let _ = stream.write_all(estr.as_bytes()).await;
+                append_llm_audit_event(&build_event(
+                    "generate_stream",
+                    &parsed.app_name,
+                    &parsed.persona_path,
+                    &parsed.prompt,
+                    est_tokens,
+                    started_at.elapsed().as_millis() as u64,
+                    first_token_ms,
+                    lightweight_mode,
+                    &provider_requested,
+                    "offline",
+                    "",
+                    false,
+                    0,
+                    0,
+                    Some(e.to_string()),
+                ));
             }
         }
     }
