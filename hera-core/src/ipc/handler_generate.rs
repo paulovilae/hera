@@ -1,12 +1,12 @@
 //! Handler: generate (non-streaming LLM inference with tool execution).
 
-use crate::ai::{ChatMessage, ChatRequest, MessageContent};
 use super::context::{
-    build_full_system_prompt, build_new_chat_request, compress_if_needed,
-    inject_system_prompt, parse_payload,
+    build_full_system_prompt, build_new_chat_request, compress_if_needed, inject_system_prompt,
+    is_lightweight_conversation, parse_payload,
 };
 use super::helpers::infer_origin_from_model;
 use super::types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
+use crate::ai::{ChatMessage, ChatRequest, MessageContent};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -26,9 +26,10 @@ pub async fn handle_generate(
             &parsed.prompt,
             parsed.assistant_last.as_deref(),
         ) {
-            if parsed.permissions.contains(&"all".to_string())
-                || parsed.permissions.contains(&tool_call.name)
-            {
+            if crate::ai::tool_executor::permissions_allow_tool(
+                &parsed.permissions,
+                &tool_call.name,
+            ) {
                 tracing::info!(
                     "🚀 [Hera IPC] Fast-path tool intent detected: {}",
                     tool_call.name
@@ -47,10 +48,7 @@ pub async fn handle_generate(
                 let mut res_str = serde_json::to_string(&res).unwrap();
                 res_str.push('\n');
                 if let Err(e) = stream.write_all(res_str.as_bytes()).await {
-                    tracing::error!(
-                        "❌ Failed to write IPC response for fast-path tool: {}",
-                        e
-                    );
+                    tracing::error!("❌ Failed to write IPC response for fast-path tool: {}", e);
                 }
                 return HandlerOutcome::DirectResponse;
             } else {
@@ -65,10 +63,7 @@ pub async fn handle_generate(
     // 2. Ensure model is set
     if let Some(obj) = payload_clone.as_object_mut() {
         if !obj.contains_key("model") {
-            obj.insert(
-                "model".to_string(),
-                serde_json::json!("hera-local-model"),
-            );
+            obj.insert("model".to_string(), serde_json::json!("hera-local-model"));
         }
     }
 
@@ -79,13 +74,14 @@ pub async fn handle_generate(
         .to_string();
 
     // 3. Build or augment ChatRequest
-    let mut chat_req: Option<ChatRequest> =
-        serde_json::from_value(payload_clone.clone()).ok();
+    let mut chat_req: Option<ChatRequest> = serde_json::from_value(payload_clone.clone()).ok();
 
+    let lightweight_mode = is_lightweight_conversation(&parsed.prompt);
     let full_system_prompt = build_full_system_prompt(
         &parsed.persona_path,
         &parsed.app_name,
         &parsed.permissions,
+        lightweight_mode,
     )
     .await;
 
@@ -106,10 +102,11 @@ pub async fn handle_generate(
     if let Some(req) = chat_req.clone() {
         let est_tokens = super::helpers::estimate_tokens(&req);
         tracing::info!(
-            "📡 [Hera Generate] Starting inference for app='{}' — {} msgs, ~{} tokens",
+            "📡 [Hera Generate] Starting inference for app='{}' — {} msgs, ~{} tokens (lightweight_mode={})",
             parsed.app_name,
             req.messages.len(),
-            est_tokens
+            est_tokens,
+            lightweight_mode
         );
         match state.engine.generate_content(req).await {
             Ok(resp) => {
@@ -122,7 +119,9 @@ pub async fn handle_generate(
                 };
                 tracing::info!(
                     "{} [Hera Generate] Response from {} engine — model: {}",
-                    origin_emoji, response_origin, response_model
+                    origin_emoji,
+                    response_origin,
+                    response_model
                 );
                 let mut result_text = String::new();
                 let mut tool_calls: Option<serde_json::Value> = None;
@@ -132,8 +131,7 @@ pub async fn handle_generate(
                         result_text = content.clone();
 
                         // 6. Parse and execute output tool calls
-                        let parsed_calls =
-                            crate::ai::tool_executor::parse_tool_calls(&result_text);
+                        let parsed_calls = crate::ai::tool_executor::parse_tool_calls(&result_text);
                         if !parsed_calls.is_empty() {
                             tracing::info!(
                                 "🛠️ [Hera IPC] LLM emitted {} tool calls",
@@ -143,13 +141,13 @@ pub async fn handle_generate(
                             let mut executed_calls = Vec::new();
 
                             for call in &parsed_calls {
-                                if parsed.permissions.contains(&"all".to_string())
-                                    || parsed.permissions.contains(&call.name)
-                                {
+                                if crate::ai::tool_executor::permissions_allow_tool(
+                                    &parsed.permissions,
+                                    &call.name,
+                                ) {
                                     let tool_res =
                                         crate::ai::tool_executor::execute_tool(call).await;
-                                    execution_outputs
-                                        .push_str(&format!("\n\n{}", tool_res.output));
+                                    execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
                                     executed_calls.push(serde_json::json!({
                                         "name": call.name,
                                         "arguments": call.arguments
@@ -214,7 +212,8 @@ pub async fn handle_generate(
                                             let p2_origin = infer_origin_from_model(&resp2.model);
                                             tracing::info!(
                                                 "🔄 [Hera Generate] Second-pass response from {} — model: {}",
-                                                p2_origin, resp2.model
+                                                p2_origin,
+                                                resp2.model
                                             );
                                             if let Some(ch) = resp2.choices.first() {
                                                 if let Some(c) = &ch.message.content {
@@ -223,10 +222,7 @@ pub async fn handle_generate(
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::error!(
-                                                "Second pass inference failed: {}",
-                                                e
-                                            );
+                                            tracing::error!("Second pass inference failed: {}", e);
                                             result_text.push_str(&format!(
                                                 "\n\n[Error forming final response: {}]\n{}",
                                                 e, execution_outputs

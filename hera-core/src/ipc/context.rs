@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use crate::ai::{ChatMessage, ChatRequest, ContentPart, LLMEngine, MessageContent};
 use super::helpers::{fetch_db_schema_context, fetch_semantic_memory};
+use crate::ai::{ChatMessage, ChatRequest, ContentPart, LLMEngine, MessageContent};
 
 /// Extracted data from the IPC payload.
 pub struct ParsedPayload {
@@ -17,9 +17,47 @@ pub struct ParsedPayload {
     pub app_name: String,
 }
 
+fn normalize_lightweight_prompt(prompt: &str) -> String {
+    prompt
+        .trim()
+        .to_lowercase()
+        .replace(['¡', '!', '¿', '?', '.', ',', ';', ':'], "")
+}
+
+pub fn is_lightweight_conversation(prompt: &str) -> bool {
+    let normalized = normalize_lightweight_prompt(prompt);
+    if normalized.is_empty() {
+        return true;
+    }
+
+    let lightweight_messages = [
+        "hola",
+        "hola memo",
+        "hola chepito",
+        "buenas",
+        "buenos dias",
+        "buenos días",
+        "buenas tardes",
+        "buenas noches",
+        "hey",
+        "ey",
+        "ola",
+        "gracias",
+        "muchas gracias",
+        "ok gracias",
+        "listo gracias",
+        "quien eres",
+        "quién eres",
+        "que haces",
+        "qué haces",
+        "ayuda",
+    ];
+
+    lightweight_messages.contains(&normalized.as_str())
+}
+
 /// Default persona path when none is provided.
-const DEFAULT_PERSONA: &str =
-    "/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md";
+const DEFAULT_PERSONA: &str = "/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md";
 
 /// Extract prompt, assistant_last, permissions, persona_path, and app_name from payload.
 pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
@@ -89,6 +127,7 @@ pub async fn build_full_system_prompt(
     persona_path: &str,
     app_name: &str,
     permissions: &[String],
+    lightweight_mode: bool,
 ) -> String {
     let memento_ctx = fetch_semantic_memory(app_name).await;
     let base_system_prompt = format!(
@@ -103,19 +142,31 @@ pub async fn build_full_system_prompt(
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
 
-    let schemas = crate::ai::tool_executor::hera_tool_schemas(permissions, agent_identity);
-    let db_schema_ctx = fetch_db_schema_context(agent_identity, app_name).await;
+    let schemas = if lightweight_mode {
+        String::new()
+    } else {
+        crate::ai::tool_executor::hera_tool_schemas(permissions, agent_identity)
+    };
+    let db_schema_ctx = if lightweight_mode {
+        String::new()
+    } else {
+        fetch_db_schema_context(agent_identity, app_name).await
+    };
 
-    let think_directive = "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag.";
-    let json_directive = "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be ONLY the raw JSON tool call. DO NOT write conversational text or explanations before or after the JSON tool block. The UI stream will crash if text and code logic bleed together.";
+    let think_directive = if lightweight_mode {
+        "\n\nRespond naturally and briefly. Do not use tools. Do not use <think> tags."
+    } else {
+        "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag."
+    };
+    let json_directive = if lightweight_mode {
+        ""
+    } else {
+        "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be ONLY the raw JSON tool call. DO NOT write conversational text or explanations before or after the JSON tool block. The UI stream will crash if text and code logic bleed together."
+    };
 
     format!(
         "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}",
-        base_system_prompt,
-        schemas,
-        db_schema_ctx,
-        think_directive,
-        json_directive
+        base_system_prompt, schemas, db_schema_ctx, think_directive, json_directive
     )
 }
 
@@ -194,10 +245,7 @@ pub fn inject_system_prompt(req: &mut ChatRequest, full_system_prompt: String) {
 }
 
 /// Compress chat history if it exceeds 24k tokens (safety buffer for 32k engine limit).
-pub async fn compress_if_needed(
-    req: &mut ChatRequest,
-    engine: &Arc<dyn LLMEngine + Send + Sync>,
-) {
+pub async fn compress_if_needed(req: &mut ChatRequest, engine: &Arc<dyn LLMEngine + Send + Sync>) {
     let est_tokens = super::helpers::estimate_tokens(req);
     if est_tokens <= 24000 || req.messages.len() <= 6 {
         return;
@@ -281,7 +329,10 @@ pub async fn compress_if_needed(
                 }
             }
             // Fallback: reassemble if summary had no content
-            tracing::warn!("⚠️ [Hera Context] Compression returned EMPTY response. Reassembling {} original messages.", old_history.len());
+            tracing::warn!(
+                "⚠️ [Hera Context] Compression returned EMPTY response. Reassembling {} original messages.",
+                old_history.len()
+            );
             req.messages.push(sys);
             req.messages.extend(old_history);
             req.messages.extend(recent);
@@ -289,7 +340,9 @@ pub async fn compress_if_needed(
         Err(e) => {
             tracing::error!(
                 "❌ [Hera Context] Compression FAILED: {}. Sending {} msgs uncompressed (~{} tokens).",
-                e, old_history.len(), est_tokens
+                e,
+                old_history.len(),
+                est_tokens
             );
             req.messages.push(sys);
             req.messages.extend(old_history);

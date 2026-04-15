@@ -1,6 +1,3 @@
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-
 #[test]
 fn test_hera_ipc_socket_reachability() {
     // Note: Integration tests usually boot the server then test it.

@@ -1,9 +1,15 @@
 //! Vetra app tool executors: contracts, QR, email, Telegram, maps, workflows
 use crate::ai::tool_executor::{ToolCall, ToolResult};
+use genpdf::{Alignment, Element as _, elements, fonts, style};
 use serde_json::Value;
-use std::process::Command;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
+
+const PDF_FONT_CANDIDATES: &[(&str, &str)] = &[
+    ("/usr/share/fonts/truetype/liberation", "LiberationSans"),
+    ("/usr/share/fonts/truetype/dejavu", "DejaVuSans"),
+];
 
 pub(crate) async fn execute_bind_telegram_workspace(call: &ToolCall) -> ToolResult {
     let bot_name = call
@@ -181,8 +187,13 @@ pub(crate) async fn execute_generate_contract_pdf(call: &ToolCall) -> ToolResult
     let file_name = format!("Acuerdo_Pago_{}.pdf", debtor.replace(" ", "_"));
     let path = format!("/tmp/{}", file_name);
 
-    // Vetra stores mock PDFs as text locally
-    let _ = std::fs::write(&path, content);
+    if let Err(error) = render_payment_agreement_pdf(&path, debtor, content) {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to generate payment agreement PDF: {}", error),
+        };
+    }
 
     info!("📄 [Hera] Generated Contract Document: {}", path);
     ToolResult {
@@ -193,6 +204,103 @@ pub(crate) async fn execute_generate_contract_pdf(call: &ToolCall) -> ToolResult
             path
         ),
     }
+}
+
+fn render_payment_agreement_pdf(
+    output_path: &str,
+    debtor: &str,
+    content: &str,
+) -> Result<(), String> {
+    let font_family = load_pdf_font_family()?;
+    let mut doc = genpdf::Document::new(font_family);
+    doc.set_title(format!("Acuerdo de pago - {}", debtor));
+    doc.set_minimal_conformance();
+    doc.set_line_spacing(1.25);
+
+    let mut decorator = genpdf::SimplePageDecorator::new();
+    decorator.set_margins(16);
+    doc.set_page_decorator(decorator);
+
+    let title_style = style::Style::new().bold().with_font_size(18);
+    let meta_style = style::Style::new().with_font_size(10);
+
+    doc.push(
+        elements::Paragraph::new("Acuerdo de Pago")
+            .aligned(Alignment::Center)
+            .styled(title_style),
+    );
+    doc.push(
+        elements::Paragraph::new(format!("Deudor / referencia: {}", debtor))
+            .aligned(Alignment::Center)
+            .styled(meta_style),
+    );
+    doc.push(
+        elements::Paragraph::new(format!(
+            "Generado por Hera. Timestamp Unix: {}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0)
+        ))
+        .aligned(Alignment::Center)
+        .styled(meta_style),
+    );
+    doc.push(elements::Break::new(1));
+
+    for block in normalized_agreement_blocks(content) {
+        doc.push(elements::Paragraph::new(block));
+        doc.push(elements::Break::new(0.6));
+    }
+
+    doc.push(elements::Break::new(0.5));
+    doc.push(
+        elements::Paragraph::new(
+            "Este documento resume el acuerdo reportado por el flujo de cobranza. Debe ser validado por la operación antes de archivo o notificación final cuando aplique.",
+        )
+        .styled(meta_style),
+    );
+
+    doc.render_to_file(output_path)
+        .map_err(|error| error.to_string())
+}
+
+fn load_pdf_font_family() -> Result<fonts::FontFamily<fonts::FontData>, String> {
+    for (dir, name) in PDF_FONT_CANDIDATES {
+        if !Path::new(dir).exists() {
+            continue;
+        }
+        if let Ok(family) = fonts::from_files(dir, name, None) {
+            return Ok(family);
+        }
+    }
+    Err("No suitable PDF font family found on host".to_string())
+}
+
+fn normalized_agreement_blocks(content: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !current.is_empty() {
+                blocks.push(current.join(" "));
+                current.clear();
+            }
+            continue;
+        }
+        current.push(trimmed.to_string());
+    }
+
+    if !current.is_empty() {
+        blocks.push(current.join(" "));
+    }
+
+    if blocks.is_empty() {
+        blocks.push(content.trim().to_string());
+    }
+
+    blocks
 }
 
 pub(crate) async fn execute_dispatch_email(call: &ToolCall) -> ToolResult {
@@ -334,4 +442,3 @@ pub(crate) async fn execute_workflow(call: &ToolCall) -> ToolResult {
         },
     }
 }
-

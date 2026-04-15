@@ -68,11 +68,13 @@ impl SolParser {
             }
             "INSERT" => {
                 if let Some(into_idx) = tokens.iter().rposition(|&t| t.to_uppercase() == "INTO")
-                    && into_idx > 1 && into_idx + 1 < tokens.len() {
-                        let content = tokens[1..into_idx].join(" ");
-                        let object_id = tokens[into_idx + 1].to_string();
-                        return Ok(SolOperation::Insert { content, object_id });
-                    }
+                    && into_idx > 1
+                    && into_idx + 1 < tokens.len()
+                {
+                    let content = tokens[1..into_idx].join(" ");
+                    let object_id = tokens[into_idx + 1].to_string();
+                    return Ok(SolOperation::Insert { content, object_id });
+                }
                 Err("Syntax error: INSERT <content> INTO <object_id>".to_string())
             }
             "QUERY" => {

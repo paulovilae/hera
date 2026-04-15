@@ -1,8 +1,106 @@
 //! Data tool executors: Memento, Git, API requests
 use crate::ai::tool_executor::{ToolCall, ToolResult};
 use serde_json::Value;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use tracing::info;
+
+const OS_ROOT: &str = "/home/paulo/Programs/apps/OS";
+
+fn memento_request(action: &str, payload: Value) -> Value {
+    serde_json::json!({
+        "action": action,
+        "payload": payload,
+        "client": {
+            "app": "hera",
+            "token": std::env::var("MEMENTO_CLIENT_TOKEN").ok()
+        }
+    })
+}
+
+fn resolve_guarded_path(path: &str) -> Result<PathBuf, String> {
+    let raw = Path::new(path);
+    let candidate = if raw.exists() {
+        std::fs::canonicalize(raw).map_err(|e| format!("Failed to resolve path: {}", e))?
+    } else {
+        let parent = raw
+            .parent()
+            .ok_or_else(|| "Path must include a parent directory".to_string())?;
+        let resolved_parent = std::fs::canonicalize(parent)
+            .map_err(|e| format!("Failed to resolve parent directory: {}", e))?;
+        resolved_parent.join(
+            raw.file_name()
+                .ok_or_else(|| "Path must include a file or directory name".to_string())?,
+        )
+    };
+
+    if candidate.starts_with(OS_ROOT) {
+        Ok(candidate)
+    } else {
+        Err(format!(
+            "Path '{}' is outside the allowed Hera workspace root '{}'.",
+            path, OS_ROOT
+        ))
+    }
+}
+
+fn is_forbidden_host(host: &str) -> bool {
+    let lowered = host.trim().to_lowercase();
+    if lowered.is_empty() {
+        return true;
+    }
+
+    if matches!(
+        lowered.as_str(),
+        "localhost" | "metadata.google.internal" | "metadata" | "host.docker.internal"
+    ) {
+        return true;
+    }
+
+    if lowered == "169.254.169.254"
+        || lowered.starts_with("127.")
+        || lowered.starts_with("10.")
+        || lowered.starts_with("192.168.")
+        || lowered.starts_with("169.254.")
+        || lowered == "::1"
+    {
+        return true;
+    }
+
+    if let Some(rest) = lowered.strip_prefix("172.") {
+        if let Some(octet) = rest.split('.').next()
+            && let Ok(value) = octet.parse::<u8>()
+        {
+            return (16..=31).contains(&value);
+        }
+    }
+
+    lowered.starts_with("fc") || lowered.starts_with("fd")
+}
+
+fn validate_outbound_url(url: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "Unsupported URL scheme '{}'. Only http and https are allowed.",
+                other
+            ));
+        }
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL must include a hostname".to_string())?;
+    if is_forbidden_host(host) {
+        return Err(format!(
+            "Outbound requests to private or loopback hosts are blocked: '{}'.",
+            host
+        ));
+    }
+
+    Ok(parsed)
+}
 
 pub(crate) async fn execute_memento_query_json(call: &ToolCall) -> Result<Value, String> {
     let app = call
@@ -15,6 +113,11 @@ pub(crate) async fn execute_memento_query_json(call: &ToolCall) -> Result<Value,
         .get("query")
         .and_then(|q| q.as_str())
         .unwrap_or("");
+    let limit = call
+        .arguments
+        .get("limit")
+        .and_then(|l| l.as_u64())
+        .unwrap_or(500);
 
     if query.is_empty() {
         return Err("Missing 'query' argument".to_string());
@@ -27,14 +130,14 @@ pub(crate) async fn execute_memento_query_json(call: &ToolCall) -> Result<Value,
         Ok(mut stream) => {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-            let msg = serde_json::json!({
-                "action": "query_app",
-                "payload": {
+            let msg = memento_request(
+                "query_app",
+                serde_json::json!({
                     "app": app,
                     "query": query,
-                    "limit": 20
-                }
-            });
+                    "limit": limit
+                }),
+            );
 
             if let Err(e) = stream.write_all(msg.to_string().as_bytes()).await {
                 return Err(format!("Failed to send to Memento: {}", e));
@@ -138,22 +241,70 @@ pub(crate) async fn execute_api_request(call: &ToolCall) -> ToolResult {
         };
     }
 
-    let client = reqwest::Client::new();
-    let mut req = match method.to_uppercase().as_str() {
-        "POST" => client.post(url),
-        "PUT" => client.put(url),
-        "DELETE" => client.delete(url),
-        _ => client.get(url),
+    let method_upper = method.to_uppercase();
+    if !matches!(
+        method_upper.as_str(),
+        "GET" | "POST" | "PUT" | "DELETE" | "PATCH"
+    ) {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Unsupported HTTP method '{}'.", method),
+        };
+    }
+
+    let parsed_url = match validate_outbound_url(url) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: error,
+            };
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Failed to build HTTP client: {}", error),
+            };
+        }
+    };
+    let mut req = match method_upper.as_str() {
+        "POST" => client.post(parsed_url.clone()),
+        "PUT" => client.put(parsed_url.clone()),
+        "DELETE" => client.delete(parsed_url.clone()),
+        "PATCH" => client.patch(parsed_url.clone()),
+        _ => client.get(parsed_url.clone()),
     };
 
     if let Ok(headers) = serde_json::from_str::<serde_json::Value>(headers_str)
-        && let Some(obj) = headers.as_object() {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+        && let Some(obj) = headers.as_object()
+    {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                let lower = k.to_ascii_lowercase();
+                if matches!(lower.as_str(), "authorization" | "cookie" | "x-api-key") {
+                    return ToolResult {
+                        name: call.name.clone(),
+                        success: false,
+                        output: format!(
+                            "Blocked outbound sensitive header '{}'. Use a dedicated adapter instead.",
+                            k
+                        ),
+                    };
                 }
+                req = req.header(k, s);
             }
         }
+    }
 
     if !body_str.is_empty() {
         req = req.body(body_str.to_string());
@@ -203,9 +354,40 @@ pub(crate) async fn execute_git_manager(call: &ToolCall) -> ToolResult {
         };
     }
 
+    let resolved_repo = match resolve_guarded_path(repo_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: error,
+            };
+        }
+    };
+
     let args: Vec<&str> = command.split_whitespace().collect();
+    let Some(subcommand) = args.first().copied() else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Git command cannot be empty.".into(),
+        };
+    };
+    if !matches!(
+        subcommand,
+        "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
+    ) {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!(
+                "Git subcommand '{}' is blocked. Hera only allows read-only git operations.",
+                subcommand
+            ),
+        };
+    }
     match std::process::Command::new("git")
-        .current_dir(repo_path)
+        .current_dir(&resolved_repo)
         .args(&args)
         .output()
     {
@@ -248,13 +430,13 @@ pub(crate) async fn execute_memento_vector_search(call: &ToolCall) -> ToolResult
     match tokio::net::UnixStream::connect("/tmp/memento.sock").await {
         Ok(mut stream) => {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let msg = serde_json::json!({
-                "action": "vector_search",
-                "payload": {
+            let msg = memento_request(
+                "vector_search",
+                serde_json::json!({
                     "query": query,
                     "limit": limit
-                }
-            });
+                }),
+            );
             if stream.write_all(msg.to_string().as_bytes()).await.is_err() {
                 return ToolResult {
                     name: call.name.clone(),
@@ -286,4 +468,3 @@ pub(crate) async fn execute_memento_vector_search(call: &ToolCall) -> ToolResult
         },
     }
 }
-

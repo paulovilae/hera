@@ -9,6 +9,7 @@
 
 pub mod context;
 pub mod handler_audio;
+pub mod handler_dag;
 pub mod handler_generate;
 pub mod handler_lora;
 pub mod handler_media;
@@ -49,12 +50,8 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                 buffer.extend_from_slice(&chunk[..n]);
                                 match serde_json::from_slice::<IpcPayload>(&buffer) {
                                     Ok(request) => {
-                                        info!(
-                                            "📥 Received IPC Action: {}",
-                                            request.action
-                                        );
-                                        let outcome =
-                                            dispatch(&request, &state, &mut stream).await;
+                                        info!("📥 Received IPC Action: {}", request.action);
+                                        let outcome = dispatch(&request, &state, &mut stream).await;
                                         match outcome {
                                             HandlerOutcome::DirectResponse => {
                                                 // Handler already wrote to stream
@@ -92,11 +89,9 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                                                 "error": format!("Invalid JSON: {}", e)
                                             }),
                                         };
-                                        let mut estr =
-                                            serde_json::to_string(&err_msg).unwrap();
+                                        let mut estr = serde_json::to_string(&err_msg).unwrap();
                                         estr.push('\n');
-                                        let _ =
-                                            stream.write_all(estr.as_bytes()).await;
+                                        let _ = stream.write_all(estr.as_bytes()).await;
                                         break;
                                     }
                                 }
@@ -124,25 +119,16 @@ async fn dispatch(
     stream: &mut tokio::net::UnixStream,
 ) -> HandlerOutcome {
     match request.action.as_str() {
-        "execute_tool" => {
-            handler_tools::handle_execute_tool(request, state, stream).await
-        }
-        "generate" => {
-            handler_generate::handle_generate(request, state, stream).await
-        }
-        "generate_stream" => {
-            handler_stream::handle_generate_stream(request, state, stream).await
-        }
+        "execute_tool" => handler_tools::handle_execute_tool(request, state, stream).await,
+        "generate" => handler_generate::handle_generate(request, state, stream).await,
+        "generate_stream" => handler_stream::handle_generate_stream(request, state, stream).await,
         "generate_image" => handler_media::handle_generate_image(request, state).await,
-        "vision_analysis" => {
-            handler_media::handle_vision_analysis(request, state).await
-        }
+        "vision_analysis" => handler_media::handle_vision_analysis(request, state).await,
+        "execute_dag" => handler_dag::handle_execute_dag(request, state).await,
         "generate_video" | "animate_image" => {
             handler_media::handle_generate_video(request, state).await
         }
-        "transcribe_audio" => {
-            handler_audio::handle_transcribe_audio(request, state).await
-        }
+        "transcribe_audio" => handler_audio::handle_transcribe_audio(request, state).await,
         "get_tools" => handler_tools::handle_get_tools(request, state),
         "download_lora" => handler_lora::handle_download_lora(request).await,
         _ => HandlerOutcome::Result {

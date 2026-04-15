@@ -1,9 +1,265 @@
 //! Platform tool executors: desktop, draw, search, speak, video, files, agents, skills, soul, user interaction
-use crate::ai::tool_executor::{find_skill_artifact, load_agent_artifact, ToolCall, ToolResult};
-use serde_json::Value;
+use crate::ai::tool_executor::{ToolCall, ToolResult, find_skill_artifact, load_agent_artifact};
+use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tracing::info;
+
+const HERA_SOCKET: &str = "/tmp/hera-core.sock";
+const OS_ROOT: &str = "/home/paulo/Programs/apps/OS";
+const TMP_ROOT: &str = "/tmp";
+
+fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<PathBuf, String> {
+    let raw = Path::new(path);
+    let candidate = if raw.exists() {
+        std::fs::canonicalize(raw).map_err(|e| format!("Failed to resolve path: {}", e))?
+    } else {
+        let parent = raw
+            .parent()
+            .ok_or_else(|| "Path must include a parent directory".to_string())?;
+        let resolved_parent = std::fs::canonicalize(parent)
+            .map_err(|e| format!("Failed to resolve parent directory: {}", e))?;
+        resolved_parent.join(
+            raw.file_name()
+                .ok_or_else(|| "Path must include a file name".to_string())?,
+        )
+    };
+
+    if candidate.starts_with(OS_ROOT) || (allow_tmp && candidate.starts_with(TMP_ROOT)) {
+        Ok(candidate)
+    } else {
+        Err(format!(
+            "Path '{}' is outside allowed Hera roots ('{}'{}).",
+            path,
+            OS_ROOT,
+            if allow_tmp { ", '/tmp'" } else { "" }
+        ))
+    }
+}
+
+fn validate_python_package_name(package: &str) -> bool {
+    !package.is_empty()
+        && package.len() <= 64
+        && package
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn parse_ipc_result(response: &str) -> Result<String, String> {
+    let mut accumulated_text = String::new();
+    let mut final_result = None;
+
+    for line in response.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        match message.get("status").and_then(|value| value.as_str()) {
+            Some("success") => {
+                if let Some(result) = message
+                    .pointer("/data/result")
+                    .and_then(|value| value.as_str())
+                {
+                    final_result = Some(result.to_string());
+                }
+            }
+            Some("chunk") => {
+                if let Some(text) = message
+                    .pointer("/data/text")
+                    .and_then(|value| value.as_str())
+                {
+                    accumulated_text.push_str(text);
+                }
+            }
+            Some("error") => {
+                let error = message
+                    .pointer("/data/error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown Hera IPC error");
+                return Err(error.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(result) = final_result {
+        Ok(result)
+    } else if !accumulated_text.is_empty() {
+        Ok(accumulated_text)
+    } else {
+        Err("No content in Hera IPC response".to_string())
+    }
+}
+
+async fn run_agent_via_hera_ipc(persona: String, prompt: String) -> Result<String, String> {
+    let mut stream = UnixStream::connect(HERA_SOCKET)
+        .await
+        .map_err(|error| format!("failed to connect to Hera IPC: {error}"))?;
+
+    let request = json!({
+        "action": "generate",
+        "payload": {
+            "app": "hera",
+            "messages": [
+                { "role": "system", "content": persona },
+                { "role": "user", "content": prompt }
+            ],
+            "temperature": 0.2,
+            "max_tokens": 1200,
+            "permissions": []
+        }
+    });
+
+    let payload = format!("{}\n", request);
+    stream
+        .write_all(payload.as_bytes())
+        .await
+        .map_err(|error| format!("failed to write Hera IPC request: {error}"))?;
+
+    stream
+        .shutdown()
+        .await
+        .map_err(|error| format!("failed to shutdown Hera IPC write half: {error}"))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .map_err(|error| format!("failed to read Hera IPC response: {error}"))?;
+
+    parse_ipc_result(&response)
+}
+
+fn resolve_app_main_css(app: &str) -> Option<PathBuf> {
+    let needle = app.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+
+    let apps_dir = PathBuf::from("/home/paulo/Programs/apps/OS/Apps");
+    let entries = std::fs::read_dir(apps_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().to_lowercase();
+        let normalized = dir_name.replace('_', "-");
+        if dir_name != needle && normalized != needle {
+            continue;
+        }
+        let css_path = path.join("media/css/main.css");
+        if css_path.exists() {
+            return Some(css_path);
+        }
+    }
+    None
+}
+
+pub(crate) async fn execute_edit_app_theme(call: &ToolCall) -> ToolResult {
+    let app = call
+        .arguments
+        .get("app")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let theme = call
+        .arguments
+        .get("theme")
+        .and_then(|value| value.as_str())
+        .unwrap_or("both")
+        .trim();
+    let variables = call
+        .arguments
+        .get("variables")
+        .and_then(|value| value.as_object());
+
+    if app.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing required 'app' parameter.".to_string(),
+        };
+    }
+
+    let Some(variables) = variables else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing or invalid 'variables' object.".to_string(),
+        };
+    };
+
+    if variables.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Theme edit requires at least one CSS variable override.".to_string(),
+        };
+    }
+
+    let Some(css_path) = resolve_app_main_css(app) else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Could not find media/css/main.css for app '{}'.", app),
+        };
+    };
+
+    let selector = match theme {
+        "light" => ":root, [data-theme=\"light\"]",
+        "dark" => "[data-theme=\"dark\"]",
+        "both" => ":root, [data-theme=\"light\"], [data-theme=\"dark\"]",
+        _ => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: "Theme must be one of: light, dark, both.".to_string(),
+            };
+        }
+    };
+
+    let mut overrides = String::from("\n/* Hera theme override */\n");
+    overrides.push_str(selector);
+    overrides.push_str(" {\n");
+    for (key, value) in variables {
+        let Some(raw) = value.as_str() else {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Theme variable '{}' must map to a string value.", key),
+            };
+        };
+        overrides.push_str(&format!("  {}: {};\n", key.trim(), raw.trim()));
+    }
+    overrides.push_str("}\n");
+
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .open(&css_path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, overrides.as_bytes()))
+    {
+        Ok(_) => ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!(
+                "App theme updated by appending CSS overrides to {}",
+                css_path.display()
+            ),
+        },
+        Err(error) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to update app theme: {}", error),
+        },
+    }
+}
 
 pub(crate) async fn execute_desktop_click(call: &ToolCall) -> ToolResult {
     let x = call
@@ -199,46 +455,16 @@ pub(crate) async fn execute_spawn_parallel_agents(call: &ToolCall) -> ToolResult
             let agent = load_agent_artifact(&agent_name);
             let persona = agent.persona;
 
-            // Connect to local inference engine via Hera chat
-            let hera = hera_web::agents::hera::Hera::new("http://127.0.0.1:3000");
-
-            let payload = serde_json::json!({
-                "model": "hera",
-                "messages": [
-                    { "role": "system", "content": persona },
-                    { "role": "user", "content": p }
-                ],
-                "temperature": 0.2
-            });
-
-            match hera.chat(payload).await {
-                Ok(res) => {
-                    if let Ok(json) = res.json::<serde_json::Value>().await {
-                        let content = json
-                            .get("choices")
-                            .and_then(|c| c.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|c| c.get("message"))
-                            .and_then(|m| m.get("content"))
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("No response")
-                            .to_string();
-                        format!(
-                            "--- REPORT FROM {} ---\n{}\n",
-                            agent_name.to_uppercase(),
-                            content
-                        )
-                    } else {
-                        format!(
-                            "--- REPORT FROM {} ---\nFailed to parse JSON response.\n",
-                            agent_name.to_uppercase()
-                        )
-                    }
-                }
-                Err(e) => format!(
-                    "--- REPORT FROM {} ---\nFailed to reach inference engine: {}\n",
+            match run_agent_via_hera_ipc(persona, p).await {
+                Ok(content) => format!(
+                    "--- REPORT FROM {} ---\n{}\n",
                     agent_name.to_uppercase(),
-                    e
+                    content
+                ),
+                Err(error) => format!(
+                    "--- REPORT FROM {} ---\nFailed to reach inference engine via Hera IPC: {}\n",
+                    agent_name.to_uppercase(),
+                    error
                 ),
             }
         }));
@@ -588,9 +814,19 @@ pub(crate) async fn execute_read_file(call: &ToolCall) -> ToolResult {
         .get("path")
         .and_then(|p| p.as_str())
         .unwrap_or("");
+    let resolved_path = match resolve_guarded_fs_path(path, true) {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: error,
+            };
+        }
+    };
     let request = diakonos_core::protocol::DiakonosRequest {
         action: "read_file".to_string(),
-        payload: serde_json::json!({ "path": path }),
+        payload: serde_json::json!({ "path": resolved_path }),
     };
 
     match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
@@ -602,11 +838,15 @@ pub(crate) async fn execute_read_file(call: &ToolCall) -> ToolResult {
                 .get("content")
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            info!("📄 [Hera] Read file: {}", path);
+            info!("📄 [Hera] Read file: {}", resolved_path.display());
             ToolResult {
                 name: call.name.clone(),
                 success: true,
-                output: format!("File contents of '{}':\n{}", path, truncated),
+                output: format!(
+                    "File contents of '{}':\n{}",
+                    resolved_path.display(),
+                    truncated
+                ),
             }
         }
         Ok(response) => ToolResult {
@@ -622,7 +862,7 @@ pub(crate) async fn execute_read_file(call: &ToolCall) -> ToolResult {
         Err(e) => ToolResult {
             name: call.name.clone(),
             success: false,
-            output: format!("Failed to read file '{}': {}", path, e),
+            output: format!("Failed to read file '{}': {}", resolved_path.display(), e),
         },
     }
 }
@@ -719,6 +959,33 @@ pub(crate) async fn execute_run_code(call: &ToolCall) -> ToolResult {
         })
         .unwrap_or_default();
 
+    if code.trim().is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing code payload.".to_string(),
+        };
+    }
+    if code.len() > 100_000 {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Code payload too large. Limit is 100000 bytes.".to_string(),
+        };
+    }
+    if packages.len() > 16
+        || packages
+            .iter()
+            .any(|pkg| !validate_python_package_name(pkg))
+    {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Package list contains invalid names or exceeds the maximum allowed count."
+                .to_string(),
+        };
+    }
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -737,6 +1004,10 @@ pub(crate) async fn execute_run_code(call: &ToolCall) -> ToolResult {
                 "key": bean_name.clone(),
                 "content": format!("Language: {}\nPackages: {:?}\nCode:\n{}", lang, packages, code),
                 "tags": "bean, code_interpreter"
+            },
+            "client": {
+                "app": "hera",
+                "token": std::env::var("MEMENTO_CLIENT_TOKEN").ok()
             }
         });
         let _ = stream.write_all(payload.to_string().as_bytes());
@@ -757,7 +1028,8 @@ tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-"#.to_string();
+"#
+        .to_string();
         for pkg in &packages {
             deps.push_str(&format!("{} = \"*\"\n", pkg));
         }
@@ -825,10 +1097,7 @@ edition = "2021"
         let mut pip_log = String::new();
         if !packages.is_empty() {
             let mut cmd = std::process::Command::new("python3");
-            cmd.arg("-m")
-                .arg("pip")
-                .arg("install")
-                .arg("--break-system-packages");
+            cmd.arg("-m").arg("pip").arg("install").arg("--user");
             for pkg in &packages {
                 cmd.arg(pkg);
             }
@@ -907,11 +1176,22 @@ pub(crate) async fn execute_write_file(call: &ToolCall) -> ToolResult {
         };
     }
 
-    match std::fs::write(path, content) {
+    let resolved_path = match resolve_guarded_fs_path(path, true) {
+        Ok(path) => path,
+        Err(error) => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: error,
+            };
+        }
+    };
+
+    match std::fs::write(&resolved_path, content) {
         Ok(_) => ToolResult {
             name: call.name.clone(),
             success: true,
-            output: format!("Successfully wrote to {}", path),
+            output: format!("Successfully wrote to {}", resolved_path.display()),
         },
         Err(e) => ToolResult {
             name: call.name.clone(),
@@ -934,10 +1214,38 @@ pub(crate) async fn execute_web_scraper(call: &ToolCall) -> ToolResult {
             output: "Missing url".into(),
         };
     }
+    let parsed_url = match reqwest::Url::parse(url) {
+        Ok(url) => url,
+        Err(error) => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Invalid URL: {}", error),
+            };
+        }
+    };
+    let Some(host) = parsed_url.host_str() else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "URL must include a hostname.".to_string(),
+        };
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+    {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Blocked scraping private or loopback host '{}'.", host),
+        };
+    }
 
     let request = diakonos_core::protocol::DiakonosRequest {
         action: "web_scrape".to_string(),
-        payload: serde_json::json!({ "url": url }),
+        payload: serde_json::json!({ "url": parsed_url.as_str() }),
     };
 
     match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
@@ -1018,7 +1326,7 @@ pub(crate) async fn execute_spline_interact(call: &ToolCall) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ai::tool_executor::parse_tool_calls;
 
     #[test]
     fn test_parse_tool_call() {

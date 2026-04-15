@@ -36,24 +36,26 @@ impl LLMEngine for OpenAICompatEngine {
 
         if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
             && let Ok(explicit_model) = std::env::var("HERA_OPENAI_MODEL")
-                && !explicit_model.trim().is_empty() {
-                    normalized_req.model = explicit_model.trim().to_string();
-                }
+            && !explicit_model.trim().is_empty()
+        {
+            normalized_req.model = explicit_model.trim().to_string();
+        }
 
         if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
             && active_endpoint.contains("openrouter.ai")
             && let Ok(cloud_model) = std::env::var("OPENROUTER_DEFAULT_MODEL")
-                && !cloud_model.trim().is_empty() {
-                    normalized_req.model = cloud_model.trim().to_string();
-                }
+            && !cloud_model.trim().is_empty()
+        {
+            normalized_req.model = cloud_model.trim().to_string();
+        }
 
         if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
             && active_endpoint.contains("127.0.0.1:8080")
             && let Some(discovered_model) =
                 discover_first_model_id(&self.client, &active_endpoint, &active_key).await
-            {
-                normalized_req.model = discovered_model;
-            }
+        {
+            normalized_req.model = discovered_model;
+        }
 
         // Force multimodal array format to avoid strict provider crashes (e.g. OpenRouter expecting objects instead of strings)
         for message in &mut normalized_req.messages {
@@ -128,24 +130,26 @@ impl LLMEngine for OpenAICompatEngine {
 
         if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
             && let Ok(explicit_model) = std::env::var("HERA_OPENAI_MODEL")
-                && !explicit_model.trim().is_empty() {
-                    normalized_req.model = explicit_model.trim().to_string();
-                }
+            && !explicit_model.trim().is_empty()
+        {
+            normalized_req.model = explicit_model.trim().to_string();
+        }
 
         if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
             && active_endpoint.contains("openrouter.ai")
             && let Ok(cloud_model) = std::env::var("OPENROUTER_DEFAULT_MODEL")
-                && !cloud_model.trim().is_empty() {
-                    normalized_req.model = cloud_model.trim().to_string();
-                }
+            && !cloud_model.trim().is_empty()
+        {
+            normalized_req.model = cloud_model.trim().to_string();
+        }
 
         if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
             && active_endpoint.contains("127.0.0.1:8080")
             && let Some(discovered_model) =
                 discover_first_model_id(&self.client, &active_endpoint, &active_key).await
-            {
-                normalized_req.model = discovered_model;
-            }
+        {
+            normalized_req.model = discovered_model;
+        }
 
         for message in &mut normalized_req.messages {
             if let crate::ai::MessageContent::Text(text) = &message.content {

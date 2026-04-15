@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::ai::{InferenceError, SpeechToTextEngine};
+use anyhow::Result;
 use candle_core::{Device, IndexOp, Tensor};
 use candle_transformers::models::whisper::{self as m, Config, audio};
 use hound::WavReader;

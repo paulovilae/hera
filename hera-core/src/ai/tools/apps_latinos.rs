@@ -1,5 +1,6 @@
 //! Latinos Trading Quant Lab tool executors
 use crate::ai::tool_executor::{ToolCall, ToolResult};
+use crate::ai::tools::data::execute_memento_query;
 use serde_json::Value;
 use std::process::Command;
 
@@ -55,7 +56,9 @@ pub(crate) async fn execute_market_research(call: &ToolCall) -> ToolResult {
 }
 
 // ── FMP/SEC Consultant Report Analyzer ────────────────────────────────────────
-pub(crate) async fn execute_consultant_report_analyzer_json(call: &ToolCall) -> Result<Value, String> {
+pub(crate) async fn execute_consultant_report_analyzer_json(
+    call: &ToolCall,
+) -> Result<Value, String> {
     let ticker = call
         .arguments
         .get("ticker")
@@ -64,7 +67,7 @@ pub(crate) async fn execute_consultant_report_analyzer_json(call: &ToolCall) -> 
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Missing 'ticker' argument".to_string())?;
 
-    let focus = call
+    let _focus = call
         .arguments
         .get("focus")
         .and_then(|value| value.as_str())
@@ -73,7 +76,7 @@ pub(crate) async fn execute_consultant_report_analyzer_json(call: &ToolCall) -> 
 
     // Phase 4 FMP integration (mocked fallback if no keys configured)
     let fmp_key = std::env::var("FMP_API_KEY").unwrap_or_default();
-    
+
     if fmp_key.is_empty() {
         return Ok(serde_json::json!({
             "ticker": ticker,
@@ -91,7 +94,9 @@ pub(crate) async fn execute_consultant_report_analyzer_json(call: &ToolCall) -> 
     }
 
     // [REAL FMP LOGIC WOULD GO HERE IN FUTURE PHASES]
-    Ok(serde_json::json!({ "ticker": ticker, "status": "error", "message": "FMP logic not yet implemented" }))
+    Ok(
+        serde_json::json!({ "ticker": ticker, "status": "error", "message": "FMP logic not yet implemented" }),
+    )
 }
 
 pub(crate) async fn execute_consultant_report_analyzer(call: &ToolCall) -> ToolResult {
@@ -105,6 +110,94 @@ pub(crate) async fn execute_consultant_report_analyzer(call: &ToolCall) -> ToolR
             name: call.name.clone(),
             success: false,
             output: error,
+        },
+    }
+}
+
+pub(crate) async fn execute_list_bots(call: &ToolCall) -> ToolResult {
+    let memento_call = ToolCall {
+        name: "memento_query".to_string(),
+        arguments: serde_json::json!({
+            "app": "latinos",
+            "query": "SELECT id, name, status, live_trading, created_at, updated_at FROM latinos_bots ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 25"
+        }),
+    };
+
+    let mut result = execute_memento_query(&memento_call).await;
+    result.name = call.name.clone();
+    result
+}
+
+pub(crate) async fn execute_get_bot_status(call: &ToolCall) -> ToolResult {
+    let Some(bot_id) = call
+        .arguments
+        .get("bot_id")
+        .and_then(|value| value.as_i64())
+    else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing required 'bot_id' parameter.".to_string(),
+        };
+    };
+    let include_trades = call
+        .arguments
+        .get("include_trades")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let trade_limit = call
+        .arguments
+        .get("trade_limit")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 50);
+
+    let bot_call = ToolCall {
+        name: "memento_query".to_string(),
+        arguments: serde_json::json!({
+            "app": "latinos",
+            "query": format!("SELECT id, name, status, live_trading, live_metrics, updated_at FROM latinos_bots WHERE id = {} LIMIT 1", bot_id)
+        }),
+    };
+    let bot_result = execute_memento_query(&bot_call).await;
+    if !bot_result.success {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: bot_result.output,
+        };
+    }
+
+    if !include_trades {
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Bot status:\n{}", bot_result.output),
+        };
+    }
+
+    let trades_call = ToolCall {
+        name: "memento_query".to_string(),
+        arguments: serde_json::json!({
+            "app": "latinos",
+            "query": format!("SELECT symbol, side, price, amount, status, pnl, timestamp FROM latinos_trades WHERE bot_id = {} ORDER BY timestamp DESC LIMIT {}", bot_id, trade_limit)
+        }),
+    };
+    let trades_result = execute_memento_query(&trades_call).await;
+
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: if trades_result.success {
+            format!(
+                "Bot status:\n{}\n\nRecent trades:\n{}",
+                bot_result.output, trades_result.output
+            )
+        } else {
+            format!(
+                "Bot status:\n{}\n\nRecent trades could not be loaded:\n{}",
+                bot_result.output, trades_result.output
+            )
         },
     }
 }
@@ -132,7 +225,11 @@ pub(crate) async fn execute_latinos_bridge(call: &ToolCall, tool: &str) -> ToolR
     if let Some(v) = call.arguments.get("range").and_then(|v| v.as_str()) {
         cmd.args(["--range", v]);
     }
-    if let Some(v) = call.arguments.get("initial_capital").and_then(|v| v.as_f64()) {
+    if let Some(v) = call
+        .arguments
+        .get("initial_capital")
+        .and_then(|v| v.as_f64())
+    {
         cmd.args(["--initial-capital", &v.to_string()]);
     }
     if let Some(v) = call.arguments.get("source").and_then(|v| v.as_str()) {
@@ -148,11 +245,19 @@ pub(crate) async fn execute_latinos_bridge(call: &ToolCall, tool: &str) -> ToolR
     match cmd.output().await {
         Ok(output) if output.status.success() => {
             let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            ToolResult { name: call.name.clone(), success: true, output: out }
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: out,
+            }
         }
         Ok(output) => {
             let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            ToolResult { name: call.name.clone(), success: false, output: format!("Bridge error: {}", err) }
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Bridge error: {}", err),
+            }
         }
         Err(e) => ToolResult {
             name: call.name.clone(),
@@ -161,4 +266,3 @@ pub(crate) async fn execute_latinos_bridge(call: &ToolCall, tool: &str) -> ToolR
         },
     }
 }
-

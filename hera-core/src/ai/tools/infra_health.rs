@@ -1,11 +1,125 @@
 //! Infrastructure health tool executors: diagnose, system_status, service_restart, pm2_logs
 use crate::ai::tool_executor::{
-    canonical_app_search_terms, load_canonical_app_registry, text_contains_app_alias, ToolCall,
-    ToolResult,
+    ToolCall, ToolResult, canonical_app_search_terms, canonicalize_app_slug,
+    pm2_process_name_for_slug, text_contains_app_alias,
 };
-use serde_json::Value;
-use std::process::Command;
 use tracing::info;
+
+fn allowed_pm2_service_name(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(slug) = canonicalize_app_slug(trimmed) {
+        return Some(pm2_process_name_for_slug(&slug).to_string());
+    }
+
+    let sanitized: String = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '.')
+        .collect();
+
+    let core_services = [
+        "hera-core",
+        "memento-node",
+        "argus",
+        "diakonos",
+        "os-v3",
+        "desktop-rust",
+        "movilo",
+        "vetra-rust",
+        "latinos-rust",
+        "capacita-rust",
+        "paulo-vila",
+    ];
+
+    core_services
+        .iter()
+        .find(|candidate| **candidate == sanitized)
+        .map(|value| (*value).to_string())
+}
+
+pub(crate) async fn execute_caddy_domain_manager(call: &ToolCall) -> ToolResult {
+    let action = call
+        .arguments
+        .get("action")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let domain = call
+        .arguments
+        .get("domain")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let with_www = call
+        .arguments
+        .get("with_www")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+
+    if !matches!(action, "add" | "remove" | "list") {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Action must be one of: add, remove, list.".to_string(),
+        };
+    }
+
+    if action != "list" {
+        let valid = !domain.is_empty()
+            && domain
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-');
+        if !valid {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: "Domain must be a non-empty hostname containing only letters, digits, dots, or hyphens.".to_string(),
+            };
+        }
+    }
+
+    let script_path = "/home/paulo/Programs/apps/OS/Tools/global/infra/caddy_domain_manager.sh";
+    let mut command = std::process::Command::new(script_path);
+    command.arg(action);
+    if action != "list" {
+        command.arg(domain);
+        if with_www {
+            command.arg("--www");
+        }
+    }
+
+    match command.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if output.status.success() {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: if stdout.is_empty() {
+                        "Caddy domain operation completed.".to_string()
+                    } else {
+                        stdout
+                    },
+                }
+            } else {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: if stderr.is_empty() { stdout } else { stderr },
+                }
+            }
+        }
+        Err(error) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to execute caddy_domain_manager.sh: {}", error),
+        },
+    }
+}
 
 pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
     let service_filter = call
@@ -63,57 +177,60 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
     // ── 2. Get PM2 process list ──
     let mut pm2_services: Vec<(String, String, u64, u64)> = Vec::new(); // (name, status, restarts, pid)
     if let Ok(output) = std::process::Command::new("pm2").arg("jlist").output()
-        && output.status.success() {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            if let Ok(procs) = serde_json::from_str::<Vec<serde_json::Value>>(&out_str) {
-                for proc in &procs {
-                    let name = proc
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("?")
-                        .to_string();
-                    let status = proc
-                        .get("pm2_env")
-                        .and_then(|e| e.get("status"))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("?")
-                        .to_string();
-                    let restarts = proc
-                        .get("pm2_env")
-                        .and_then(|e| e.get("restart_time"))
-                        .and_then(|r| r.as_u64())
-                        .unwrap_or(0);
-                    let pid = proc.get("pid").and_then(|p| p.as_u64()).unwrap_or(0);
-                    pm2_services.push((name, status, restarts, pid));
-                }
+        && output.status.success()
+    {
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        if let Ok(procs) = serde_json::from_str::<Vec<serde_json::Value>>(&out_str) {
+            for proc in &procs {
+                let name = proc
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let status = proc
+                    .get("pm2_env")
+                    .and_then(|e| e.get("status"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let restarts = proc
+                    .get("pm2_env")
+                    .and_then(|e| e.get("restart_time"))
+                    .and_then(|r| r.as_u64())
+                    .unwrap_or(0);
+                let pid = proc.get("pid").and_then(|p| p.as_u64()).unwrap_or(0);
+                pm2_services.push((name, status, restarts, pid));
             }
         }
+    }
 
     // ── 3. Get actual port listeners via ss ──
     let mut port_owners: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
     if let Ok(output) = std::process::Command::new("ss").args(["-tlnp"]).output()
-        && output.status.success() {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            for line in out_str.lines().skip(1) {
-                // Parse: LISTEN  0  4096  0.0.0.0:5150  0.0.0.0:*  users:(("proc",pid=X,fd=Y))
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    let addr = parts[3];
-                    if let Some(port_str) = addr.rsplit(':').next()
-                        && let Ok(port) = port_str.parse::<u16>() {
-                            // Extract process name from users:((...)) field
-                            let proc_info = parts.get(5).unwrap_or(&"");
-                            let proc_name = if let Some(start) = proc_info.find("((\"") {
-                                let after = &proc_info[start + 3..];
-                                after.split('"').next().unwrap_or("unknown").to_string()
-                            } else {
-                                "unknown".to_string()
-                            };
-                            port_owners.insert(port, proc_name);
-                        }
+        && output.status.success()
+    {
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        for line in out_str.lines().skip(1) {
+            // Parse: LISTEN  0  4096  0.0.0.0:5150  0.0.0.0:*  users:(("proc",pid=X,fd=Y))
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5 {
+                let addr = parts[3];
+                if let Some(port_str) = addr.rsplit(':').next()
+                    && let Ok(port) = port_str.parse::<u16>()
+                {
+                    // Extract process name from users:((...)) field
+                    let proc_info = parts.get(5).unwrap_or(&"");
+                    let proc_name = if let Some(start) = proc_info.find("((\"") {
+                        let after = &proc_info[start + 3..];
+                        after.split('"').next().unwrap_or("unknown").to_string()
+                    } else {
+                        "unknown".to_string()
+                    };
+                    port_owners.insert(port, proc_name);
                 }
             }
         }
+    }
 
     // ── 4. HTTP-probe each unique port ──
     let mut port_status: std::collections::HashMap<u16, (u16, String)> =
@@ -181,9 +298,9 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
             && !hosts
                 .iter()
                 .any(|h| text_contains_app_alias(h, &service_terms))
-            {
-                continue;
-            }
+        {
+            continue;
+        }
 
         let port_owner = port_owners.get(port);
         let http = port_status.get(port);
@@ -218,9 +335,9 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
                     let host_base = host_label.split('.').next().unwrap_or("").to_lowercase();
                     let pm2_aliases = canonical_app_search_terms(name);
                     text_contains_app_alias(&host_label, &pm2_aliases)
-                        || pm2_aliases
-                            .iter()
-                            .any(|alias: &String| host_base.contains(alias) || alias.contains(&host_base))
+                        || pm2_aliases.iter().any(|alias: &String| {
+                            host_base.contains(alias) || alias.contains(&host_base)
+                        })
                 });
                 if let Some((pm2_name, pm2_status, restarts, _)) = possible_pm2 {
                     root_causes.push(format!(
@@ -233,7 +350,10 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
                         "Port {} ({}) has no listener and NO matching PM2 process — service may not be registered in PM2",
                         port, host_label
                     ));
-                    proposed_fixes.push("Register the service in PM2 or verify the port in services.conf".to_string());
+                    proposed_fixes.push(
+                        "Register the service in PM2 or verify the port in services.conf"
+                            .to_string(),
+                    );
                 }
             }
             // Port listening but HTTP probe returned 0 (connection issues)
@@ -288,81 +408,87 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
             "--format=csv,noheader,nounits",
         ])
         .output()
-        && output.status.success() {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            for (i, line) in out_str.lines().enumerate() {
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() == 2 {
-                    let used: f64 = parts[0].trim().parse().unwrap_or(0.0);
-                    let total: f64 = parts[1].trim().parse().unwrap_or(1.0);
-                    let pct = (used / total) * 100.0;
-                    if pct > 95.0 {
-                        root_causes.push(format!(
+        && output.status.success()
+    {
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        for (i, line) in out_str.lines().enumerate() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() == 2 {
+                let used: f64 = parts[0].trim().parse().unwrap_or(0.0);
+                let total: f64 = parts[1].trim().parse().unwrap_or(1.0);
+                let pct = (used / total) * 100.0;
+                if pct > 95.0 {
+                    root_causes.push(format!(
                             "🔥 VRAM EXHAUSTION: GPU {} is at {:.0}% VRAM ({:.0}MB / {:.0}MB) — new GPU-dependent services will fail to start",
                             i, pct, used, total
                         ));
-                        proposed_fixes.push(format!("Free GPU {} VRAM by stopping unused GPU processes: `nvidia-smi` then kill the heaviest one", i));
-                    }
+                    proposed_fixes.push(format!("Free GPU {} VRAM by stopping unused GPU processes: `nvidia-smi` then kill the heaviest one", i));
                 }
             }
         }
+    }
 
     // Check disk space
     if let Ok(output) = std::process::Command::new("df")
         .args(["-h", "--output=target,pcent,avail", "/", "/home"])
         .output()
-        && output.status.success() {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            for line in out_str.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    let mount = parts[0];
-                    let pct_str = parts[1].trim_end_matches('%');
-                    if let Ok(pct) = pct_str.parse::<u32>()
-                        && pct > 90 {
-                            root_causes.push(format!(
+        && output.status.success()
+    {
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        for line in out_str.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let mount = parts[0];
+                let pct_str = parts[1].trim_end_matches('%');
+                if let Ok(pct) = pct_str.parse::<u32>()
+                    && pct > 90
+                {
+                    root_causes.push(format!(
                                 "💾 DISK FULL: {} is at {}% usage (only {} free) — services will crash on write",
                                 mount, pct, parts[2]
                             ));
-                            proposed_fixes.push(format!(
+                    proposed_fixes.push(format!(
                                 "Free disk space on {}: check /tmp, Docker images, PM2 logs, and build artifacts",
                                 mount
                             ));
-                        }
                 }
             }
         }
+    }
 
     // Check WireGuard tunnel status
     if let Ok(output) = std::process::Command::new("wg").arg("show").output()
-        && output.status.success() {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            if out_str.trim().is_empty() {
-                root_causes.push("🔒 WIREGUARD DOWN: No active WireGuard tunnels — external traffic cannot reach services".to_string());
-                proposed_fixes.push("Bring up WireGuard: `sudo wg-quick up wg0`".to_string());
-            } else {
-                // Check for handshake staleness (last handshake > 5 minutes ago)
-                for line in out_str.lines() {
-                    if line.contains("latest handshake:")
-                        && (line.contains("minutes") || line.contains("hours"))
-                        && line.contains("hour") {
-                            root_causes.push(format!(
-                                "🔒 WIREGUARD STALE: Tunnel peer handshake is stale ({})",
-                                line.trim()
-                            ));
-                            proposed_fixes.push("Check WireGuard peer connectivity: `sudo wg-quick down wg0 && sudo wg-quick up wg0`".to_string());
-                        }
+        && output.status.success()
+    {
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        if out_str.trim().is_empty() {
+            root_causes.push("🔒 WIREGUARD DOWN: No active WireGuard tunnels — external traffic cannot reach services".to_string());
+            proposed_fixes.push("Bring up WireGuard: `sudo wg-quick up wg0`".to_string());
+        } else {
+            // Check for handshake staleness (last handshake > 5 minutes ago)
+            for line in out_str.lines() {
+                if line.contains("latest handshake:")
+                    && (line.contains("minutes") || line.contains("hours"))
+                    && line.contains("hour")
+                {
+                    root_causes.push(format!(
+                        "🔒 WIREGUARD STALE: Tunnel peer handshake is stale ({})",
+                        line.trim()
+                    ));
+                    proposed_fixes.push("Check WireGuard peer connectivity: `sudo wg-quick down wg0 && sudo wg-quick up wg0`".to_string());
                 }
             }
         }
+    }
 
     // Check Caddy/Sentinel reverse proxy (port 3000)
     if let Some(&sentinel_port) = sorted_ports.iter().find(|p| **p == 3000)
-        && port_owners.get(&sentinel_port).is_none() {
-            root_causes.push("🚪 SENTINEL DOWN: Port 3000 (Caddy/Sentinel reverse proxy) has no listener — ALL external traffic is blocked".to_string());
-            proposed_fixes
-                .push("CRITICAL: Restart Sentinel immediately: `pm2 restart sentinel`".to_string());
-        }
+        && port_owners.get(&sentinel_port).is_none()
+    {
+        root_causes.push("🚪 SENTINEL DOWN: Port 3000 (Caddy/Sentinel reverse proxy) has no listener — ALL external traffic is blocked".to_string());
+        proposed_fixes
+            .push("CRITICAL: Restart Sentinel immediately: `pm2 restart sentinel`".to_string());
+    }
 
     // ── 6. Format the final report ──
     if !healthy.is_empty() {
@@ -541,8 +667,11 @@ pub(crate) async fn execute_system_status(call: &ToolCall) -> ToolResult {
                 for line in out_str.lines() {
                     let parts: Vec<&str> = line.split(", ").collect();
                     if parts.len() == 3 {
-                        let proc_name =
-                            parts[1].trim().split('/').next_back().unwrap_or(parts[1].trim());
+                        let proc_name = parts[1]
+                            .trim()
+                            .split('/')
+                            .next_back()
+                            .unwrap_or(parts[1].trim());
                         report.push_str(&format!(
                             "  PID {} | {} | {}MB VRAM\n",
                             parts[0].trim(),
@@ -561,24 +690,26 @@ pub(crate) async fn execute_system_status(call: &ToolCall) -> ToolResult {
     let mut port_by_pid: std::collections::HashMap<u64, Vec<u16>> =
         std::collections::HashMap::new();
     if let Ok(output) = std::process::Command::new("ss").args(["-tlnp"]).output()
-        && output.status.success() {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            for line in out_str.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5
-                    && let Some(port_str) = parts[3].rsplit(':').next()
-                        && let Ok(port) = port_str.parse::<u16>() {
-                            let proc_info = parts.get(5).unwrap_or(&"");
-                            if let Some(start) = proc_info.find("pid=") {
-                                let after = &proc_info[start + 4..];
-                                let pid_str = after.split(',').next().unwrap_or("0");
-                                if let Ok(pid) = pid_str.parse::<u64>() {
-                                    port_by_pid.entry(pid).or_default().push(port);
-                                }
-                            }
-                        }
+        && output.status.success()
+    {
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        for line in out_str.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5
+                && let Some(port_str) = parts[3].rsplit(':').next()
+                && let Ok(port) = port_str.parse::<u16>()
+            {
+                let proc_info = parts.get(5).unwrap_or(&"");
+                if let Some(start) = proc_info.find("pid=") {
+                    let after = &proc_info[start + 4..];
+                    let pid_str = after.split(',').next().unwrap_or("0");
+                    if let Ok(pid) = pid_str.parse::<u64>() {
+                        port_by_pid.entry(pid).or_default().push(port);
+                    }
+                }
             }
         }
+    }
 
     match std::process::Command::new("pm2").arg("jlist").output() {
         Ok(output) if output.status.success() => {
@@ -661,11 +792,16 @@ pub(crate) async fn execute_service_restart(call: &ToolCall) -> ToolResult {
         };
     }
 
-    // Safety: sanitize service name to prevent injection
-    let sanitized: String = service_name
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '.')
-        .collect();
+    let Some(sanitized) = allowed_pm2_service_name(service_name) else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!(
+                "Service '{}' is not on Hera's restart allowlist.",
+                service_name
+            ),
+        };
+    };
 
     let mut report = String::new();
 
@@ -888,4 +1024,3 @@ pub(crate) async fn execute_read_pm2_logs(call: &ToolCall) -> ToolResult {
         output: result,
     }
 }
-

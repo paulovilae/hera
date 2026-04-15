@@ -168,10 +168,8 @@ pub trait LLMEngine {
 
 #[async_trait::async_trait]
 pub trait SpeechToTextEngine {
-    async fn transcribe_audio(
-        &self,
-        wav_bytes: &[u8],
-    ) -> Result<String, crate::ai::InferenceError>;
+    async fn transcribe_audio(&self, wav_bytes: &[u8])
+    -> Result<String, crate::ai::InferenceError>;
 }
 
 // --- Streaming API Schema ---

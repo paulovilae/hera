@@ -1,11 +1,9 @@
 use crate::ai::tool_executor::{
-    canonical_app_search_terms, canonicalize_app_slug, load_canonical_app_registry,
-    pm2_process_name_for_slug, CanonicalAppEntry, ToolCall, ToolResult,
+    ToolCall, ToolResult, canonical_app_search_terms, canonicalize_app_slug,
+    load_canonical_app_registry, pm2_process_name_for_slug,
 };
 use crate::ai::tools::infra_health::execute_diagnose_services;
 use serde_json::Value;
-use std::process::Command;
-use tracing::info;
 
 pub(crate) async fn execute_read_os_logs(call: &ToolCall) -> ToolResult {
     let service = call
@@ -561,7 +559,8 @@ pub(crate) async fn execute_verify_canonical_stack(call: &ToolCall) -> ToolResul
                 .get("summary")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            let lines = ["Canonical stack verification".to_string(),
+            let lines = [
+                "Canonical stack verification".to_string(),
                 format!(
                     "compile: {}",
                     if summary
@@ -597,7 +596,8 @@ pub(crate) async fn execute_verify_canonical_stack(call: &ToolCall) -> ToolResul
                     } else {
                         "failed"
                     }
-                )];
+                ),
+            ];
 
             ToolResult {
                 name: call.name.clone(),
@@ -877,4 +877,3 @@ pub(crate) async fn execute_verify_app_health(call: &ToolCall) -> ToolResult {
         },
     }
 }
-

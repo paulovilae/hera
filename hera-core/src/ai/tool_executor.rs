@@ -3,16 +3,17 @@
 //! Defines tool schemas in Qwen's native format, parses `<tool_call>` blocks
 //! from Qwen output, and dispatches tool execution to existing Hera methods.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
 use crate::ai::tools::{
     apps_latinos, apps_movilo, apps_vetra, data, infra_health, infra_smoke, platform,
 };
-
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tracing::info;
 
 /// Tool call parsed from Qwen's output
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,11 +30,31 @@ pub struct ToolResult {
     pub output: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolRiskLevel {
+    Low,
+    High,
+    Critical,
+}
+
 #[derive(Debug, Clone)]
 struct ToolArtifact {
     schema: Value,
     consumers: Vec<String>,
 }
+
+#[derive(Debug, Clone, Default)]
+struct ToolRuntimeMetadata {
+    execution_kind: Option<String>,
+    risk_level: Option<ToolRiskLevel>,
+    timeout_ms: Option<u64>,
+    allowed_callers: Vec<String>,
+}
+
+static TOOL_RUNTIME_REGISTRY: OnceLock<HashMap<String, ToolRuntimeMetadata>> = OnceLock::new();
+static REGISTERED_TOOL_NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+const DEFAULT_TOOL_TIMEOUT_MS: u64 = 90_000;
+const HERA_TOOL_AUDIT_LOG: &str = "/tmp/hera_tool_audit.jsonl";
 
 #[derive(Debug, Clone)]
 pub(crate) struct SkillArtifact {
@@ -209,6 +230,164 @@ pub(crate) fn text_contains_app_alias(text: &str, aliases: &[String]) -> bool {
     aliases.iter().any(|alias| lower.contains(alias))
 }
 
+pub(crate) fn tool_risk_level(tool_name: &str) -> ToolRiskLevel {
+    if let Some(risk) = find_tool_runtime_metadata(tool_name).and_then(|metadata| metadata.risk_level)
+    {
+        return risk;
+    }
+
+    match tool_name {
+        "run_code" | "write_file" | "update_soul" | "service_restart" | "api_request"
+        | "git_manager" | "desktop_click" | "desktop_type" => ToolRiskLevel::Critical,
+        "read_file"
+        | "web_scraper"
+        | "spawn_parallel_agents"
+        | "create_agent"
+        | "create_skill"
+        | "execute_workflow"
+        | "dispatch_email"
+        | "bind_telegram_workspace"
+        | "edit_app_theme" => ToolRiskLevel::High,
+        _ => ToolRiskLevel::Low,
+    }
+}
+
+fn parse_tool_risk_level(value: &str) -> Option<ToolRiskLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(ToolRiskLevel::Low),
+        "high" => Some(ToolRiskLevel::High),
+        "critical" => Some(ToolRiskLevel::Critical),
+        _ => None,
+    }
+}
+
+fn tool_timeout_ms(tool_name: &str) -> u64 {
+    find_tool_runtime_metadata(tool_name)
+        .and_then(|metadata| metadata.timeout_ms)
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS)
+}
+
+fn tool_allowed_callers(tool_name: &str) -> Vec<String> {
+    find_tool_runtime_metadata(tool_name)
+        .map(|metadata| metadata.allowed_callers.clone())
+        .filter(|callers| !callers.is_empty())
+        .unwrap_or_else(|| vec!["all".to_string()])
+}
+
+fn extract_tool_caller(call: &ToolCall) -> String {
+    call.arguments
+        .get("app_name")
+        .or_else(|| call.arguments.get("app"))
+        .or_else(|| call.arguments.get("caller"))
+        .or_else(|| call.arguments.get("agent"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn tool_result_envelope(call: &ToolCall, result: &ToolResult, duration_ms: u128) -> Value {
+    serde_json::json!({
+        "ok": result.success,
+        "data": {
+            "output": result.output,
+        },
+        "error": if result.success { Value::Null } else { Value::String(result.output.clone()) },
+        "meta": {
+            "tool": result.name,
+            "caller": extract_tool_caller(call),
+            "execution_kind": find_tool_runtime_metadata(&result.name).and_then(|metadata| metadata.execution_kind.clone()),
+            "risk_level": match tool_risk_level(&result.name) {
+                ToolRiskLevel::Low => "low",
+                ToolRiskLevel::High => "high",
+                ToolRiskLevel::Critical => "critical",
+            },
+            "duration_ms": duration_ms,
+            "allowed_callers": tool_allowed_callers(&result.name),
+        },
+        "artifacts": []
+    })
+}
+
+fn tool_error_envelope(call: &ToolCall, error: &str, duration_ms: u128) -> Value {
+    serde_json::json!({
+        "ok": false,
+        "data": {
+            "output": Value::Null,
+        },
+        "error": error,
+        "meta": {
+            "tool": call.name,
+            "caller": extract_tool_caller(call),
+            "execution_kind": find_tool_runtime_metadata(&call.name).and_then(|metadata| metadata.execution_kind.clone()),
+            "risk_level": match tool_risk_level(&call.name) {
+                ToolRiskLevel::Low => "low",
+                ToolRiskLevel::High => "high",
+                ToolRiskLevel::Critical => "critical",
+            },
+            "duration_ms": duration_ms,
+            "allowed_callers": tool_allowed_callers(&call.name),
+        },
+        "artifacts": []
+    })
+}
+
+fn audit_tool_execution(
+    call: &ToolCall,
+    success: bool,
+    duration_ms: u128,
+    timed_out: bool,
+    error: Option<&str>,
+) {
+    let argument_keys = call
+        .arguments
+        .as_object()
+        .map(|map| map.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let record = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default(),
+        "tool": call.name,
+        "caller": extract_tool_caller(call),
+        "success": success,
+        "timed_out": timed_out,
+        "duration_ms": duration_ms,
+        "execution_kind": find_tool_runtime_metadata(&call.name).and_then(|metadata| metadata.execution_kind.clone()),
+        "risk_level": match tool_risk_level(&call.name) {
+            ToolRiskLevel::Low => "low",
+            ToolRiskLevel::High => "high",
+            ToolRiskLevel::Critical => "critical",
+        },
+        "allowed_callers": tool_allowed_callers(&call.name),
+        "argument_keys": argument_keys,
+        "error": error,
+    });
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(HERA_TOOL_AUDIT_LOG)
+    {
+        let _ = writeln!(file, "{}", record);
+    }
+}
+
+pub(crate) fn permissions_allow_tool(permissions: &[String], tool_name: &str) -> bool {
+    let has_explicit_tool_grant = permissions.iter().any(|permission| permission == tool_name);
+    let has_all = permissions.iter().any(|permission| permission == "all");
+    let has_unsafe_all = permissions
+        .iter()
+        .any(|permission| permission == "unsafe_all" || permission == "system_admin");
+
+    match tool_risk_level(tool_name) {
+        ToolRiskLevel::Critical => has_explicit_tool_grant || has_unsafe_all,
+        ToolRiskLevel::High => has_explicit_tool_grant || has_all || has_unsafe_all,
+        ToolRiskLevel::Low => has_explicit_tool_grant || has_all || has_unsafe_all,
+    }
+}
+
 pub(crate) fn pm2_process_name_for_slug(slug: &str) -> &str {
     match slug {
         "vetra" => "vetra-rust",
@@ -249,6 +428,286 @@ fn parse_tool_artifact(path: &Path) -> Option<ToolArtifact> {
     }
 
     Some(ToolArtifact { schema, consumers })
+}
+
+fn collect_tool_runtime_metadata_in_dir(
+    dir: &Path,
+    registry: &mut HashMap<String, ToolRuntimeMetadata>,
+) {
+    if !dir.exists() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_tool_runtime_metadata_in_dir(&entry_path, registry);
+            continue;
+        }
+
+        if entry_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&entry_path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let schema = match serde_json::from_str::<Value>(&content) {
+            Ok(schema) => schema,
+            Err(_) => continue,
+        };
+        let Some(tool_name) = schema
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        let metadata = ToolRuntimeMetadata {
+            execution_kind: schema
+                .get("metadata")
+                .and_then(|value| value.get("execution_kind"))
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string),
+            risk_level: schema
+                .get("metadata")
+                .and_then(|value| value.get("risk_level"))
+                .and_then(|value| value.as_str())
+                .and_then(parse_tool_risk_level),
+            timeout_ms: schema
+                .get("metadata")
+                .and_then(|value| value.get("timeout_ms"))
+                .and_then(|value| value.as_u64()),
+            allowed_callers: schema
+                .get("metadata")
+                .and_then(|value| value.get("allowed_callers"))
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToString::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        };
+        if metadata.execution_kind.is_some() {
+            registry.insert(tool_name.to_string(), metadata);
+        }
+    }
+}
+
+fn collect_tool_names_in_dir(dir: &Path, names: &mut HashSet<String>) {
+    if !dir.exists() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_tool_names_in_dir(&entry_path, names);
+            continue;
+        }
+        if entry_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&entry_path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let schema = match serde_json::from_str::<Value>(&content) {
+            Ok(schema) => schema,
+            Err(_) => continue,
+        };
+        if let Some(tool_name) = schema
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|value| value.as_str())
+        {
+            names.insert(tool_name.to_string());
+        }
+    }
+}
+
+fn tool_runtime_registry() -> &'static HashMap<String, ToolRuntimeMetadata> {
+    TOOL_RUNTIME_REGISTRY.get_or_init(|| {
+        let mut registry = HashMap::new();
+        collect_tool_runtime_metadata_in_dir(
+            Path::new("/home/paulo/Programs/apps/OS/Tools"),
+            &mut registry,
+        );
+        registry
+    })
+}
+
+fn find_tool_runtime_metadata(tool_name: &str) -> Option<&'static ToolRuntimeMetadata> {
+    tool_runtime_registry().get(tool_name)
+}
+
+fn registered_tool_names() -> &'static HashSet<String> {
+    REGISTERED_TOOL_NAMES.get_or_init(|| {
+        let mut names = HashSet::new();
+        collect_tool_names_in_dir(Path::new("/home/paulo/Programs/apps/OS/Tools"), &mut names);
+        names
+    })
+}
+
+fn is_registered_tool(tool_name: &str) -> bool {
+    registered_tool_names().contains(tool_name)
+}
+
+#[cfg(test)]
+fn is_platform_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "generate_image"
+            | "hera_draw"
+            | "hera_search"
+            | "hera_speak"
+            | "hera_video"
+            | "hera_read_file"
+            | "read_file"
+            | "hera_update_soul"
+            | "update_soul"
+            | "ask_user"
+            | "get_system_time"
+            | "run_code"
+            | "web_scraper"
+            | "write_file"
+            | "spline_interact"
+            | "desktop_click"
+            | "desktop_type"
+            | "edit_app_theme"
+    )
+}
+
+#[cfg(test)]
+fn is_data_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "memento_query" | "api_request" | "git_manager" | "memento_vector_search"
+    )
+}
+
+#[cfg(test)]
+fn is_infra_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "caddy_domain_manager"
+            | "system_status"
+            | "diagnose_services"
+            | "service_restart"
+            | "read_pm2_logs"
+            | "read_os_logs"
+            | "smoke_apps"
+            | "test_apps"
+            | "verify_canonical_stack"
+            | "review_all_apps_status"
+            | "verify_app_health"
+    )
+}
+
+#[cfg(test)]
+fn is_vetra_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "generate_qr_code"
+            | "generate_contract_pdf"
+            | "dispatch_email"
+            | "get_map_route"
+            | "execute_workflow"
+            | "bind_telegram_workspace"
+    )
+}
+
+#[cfg(test)]
+fn is_movilo_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "movilo_search_providers" | "movilo_check_affiliation" | "movilo_validate_qr"
+    )
+}
+
+#[cfg(test)]
+fn is_latinos_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "list_bots"
+            | "get_bot_status"
+            | "market_research"
+            | "analyze_market_research"
+            | "consultant_report_analyzer"
+            | "run_backtest"
+            | "load_market_data"
+            | "scan_opportunities"
+    )
+}
+
+#[cfg(test)]
+fn tool_has_runtime_dispatch(tool_name: &str, execution_kind: Option<&str>) -> bool {
+    if matches!(
+        tool_name,
+        "spawn_parallel_agents" | "create_agent" | "create_skill"
+    ) {
+        return true;
+    }
+
+    match execution_kind {
+        Some("ipc_native") => {
+            is_data_tool_name(tool_name)
+                || is_platform_tool_name(tool_name)
+                || is_vetra_tool_name(tool_name)
+                || is_latinos_tool_name(tool_name)
+        }
+        Some("cli") => {
+            is_infra_tool_name(tool_name)
+                || is_data_tool_name(tool_name)
+                || is_latinos_tool_name(tool_name)
+                || is_platform_tool_name(tool_name)
+        }
+        Some("direct_rust") => {
+            is_platform_tool_name(tool_name)
+                || is_infra_tool_name(tool_name)
+                || is_vetra_tool_name(tool_name)
+                || is_data_tool_name(tool_name)
+                || is_movilo_tool_name(tool_name)
+                || is_latinos_tool_name(tool_name)
+        }
+        Some("http_adapter") => {
+            is_vetra_tool_name(tool_name)
+                || is_data_tool_name(tool_name)
+                || is_platform_tool_name(tool_name)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn tool_has_raw_json_dispatch(tool_name: &str, execution_kind: Option<&str>) -> bool {
+    match execution_kind {
+        Some("ipc_native") => tool_name == "memento_query",
+        Some("cli") | Some("direct_rust") => matches!(
+            tool_name,
+            "memento_query"
+                | "market_research"
+                | "analyze_market_research"
+                | "consultant_report_analyzer"
+                | "smoke_apps"
+                | "test_apps"
+                | "verify_canonical_stack"
+                | "review_all_apps_status"
+                | "verify_app_health"
+        ),
+        _ => false,
+    }
 }
 
 fn collect_tool_schemas_from_dir(dir: &Path, tools: &mut Vec<Value>, agent_name: &str) {
@@ -344,9 +803,10 @@ fn collect_skill_artifacts() -> Vec<SkillArtifact> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir()
-                && let Some(skill) = parse_skill_artifact(&path) {
-                    skills.push(skill);
-                }
+                && let Some(skill) = parse_skill_artifact(&path)
+            {
+                skills.push(skill);
+            }
         }
     }
     skills
@@ -369,9 +829,7 @@ pub(crate) fn load_agent_artifact(agent_name: &str) -> AgentArtifact {
     ));
     let persona = std::fs::read_to_string(&agent_path)
         .unwrap_or_else(|_| format!("You are an expert {}", sanitized));
-    AgentArtifact {
-        persona,
-    }
+    AgentArtifact { persona }
 }
 
 /// Tool schemas in Qwen3's native Hermes-style format.
@@ -603,17 +1061,18 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
                     && let (Some(name), Some(args)) = (
                         val.get("name").and_then(|n| n.as_str()),
                         val.get("arguments"),
-                    ) {
-                        calls.push(ToolCall {
-                            name: name.to_string(),
-                            arguments: args.clone(),
-                        });
-                        info!(
-                            "🔧 [Hera] Parsed RAW JSON tool call (after think-strip): {} with args: {}",
-                            name,
-                            serde_json::to_string(args).unwrap_or_default()
-                        );
-                    }
+                    )
+                {
+                    calls.push(ToolCall {
+                        name: name.to_string(),
+                        arguments: args.clone(),
+                    });
+                    info!(
+                        "🔧 [Hera] Parsed RAW JSON tool call (after think-strip): {} with args: {}",
+                        name,
+                        serde_json::to_string(args).unwrap_or_default()
+                    );
+                }
             }
         }
     }
@@ -621,7 +1080,11 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
     calls
 }
 
-fn append_tool_calls_from_value(calls: &mut Vec<ToolCall>, value: &serde_json::Value, source_tag: &str) {
+fn append_tool_calls_from_value(
+    calls: &mut Vec<ToolCall>,
+    value: &serde_json::Value,
+    source_tag: &str,
+) {
     if let Some(items) = value.get("calls").and_then(|v| v.as_array()) {
         for item in items {
             append_tool_calls_from_value(calls, item, source_tag);
@@ -815,26 +1278,26 @@ pub fn detect_intent_from_user_message(
             || ast.contains("Aquí tienes")
             || ast.contains("Here is")
             || ast.contains("la imagen"))
-        {
-            let is_modifier = lower.starts_with("ahora ")
-                || lower.starts_with("now ")
-                || lower.starts_with("con ")
-                || lower.starts_with("with ")
-                || lower.starts_with("sin ")
-                || lower.starts_with("without ")
-                || lower.starts_with("mas ")
-                || lower.starts_with("more ");
+    {
+        let is_modifier = lower.starts_with("ahora ")
+            || lower.starts_with("now ")
+            || lower.starts_with("con ")
+            || lower.starts_with("with ")
+            || lower.starts_with("sin ")
+            || lower.starts_with("without ")
+            || lower.starts_with("mas ")
+            || lower.starts_with("more ");
 
-            if is_modifier {
-                tracing::info!(
-                    "🎯 [Hera] Intent detected: hera_draw from conversational context (modifier)"
-                );
-                return Some(ToolCall {
-                    name: "hera_draw".to_string(),
-                    arguments: serde_json::json!({"prompt": user_msg}),
-                });
-            }
+        if is_modifier {
+            tracing::info!(
+                "🎯 [Hera] Intent detected: hera_draw from conversational context (modifier)"
+            );
+            return Some(ToolCall {
+                name: "hera_draw".to_string(),
+                arguments: serde_json::json!({"prompt": user_msg}),
+            });
         }
+    }
 
     // Draw/Image intent — Strict matching to prevent hijacking normal conversation
     let exact_starts = [
@@ -1152,27 +1615,195 @@ pub fn detect_intent_from_user_message(
 pub async fn execute_tool(call: &ToolCall) -> ToolResult {
     info!("🔧 [Hera] Executing tool: {}", call.name);
 
-    // Global timeout: 90 seconds. No tool should take longer.
+    let start = std::time::Instant::now();
     let tool_name = call.name.clone();
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(90),
-        execute_tool_inner(call),
-    )
-    .await
-    {
-        Ok(result) => result,
+    let timeout = std::time::Duration::from_millis(tool_timeout_ms(&call.name));
+    match tokio::time::timeout(timeout, execute_tool_inner(call)).await {
+        Ok(result) => {
+            audit_tool_execution(call, result.success, start.elapsed().as_millis(), false, None);
+            result
+        }
         Err(_) => {
             tracing::error!(
-                "⏰ [Hera] Tool '{}' TIMED OUT after 90s. Returning error.",
+                "⏰ [Hera] Tool '{}' TIMED OUT after {:?}. Returning error.",
                 tool_name
+                , timeout
             );
+            let error = format!(
+                "Error: Tool execution timed out after {} ms.",
+                timeout.as_millis()
+            );
+            audit_tool_execution(call, false, start.elapsed().as_millis(), true, Some(&error));
             ToolResult {
                 name: tool_name,
                 success: false,
-                output: "Error: Tool execution timed out after 90 seconds.".to_string(),
+                output: error,
             }
         }
     }
+}
+
+async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "generate_image" | "hera_draw" => platform::execute_draw(call).await,
+        "hera_search" => platform::execute_search(call).await,
+        "hera_speak" => platform::execute_speak(call).await,
+        "hera_video" => platform::execute_video(call).await,
+        "hera_read_file" | "read_file" => platform::execute_read_file(call).await,
+        "hera_update_soul" | "update_soul" => platform::execute_update_soul(call).await,
+        "ask_user" => platform::execute_ask_user(call).await,
+        "get_system_time" => platform::execute_get_system_time(call).await,
+        "run_code" => platform::execute_run_code(call).await,
+        "web_scraper" => platform::execute_web_scraper(call).await,
+        "write_file" => platform::execute_write_file(call).await,
+        "spline_interact" => platform::execute_spline_interact(call).await,
+        "desktop_click" => platform::execute_desktop_click(call).await,
+        "desktop_type" => platform::execute_desktop_type(call).await,
+        "edit_app_theme" => platform::execute_edit_app_theme(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_metadata_tool(call: &ToolCall) -> Option<ToolResult> {
+    let metadata = find_tool_runtime_metadata(&call.name)?;
+    let execution_kind = metadata.execution_kind.as_deref()?;
+
+    match execution_kind {
+        "ipc_native" => {
+            if let Some(result) = dispatch_data_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_platform_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_vetra_tool(call).await {
+                Some(result)
+            } else {
+                dispatch_latinos_tool(call).await
+            }
+        }
+        "cli" => {
+            if let Some(result) = dispatch_infra_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_data_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_latinos_tool(call).await {
+                Some(result)
+            } else {
+                dispatch_platform_tool(call).await
+            }
+        }
+        "direct_rust" => {
+            if let Some(result) = dispatch_platform_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_infra_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_vetra_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_data_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_movilo_tool(call).await {
+                Some(result)
+            } else {
+                dispatch_latinos_tool(call).await
+            }
+        }
+        "http_adapter" => {
+            if let Some(result) = dispatch_vetra_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_data_tool(call).await {
+                Some(result)
+            } else {
+                dispatch_platform_tool(call).await
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn dispatch_data_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "memento_query" => data::execute_memento_query(call).await,
+        "api_request" => data::execute_api_request(call).await,
+        "git_manager" => data::execute_git_manager(call).await,
+        "memento_vector_search" => data::execute_memento_vector_search(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_metadata_raw_json_tool(call: &ToolCall) -> Option<Result<Value, String>> {
+    let metadata = find_tool_runtime_metadata(&call.name)?;
+    let execution_kind = metadata.execution_kind.as_deref()?;
+
+    match execution_kind {
+        "ipc_native" if call.name == "memento_query" => {
+            Some(data::execute_memento_query_json(call).await)
+        }
+        "ipc_native" => None,
+        "cli" | "direct_rust" => dispatch_raw_json_tool(call).await,
+        _ => None,
+    }
+}
+
+async fn dispatch_infra_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "caddy_domain_manager" => infra_health::execute_caddy_domain_manager(call).await,
+        "system_status" => infra_health::execute_system_status(call).await,
+        "diagnose_services" => infra_health::execute_diagnose_services(call).await,
+        "service_restart" => infra_health::execute_service_restart(call).await,
+        "read_pm2_logs" => infra_health::execute_read_pm2_logs(call).await,
+        "read_os_logs" => infra_smoke::execute_read_os_logs(call).await,
+        "smoke_apps" => infra_smoke::execute_smoke_apps(call).await,
+        "test_apps" => infra_smoke::execute_test_apps(call).await,
+        "verify_canonical_stack" => infra_smoke::execute_verify_canonical_stack(call).await,
+        "review_all_apps_status" => infra_smoke::execute_review_all_apps_status(call).await,
+        "verify_app_health" => infra_smoke::execute_verify_app_health(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_vetra_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "generate_qr_code" => apps_vetra::execute_generate_qr_code(call).await,
+        "generate_contract_pdf" => apps_vetra::execute_generate_contract_pdf(call).await,
+        "dispatch_email" => apps_vetra::execute_dispatch_email(call).await,
+        "get_map_route" => apps_vetra::execute_get_map_route(call).await,
+        "execute_workflow" => apps_vetra::execute_workflow(call).await,
+        "bind_telegram_workspace" => apps_vetra::execute_bind_telegram_workspace(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_movilo_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "movilo_search_providers" => apps_movilo::execute_movilo_search_providers(call).await,
+        "movilo_check_affiliation" => apps_movilo::execute_movilo_check_affiliation(call).await,
+        "movilo_validate_qr" => apps_movilo::execute_movilo_validate_qr(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_latinos_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "list_bots" => apps_latinos::execute_list_bots(call).await,
+        "get_bot_status" => apps_latinos::execute_get_bot_status(call).await,
+        "market_research" | "analyze_market_research" => {
+            apps_latinos::execute_market_research(call).await
+        }
+        "consultant_report_analyzer" => {
+            apps_latinos::execute_consultant_report_analyzer(call).await
+        }
+        "run_backtest" => apps_latinos::execute_latinos_bridge(call, "run_backtest").await,
+        "load_market_data" => apps_latinos::execute_latinos_bridge(call, "load_market_data").await,
+        "scan_opportunities" => {
+            apps_latinos::execute_latinos_bridge(call, "scan_opportunities").await
+        }
+        _ => return None,
+    };
+    Some(result)
 }
 
 /// Inner dispatch — called inside the 90s timeout wrapper.
@@ -1193,105 +1824,293 @@ async fn execute_tool_inner(call: &ToolCall) -> ToolResult {
         return platform::execute_create_skill(call).await;
     }
 
-    match call.name.as_str() {
-        "hera_draw" => platform::execute_draw(call).await,
-        "hera_search" => platform::execute_search(call).await,
-        "hera_speak" => platform::execute_speak(call).await,
-        "hera_video" => platform::execute_video(call).await,
-        "hera_read_file" | "read_file" => platform::execute_read_file(call).await,
-        "hera_update_soul" | "update_soul" => platform::execute_update_soul(call).await,
-        "memento_query" => data::execute_memento_query(call).await,
-        "api_request" => data::execute_api_request(call).await,
-        "git_manager" => data::execute_git_manager(call).await,
-        "memento_vector_search" => data::execute_memento_vector_search(call).await,
-        "ask_user" => platform::execute_ask_user(call).await,
-        "get_system_time" => platform::execute_get_system_time(call).await,
-        "system_status" => infra_health::execute_system_status(call).await,
-        "run_code" => platform::execute_run_code(call).await,
-        "web_scraper" => platform::execute_web_scraper(call).await,
-        "write_file" => platform::execute_write_file(call).await,
-        "generate_qr_code" => apps_vetra::execute_generate_qr_code(call).await,
-        "generate_contract_pdf" => apps_vetra::execute_generate_contract_pdf(call).await,
-        "dispatch_email" => apps_vetra::execute_dispatch_email(call).await,
-        "get_map_route" => apps_vetra::execute_get_map_route(call).await,
-        "execute_workflow" => apps_vetra::execute_workflow(call).await,
-        "movilo_search_providers" => apps_movilo::execute_movilo_search_providers(call).await,
-        "movilo_check_affiliation" => apps_movilo::execute_movilo_check_affiliation(call).await,
-        "movilo_validate_qr" => apps_movilo::execute_movilo_validate_qr(call).await,
-        "bind_telegram_workspace" => apps_vetra::execute_bind_telegram_workspace(call).await,
-        "spline_interact" => platform::execute_spline_interact(call).await,
-        "desktop_click" => platform::execute_desktop_click(call).await,
-        "desktop_type" => platform::execute_desktop_type(call).await,
-        "read_os_logs" => infra_smoke::execute_read_os_logs(call).await,
-        "diagnose_services" => infra_health::execute_diagnose_services(call).await,
-        "service_restart" => infra_health::execute_service_restart(call).await,
-        "read_pm2_logs" => infra_health::execute_read_pm2_logs(call).await,
-        "smoke_apps" => infra_smoke::execute_smoke_apps(call).await,
-        "test_apps" => infra_smoke::execute_test_apps(call).await,
-        "verify_canonical_stack" => infra_smoke::execute_verify_canonical_stack(call).await,
-        "review_all_apps_status" => infra_smoke::execute_review_all_apps_status(call).await,
-        "verify_app_health" => infra_smoke::execute_verify_app_health(call).await,
-        "market_research" => apps_latinos::execute_market_research(call).await,
-        // ── Global: Market & Company Analysis (consulting-grade) ─────────
-        "analyze_market_research" => apps_latinos::execute_market_research(call).await,
-        "consultant_report_analyzer" => apps_latinos::execute_consultant_report_analyzer(call).await,
-        // ── Latinos Quant Lab tools ──────────────────────────────────────
-        "run_backtest" => apps_latinos::execute_latinos_bridge(call, "run_backtest").await,
-        "load_market_data" => apps_latinos::execute_latinos_bridge(call, "load_market_data").await,
-        "scan_opportunities" => apps_latinos::execute_latinos_bridge(call, "scan_opportunities").await,
-        _ => ToolResult {
+    if let Some(result) = dispatch_metadata_tool(call).await {
+        return result;
+    }
+
+    if is_registered_tool(&call.name) {
+        return ToolResult {
             name: call.name.clone(),
             success: false,
-            output: format!("Unknown tool: {}", call.name),
-        },
+            output: format!(
+                "Registered tool '{}' has no metadata-driven runtime dispatcher.",
+                call.name
+            ),
+        };
+    }
+
+    ToolResult {
+        name: call.name.clone(),
+        success: false,
+        output: format!("Unknown tool: {}", call.name),
     }
 }
 
+async fn dispatch_raw_json_tool(call: &ToolCall) -> Option<Result<Value, String>> {
+    let result = match call.name.as_str() {
+        "memento_query" => data::execute_memento_query_json(call).await,
+        "market_research" | "analyze_market_research" => {
+            apps_latinos::execute_market_research_json(call).await
+        }
+        "consultant_report_analyzer" => {
+            apps_latinos::execute_consultant_report_analyzer_json(call).await
+        }
+        "smoke_apps" => infra_smoke::execute_smoke_apps_json(call).await,
+        "test_apps" => infra_smoke::execute_test_apps_json(call).await,
+        "verify_canonical_stack" => infra_smoke::execute_verify_canonical_stack_json(call).await,
+        "review_all_apps_status" => infra_smoke::execute_review_all_apps_status_json(call).await,
+        "verify_app_health" => infra_smoke::execute_verify_app_health_json(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
 pub async fn execute_tool_raw_json(call: &ToolCall) -> Result<Value, String> {
-    // Global timeout: 90 seconds for raw JSON tool execution.
+    let start = std::time::Instant::now();
     let tool_name = call.name.clone();
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(90),
-        execute_tool_raw_json_inner(call),
-    )
-    .await
-    {
-        Ok(result) => result,
+    let timeout = std::time::Duration::from_millis(tool_timeout_ms(&call.name));
+    match tokio::time::timeout(timeout, execute_tool_raw_json_inner(call)).await {
+        Ok(result) => {
+            let envelope = match result {
+                Ok(value) => {
+                    if value.get("ok").is_some()
+                        && value.get("data").is_some()
+                        && value.get("meta").is_some()
+                    {
+                        value
+                    } else {
+                        serde_json::json!({
+                            "ok": true,
+                            "data": value,
+                            "error": Value::Null,
+                            "meta": {
+                                "tool": call.name,
+                                "caller": extract_tool_caller(call),
+                                "execution_kind": find_tool_runtime_metadata(&call.name).and_then(|metadata| metadata.execution_kind.clone()),
+                                "risk_level": match tool_risk_level(&call.name) {
+                                    ToolRiskLevel::Low => "low",
+                                    ToolRiskLevel::High => "high",
+                                    ToolRiskLevel::Critical => "critical",
+                                },
+                                "duration_ms": start.elapsed().as_millis(),
+                                "allowed_callers": tool_allowed_callers(&call.name),
+                            },
+                            "artifacts": []
+                        })
+                    }
+                }
+                Err(error) => tool_error_envelope(call, &error, start.elapsed().as_millis()),
+            };
+
+            audit_tool_execution(
+                call,
+                envelope.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+                start.elapsed().as_millis(),
+                false,
+                envelope.get("error").and_then(|v| v.as_str()),
+            );
+            Ok(envelope)
+        }
         Err(_) => {
             tracing::error!(
-                "⏰ [Hera] Tool '{}' (raw_json) TIMED OUT after 90s.",
-                tool_name
+                "⏰ [Hera] Tool '{}' (raw_json) TIMED OUT after {:?}.",
+                tool_name,
+                timeout
             );
-            Err(format!(
-                "Tool '{}' timed out after 90 seconds.",
-                tool_name
-            ))
+            let error = format!("Tool '{}' timed out after {} ms.", tool_name, timeout.as_millis());
+            audit_tool_execution(call, false, start.elapsed().as_millis(), true, Some(&error));
+            Ok(tool_error_envelope(call, &error, start.elapsed().as_millis()))
         }
     }
 }
 
 /// Inner dispatch for raw JSON tools — called inside the 90s timeout wrapper.
 async fn execute_tool_raw_json_inner(call: &ToolCall) -> Result<Value, String> {
-    match call.name.as_str() {
-        "memento_query" => data::execute_memento_query_json(call).await,
-        "market_research" => apps_latinos::execute_market_research_json(call).await,
-        "analyze_market_research" => apps_latinos::execute_market_research_json(call).await,
-        "consultant_report_analyzer" => apps_latinos::execute_consultant_report_analyzer_json(call).await,
-        "smoke_apps" => infra_smoke::execute_smoke_apps_json(call).await,
-        "test_apps" => infra_smoke::execute_test_apps_json(call).await,
-        "verify_canonical_stack" => infra_smoke::execute_verify_canonical_stack_json(call).await,
-        "review_all_apps_status" => infra_smoke::execute_review_all_apps_status_json(call).await,
-        "verify_app_health" => infra_smoke::execute_verify_app_health_json(call).await,
-        _ => {
-            let result = execute_tool_inner(call).await;
-            if result.success {
-                Ok(serde_json::json!({
-                    "name": result.name,
-                    "output": result.output,
-                }))
-            } else {
-                Err(result.output)
+    if let Some(result) = dispatch_metadata_raw_json_tool(call).await {
+        return result;
+    }
+    if is_registered_tool(&call.name) {
+        return Err(format!(
+            "Registered tool '{}' has no metadata-driven raw JSON dispatcher.",
+            call.name
+        ));
+    }
+
+    let result = execute_tool_inner(call).await;
+    Ok(tool_result_envelope(call, &result, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct FunctionTool {
+        name: String,
+        execution_kind: Option<String>,
+        risk_level: Option<String>,
+        path: String,
+    }
+
+    fn load_function_tools() -> Vec<FunctionTool> {
+        let root = Path::new("/home/paulo/Programs/apps/OS/Tools");
+        let mut tools = Vec::new();
+        collect_function_tools(root, root, &mut tools);
+        tools
+    }
+
+    fn collect_function_tools(root: &Path, dir: &Path, tools: &mut Vec<FunctionTool>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_function_tools(root, &path, tools);
+                continue;
             }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(schema) = serde_json::from_str::<Value>(&content) else {
+                continue;
+            };
+            let Some(name) = schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+
+            tools.push(FunctionTool {
+                name: name.to_string(),
+                execution_kind: schema
+                    .get("metadata")
+                    .and_then(|value| value.get("execution_kind"))
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string),
+                risk_level: schema
+                    .get("metadata")
+                    .and_then(|value| value.get("risk_level"))
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string),
+                path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            });
         }
+    }
+
+    #[test]
+    fn all_registered_function_tools_have_execution_kind() {
+        let missing = load_function_tools()
+            .into_iter()
+            .filter(|tool| tool.execution_kind.is_none())
+            .map(|tool| format!("{} ({})", tool.name, tool.path))
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "Function tools missing execution_kind: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn all_registered_function_tools_have_runtime_dispatch() {
+        let missing = load_function_tools()
+            .into_iter()
+            .filter(|tool| !tool_has_runtime_dispatch(&tool.name, tool.execution_kind.as_deref()))
+            .map(|tool| {
+                format!(
+                    "{} [{}] ({})",
+                    tool.name,
+                    tool.execution_kind.unwrap_or_else(|| "missing".to_string()),
+                    tool.path
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "Registered function tools without runtime dispatcher: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn registered_tool_registry_matches_function_tools() {
+        let tools = load_function_tools();
+        let names_from_files = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<HashSet<_>>();
+        let registry_names = registered_tool_names().clone();
+
+        assert_eq!(
+            registry_names, names_from_files,
+            "Registered tool set drifted from Tools/*.json function tools"
+        );
+    }
+
+    #[test]
+    fn raw_json_dispatchers_are_declared_explicitly() {
+        let missing = load_function_tools()
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "memento_query"
+                        | "market_research"
+                        | "analyze_market_research"
+                        | "consultant_report_analyzer"
+                        | "smoke_apps"
+                        | "test_apps"
+                        | "verify_canonical_stack"
+                        | "review_all_apps_status"
+                        | "verify_app_health"
+                ) && !tool_has_raw_json_dispatch(&tool.name, tool.execution_kind.as_deref())
+            })
+            .map(|tool| format!("{} ({})", tool.name, tool.path))
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "Tools expected to support raw JSON are missing dispatcher coverage: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn critical_tools_declare_risk_metadata() {
+        let critical = load_function_tools()
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "api_request"
+                        | "run_code"
+                        | "write_file"
+                        | "service_restart"
+                        | "desktop_click"
+                        | "desktop_type"
+                ) && tool.risk_level.as_deref() != Some("critical")
+            })
+            .map(|tool| format!("{} ({})", tool.name, tool.path))
+            .collect::<Vec<_>>();
+
+        assert!(
+            critical.is_empty(),
+            "Critical tools missing explicit risk metadata: {:?}",
+            critical
+        );
     }
 }

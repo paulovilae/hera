@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use tracing::{Level, info};
 
+use hera_core::ai::SpeechToTextEngine;
 use hera_core::capabilities::{CapabilityId, CapabilityRegistry};
 use hera_core::hardware::discover_docker_services;
-use hera_core::ai::SpeechToTextEngine;
 use hera_core::ipc_server::{IpcState, serve};
 
 #[tokio::main]
@@ -67,37 +67,40 @@ async fn main() {
     };
 
     // Initialize Whisper Native engine
-    let whisper_engine: Option<Arc<dyn SpeechToTextEngine + Send + Sync>> = if capabilities.runtime_enabled(CapabilityId::AudioStt) {
-        info!("👂 Initializing Native Whisper STT Engine...");
-        match std::env::var("HERA_STT_BACKEND")
-            .unwrap_or_else(|_| "whisper".to_string())
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "faster-whisper" | "faster_whisper" => match hera_core::ai::engine_faster_whisper::FasterWhisperEngine::new() {
-                Ok(engine) => {
-                    info!("👂 faster-whisper STT backend mounted.");
-                    Some(Arc::new(engine))
+    let whisper_engine: Option<Arc<dyn SpeechToTextEngine + Send + Sync>> =
+        if capabilities.runtime_enabled(CapabilityId::AudioStt) {
+            info!("👂 Initializing Native Whisper STT Engine...");
+            match std::env::var("HERA_STT_BACKEND")
+                .unwrap_or_else(|_| "whisper".to_string())
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "faster-whisper" | "faster_whisper" => {
+                    match hera_core::ai::engine_faster_whisper::FasterWhisperEngine::new() {
+                        Ok(engine) => {
+                            info!("👂 faster-whisper STT backend mounted.");
+                            Some(Arc::new(engine))
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to mount faster-whisper STT backend: {:?}", e);
+                            None
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Failed to mount faster-whisper STT backend: {:?}", e);
-                    None
-                }
-            },
-            _ => match hera_core::ai::engine_whisper::WhisperEngine::new() {
-                Ok(engine) => {
-                    info!("👂 Native Whisper Engine mounted to VRAM.");
-                    Some(Arc::new(engine))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to mount Native Whisper: {:?}", e);
-                    None
-                }
-            },
-        }
-    } else {
-        None
-    };
+                _ => match hera_core::ai::engine_whisper::WhisperEngine::new() {
+                    Ok(engine) => {
+                        info!("👂 Native Whisper Engine mounted to VRAM.");
+                        Some(Arc::new(engine))
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to mount Native Whisper: {:?}", e);
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
 
     // Initialize LlamaBackend globally
     let _llama_backend = Arc::new(
@@ -220,8 +223,9 @@ async fn main() {
     info!("🚀 Core AI Layer booting in PURE SPEED mode.");
 
     // Spawn REST API server in the background
+    let rest_state = state.clone();
     tokio::spawn(async move {
-        hera_core::rest_api::serve_rest_api(3002).await;
+        hera_core::rest_api::serve_rest_api(3002, rest_state).await;
     });
 
     // Spawn autonomous emergency watchdog

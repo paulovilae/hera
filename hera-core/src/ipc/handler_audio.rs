@@ -11,7 +11,12 @@ const WHISPER_RESTART_COOLDOWN_SECS: u64 = 90;
 fn whisper_enabled() -> bool {
     std::env::var("HERA_ENABLE_WHISPER")
         .ok()
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -36,17 +41,17 @@ fn maybe_request_hera_restart() -> bool {
     match Command::new("pm2").args(["restart", "hera-core"]).spawn() {
         Ok(_) => true,
         Err(err) => {
-            tracing::error!("Failed to request hera-core restart for Whisper recovery: {}", err);
+            tracing::error!(
+                "Failed to request hera-core restart for Whisper recovery: {}",
+                err
+            );
             false
         }
     }
 }
 
 /// Handle the "transcribe_audio" action — audio-to-text via Whisper.
-pub async fn handle_transcribe_audio(
-    request: &IpcPayload,
-    state: &IpcState,
-) -> HandlerOutcome {
+pub async fn handle_transcribe_audio(request: &IpcPayload, state: &IpcState) -> HandlerOutcome {
     let b64 = match request.payload.get("base64_audio").and_then(|p| p.as_str()) {
         Some(b) => b,
         None => {

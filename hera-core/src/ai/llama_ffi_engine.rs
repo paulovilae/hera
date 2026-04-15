@@ -48,9 +48,10 @@ impl LLMEngine for LlamaFfiEngine {
             match res {
                 Ok(chunk) => {
                     if let Some(choice) = chunk.choices.first()
-                        && let Some(content) = &choice.delta.content {
-                            full_content.push_str(content);
-                        }
+                        && let Some(content) = &choice.delta.content
+                    {
+                        full_content.push_str(content);
+                    }
                     if let Some(stats) = chunk.stats {
                         prompt_tokens = stats.prompt_tokens as u32;
                         new_tokens = stats.completion_tokens as u32;

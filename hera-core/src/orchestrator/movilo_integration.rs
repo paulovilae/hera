@@ -160,6 +160,7 @@ impl MoviloImplicitAction {
 mod tests {
     use super::*;
     use crate::orchestrator::preference_model::{FeaturePreference, uniform_prior};
+    use crate::orchestrator::simulator::movilo_provider_domain;
 
     fn sample_providers() -> Vec<MoviloProvider> {
         vec![

@@ -129,14 +129,15 @@ fn build_completion(
             let mut sorted_prefs: Vec<(&String, &f64)> = prefs.iter().collect();
             sorted_prefs.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
             if let Some(&(ref top_pref, top_prob)) = sorted_prefs.first()
-                && *top_prob > 0.3 {
-                    completion.push_str(&format!(
-                        "- {}: likely {} ({:.0}%)\n",
-                        feat,
-                        top_pref,
-                        top_prob * 100.0
-                    ));
-                }
+                && *top_prob > 0.3
+            {
+                completion.push_str(&format!(
+                    "- {}: likely {} ({:.0}%)\n",
+                    feat,
+                    top_pref,
+                    top_prob * 100.0
+                ));
+            }
         }
         completion.push('\n');
     }
@@ -204,8 +205,7 @@ pub fn write_jsonl(examples: &[TrainingExample], path: &str) -> std::io::Result<
     let mut count = 0;
 
     for example in examples {
-        let line = serde_json::to_string(example)
-            .map_err(|e| std::io::Error::other(e))?;
+        let line = serde_json::to_string(example).map_err(|e| std::io::Error::other(e))?;
         writeln!(file, "{}", line)?;
         count += 1;
     }
@@ -226,8 +226,7 @@ pub fn write_chatml(examples: &[TrainingExample], path: &str) -> std::io::Result
                 {"role": "assistant", "content": example.completion},
             ]
         });
-        let line = serde_json::to_string(&conversation)
-            .map_err(|e| std::io::Error::other(e))?;
+        let line = serde_json::to_string(&conversation).map_err(|e| std::io::Error::other(e))?;
         writeln!(file, "{}", line)?;
         count += 1;
     }

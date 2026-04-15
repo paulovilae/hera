@@ -1,7 +1,6 @@
 //! Movilo app tool executors
 use crate::ai::tool_executor::{ToolCall, ToolResult};
 use crate::ai::tools::data::execute_memento_query;
-use serde_json::Value;
 
 pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResult {
     let city = call
@@ -169,4 +168,3 @@ pub(crate) async fn execute_movilo_validate_qr(call: &ToolCall) -> ToolResult {
         }
     }
 }
-

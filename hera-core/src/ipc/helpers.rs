@@ -2,6 +2,17 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn memento_request(action: &str, payload: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "action": action,
+        "payload": payload,
+        "client": {
+            "app": "hera",
+            "token": std::env::var("MEMENTO_CLIENT_TOKEN").ok()
+        }
+    })
+}
+
 /// Infer whether the response came from a local or cloud engine.
 pub fn infer_origin_from_model(model: &str) -> &'static str {
     let normalized = model.trim().to_lowercase();
@@ -50,10 +61,10 @@ pub async fn fetch_semantic_memory(app_name: &str) -> String {
     )
     .await
     {
-        let msg = serde_json::json!({
-            "action": "query_app",
-            "payload": { "app": app_name, "query": "semantic_context" }
-        });
+        let msg = memento_request(
+            "query_app",
+            serde_json::json!({ "app": app_name, "query": "semantic_context" }),
+        );
         if stream.write_all(msg.to_string().as_bytes()).await.is_ok() {
             let mut buffer = vec![0u8; 65536];
             if let Ok(Ok(n)) = tokio::time::timeout(
@@ -111,10 +122,7 @@ pub async fn fetch_single_app_schema(app_slug: &str) -> String {
     )
     .await
     {
-        let msg = serde_json::json!({
-            "action": "describe_app",
-            "payload": { "app": app_slug }
-        });
+        let msg = memento_request("describe_app", serde_json::json!({ "app": app_slug }));
         if stream.write_all(msg.to_string().as_bytes()).await.is_ok() {
             let _ = stream.shutdown().await;
             let mut raw_bytes = Vec::new();
@@ -146,10 +154,7 @@ pub async fn fetch_all_apps_schema() -> String {
     )
     .await
     {
-        let msg = serde_json::json!({
-            "action": "describe_all_apps",
-            "payload": {}
-        });
+        let msg = memento_request("describe_all_apps", serde_json::json!({}));
         if stream.write_all(msg.to_string().as_bytes()).await.is_ok() {
             let _ = stream.shutdown().await;
             let mut raw_bytes = Vec::new();

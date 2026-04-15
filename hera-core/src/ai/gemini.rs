@@ -164,16 +164,17 @@ impl LLMEngine for GeminiEngine {
                                 // Extract Data URI component: "data:image/jpeg;base64,...str"
                                 let url = image_url.url;
                                 if let Some(stripped) = url.strip_prefix("data:")
-                                    && let Some((mime, b64)) = stripped.split_once(";base64,") {
-                                        gemini_parts.push(GeminiPart {
-                                            text: None,
-                                            inline_data: Some(GeminiInlineData {
-                                                mime_type: mime.to_string(),
-                                                data: b64.to_string(),
-                                            }),
-                                        });
-                                        continue;
-                                    }
+                                    && let Some((mime, b64)) = stripped.split_once(";base64,")
+                                {
+                                    gemini_parts.push(GeminiPart {
+                                        text: None,
+                                        inline_data: Some(GeminiInlineData {
+                                            mime_type: mime.to_string(),
+                                            data: b64.to_string(),
+                                        }),
+                                    });
+                                    continue;
+                                }
                                 // Fallback if format is mangled
                                 return Err(InferenceError::InvalidContext(
                                     "Malformed base64 injected to Gemini model".into(),

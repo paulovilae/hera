@@ -105,14 +105,15 @@ pub fn get_gpu_endpoint(user_role: &str, engine_override: Option<&str>) -> GpuTi
         // Degrade to the first active port
         if let Some(fallback_svc) = draw_services.first()
             && let Some(pm) = fallback_svc.ports.first()
-                && let Ok(p) = pm.host.parse::<u16>() {
-                    warn!(
-                        "GPU Fallback triggered: Port {} unavailable, redirecting to {}",
-                        initial_tier.port, p
-                    );
-                    initial_tier.port = p;
-                    initial_tier.fallback = true;
-                }
+            && let Ok(p) = pm.host.parse::<u16>()
+        {
+            warn!(
+                "GPU Fallback triggered: Port {} unavailable, redirecting to {}",
+                initial_tier.port, p
+            );
+            initial_tier.port = p;
+            initial_tier.fallback = true;
+        }
     }
 
     initial_tier

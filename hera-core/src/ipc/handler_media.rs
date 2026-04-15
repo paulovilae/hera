@@ -1,13 +1,10 @@
 //! Handler: generate_image, vision_analysis, generate_video/animate_image.
 
-use crate::ai::{ChatMessage, ChatRequest, ContentPart, MessageContent};
 use super::types::{HandlerOutcome, IpcPayload, IpcState};
+use crate::ai::{ChatMessage, ChatRequest, ContentPart, MessageContent};
 
 /// Handle the "generate_image" action — FLUX/sd.cpp image generation with auto-LoRA.
-pub async fn handle_generate_image(
-    request: &IpcPayload,
-    state: &IpcState,
-) -> HandlerOutcome {
+pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> HandlerOutcome {
     let prompt_val = match request.payload.get("prompt").and_then(|p| p.as_str()) {
         Some(p) => p,
         None => {
@@ -24,9 +21,8 @@ pub async fn handle_generate_image(
     // --- Auto-LoRA Router ---
     let triggers_path = "/home/paulo/models/image-stack/loras/triggers.json";
     if let Ok(content) = std::fs::read_to_string(triggers_path)
-        && let Ok(triggers) = serde_json::from_str::<
-            std::collections::HashMap<String, Vec<String>>,
-        >(&content)
+        && let Ok(triggers) =
+            serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&content)
     {
         let prompt_lower = prompt.to_lowercase();
         let mut claimed_keywords = std::collections::HashSet::new();
@@ -45,9 +41,7 @@ pub async fn handle_generate_image(
             if !prompt_lower.contains(&format!("<lora:{}", lora_name.to_lowercase())) {
                 for keyword in keywords {
                     let kw_lower = keyword.to_lowercase();
-                    if prompt_lower.contains(&kw_lower)
-                        && !claimed_keywords.contains(&kw_lower)
-                    {
+                    if prompt_lower.contains(&kw_lower) && !claimed_keywords.contains(&kw_lower) {
                         prompt.push_str(&format!(" <lora:{}:1.0>", lora_name));
                         claimed_keywords.insert(kw_lower);
                         break;
@@ -126,10 +120,7 @@ pub async fn handle_generate_image(
 }
 
 /// Handle the "vision_analysis" action — analyze an image with vision engine.
-pub async fn handle_vision_analysis(
-    request: &IpcPayload,
-    state: &IpcState,
-) -> HandlerOutcome {
+pub async fn handle_vision_analysis(request: &IpcPayload, state: &IpcState) -> HandlerOutcome {
     let (b64, prompt) = match (
         request.payload.get("base64_image").and_then(|p| p.as_str()),
         request.payload.get("prompt").and_then(|p| p.as_str()),
@@ -211,10 +202,7 @@ pub async fn handle_vision_analysis(
 }
 
 /// Handle the "generate_video" / "animate_image" action — video generation pipeline.
-pub async fn handle_generate_video(
-    request: &IpcPayload,
-    state: &IpcState,
-) -> HandlerOutcome {
+pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> HandlerOutcome {
     let prompt = match request.payload.get("prompt").and_then(|p| p.as_str()) {
         Some(p) => p,
         None => {

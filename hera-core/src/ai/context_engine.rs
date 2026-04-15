@@ -33,7 +33,11 @@ impl ContextEngine {
 
     async fn gather_context(&self, req: &ChatRequest) -> Option<String> {
         // Find the last user message
-        let last_user_msg = req.messages.iter().filter(|m| m.role == "user").next_back()?;
+        let last_user_msg = req
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .next_back()?;
         let user_text = match &last_user_msg.content {
             MessageContent::Text(t) => t.clone(),
             MessageContent::Null => String::new(),
@@ -214,41 +218,42 @@ To invoke a tool, you MUST output exactly this format:
                 // Alternatively, parse text-based <tool_call> injected via NativeEngine templates
                 else if content.contains("<tool_call>") {
                     if let Some(start) = content.find("<tool_call>")
-                        && let Some(end) = content.find("</tool_call>") {
-                            let json_str = &content[start + 11..end];
-                            if let Ok(tc) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                let fn_name = tc["name"].as_str().unwrap_or("");
-                                let args = &tc["arguments"];
+                        && let Some(end) = content.find("</tool_call>")
+                    {
+                        let json_str = &content[start + 11..end];
+                        if let Ok(tc) = serde_json::from_str::<serde_json::Value>(json_str) {
+                            let fn_name = tc["name"].as_str().unwrap_or("");
+                            let args = &tc["arguments"];
 
-                                info!(
-                                    "🛠️ [ContextEngine] Native Orchestrator invoked tool: {}",
-                                    fn_name
-                                );
-                                let tool_result = if fn_name == "search_web" {
-                                    let query = args["query"].as_str().unwrap_or("");
-                                    hera.native_web_search(query)
-                                        .await
-                                        .unwrap_or_else(|e| format!("Search Error: {}", e))
-                                } else if fn_name == "scrape_url" {
-                                    let url = args["url"].as_str().unwrap_or("");
-                                    hera.native_web_scrape(url)
-                                        .await
-                                        .unwrap_or_else(|e| format!("Scrape Error: {}", e))
-                                } else {
-                                    "Unknown tool".to_string()
-                                };
+                            info!(
+                                "🛠️ [ContextEngine] Native Orchestrator invoked tool: {}",
+                                fn_name
+                            );
+                            let tool_result = if fn_name == "search_web" {
+                                let query = args["query"].as_str().unwrap_or("");
+                                hera.native_web_search(query)
+                                    .await
+                                    .unwrap_or_else(|e| format!("Search Error: {}", e))
+                            } else if fn_name == "scrape_url" {
+                                let url = args["url"].as_str().unwrap_or("");
+                                hera.native_web_scrape(url)
+                                    .await
+                                    .unwrap_or_else(|e| format!("Scrape Error: {}", e))
+                            } else {
+                                "Unknown tool".to_string()
+                            };
 
-                                accumulated_context.push_str(&format!(
-                                    "Tool '{}' Result:\n{}\n\n",
-                                    fn_name, tool_result
-                                ));
-                                orch_req.messages.push(ChatMessage {
+                            accumulated_context.push_str(&format!(
+                                "Tool '{}' Result:\n{}\n\n",
+                                fn_name, tool_result
+                            ));
+                            orch_req.messages.push(ChatMessage {
                                     role: "user".to_string(),
                                     content: MessageContent::Text(format!("Observation from {}:\n{}\nDo you need anything else? If no, reply NO_CONTEXT_NEEDED.", fn_name, tool_result)),
                                 });
-                                continue;
-                            }
+                            continue;
                         }
+                    }
                     break;
                 } else if content.trim().contains("NO_CONTEXT_NEEDED") {
                     info!("[ContextEngine] Orchestrator determined no context is needed.");
@@ -272,28 +277,29 @@ To invoke a tool, you MUST output exactly this format:
 
     fn inject_context(&self, req: &mut ChatRequest, ctx: &str) {
         if let Some(first) = req.messages.first_mut()
-            && first.role == "system" {
-                match &mut first.content {
-                    MessageContent::Text(t) => {
-                        *t = format!(
-                            "{}\n\n[SYSTEM ORCHESTRATOR INJECTED CONTEXT]:\n{}\n\nUse this context to answer the user's latest query if relevant.",
-                            t, ctx
-                        );
-                    }
-                    MessageContent::Parts(parts) => {
-                        parts.push(ContentPart::Text {
+            && first.role == "system"
+        {
+            match &mut first.content {
+                MessageContent::Text(t) => {
+                    *t = format!(
+                        "{}\n\n[SYSTEM ORCHESTRATOR INJECTED CONTEXT]:\n{}\n\nUse this context to answer the user's latest query if relevant.",
+                        t, ctx
+                    );
+                }
+                MessageContent::Parts(parts) => {
+                    parts.push(ContentPart::Text {
                             text: format!("\n\n[SYSTEM ORCHESTRATOR INJECTED CONTEXT]:\n{}\n\nUse this context to answer the user's latest query if relevant.", ctx),
                         });
-                    }
-                    MessageContent::Null => {
-                        first.content = MessageContent::Text(format!(
-                            "[SYSTEM ORCHESTRATOR INJECTED CONTEXT]:\n{}\n\nUse this context to answer the user's latest query if relevant.",
-                            ctx
-                        ));
-                    }
                 }
-                return;
+                MessageContent::Null => {
+                    first.content = MessageContent::Text(format!(
+                        "[SYSTEM ORCHESTRATOR INJECTED CONTEXT]:\n{}\n\nUse this context to answer the user's latest query if relevant.",
+                        ctx
+                    ));
+                }
             }
+            return;
+        }
 
         // If no system prompt, insert one
         req.messages.insert(0, ChatMessage {

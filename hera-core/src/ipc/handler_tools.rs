@@ -66,10 +66,7 @@ pub async fn handle_execute_tool(
 }
 
 /// Handle the "get_tools" action — return available tool schemas.
-pub fn handle_get_tools(
-    _request: &IpcPayload,
-    _state: &IpcState,
-) -> HandlerOutcome {
+pub fn handle_get_tools(_request: &IpcPayload, _state: &IpcState) -> HandlerOutcome {
     let raw_tools = serde_json::json!([
         {
             "type": "function",

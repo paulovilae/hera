@@ -1,6 +1,6 @@
+use crate::workflow::{GraphEdge, GraphNode, NodeData, WorkflowRequest};
 use serde::Deserialize;
 use std::collections::HashMap;
-use crate::workflow::{WorkflowRequest, GraphNode, GraphEdge, NodeData};
 
 #[derive(Deserialize, Debug)]
 pub struct DifyWorkflow {
@@ -44,8 +44,8 @@ pub struct DifyEdge {
 /// Converts a standard Dify DSL exported JSON representation into the native
 /// Hera execution DAG schema.
 pub fn parse_dify_json(json_str: &str) -> Result<WorkflowRequest, String> {
-    let dify: DifyWorkflow = serde_json::from_str(json_str)
-        .map_err(|e| format!("Failed to parse Dify JSON: {}", e))?;
+    let dify: DifyWorkflow =
+        serde_json::from_str(json_str).map_err(|e| format!("Failed to parse Dify JSON: {}", e))?;
 
     let mut req_nodes = Vec::new();
     let mut req_edges = Vec::new();
@@ -68,9 +68,9 @@ pub fn parse_dify_json(json_str: &str) -> Result<WorkflowRequest, String> {
             "llm" => "llm",
             "code" => "code",
             "tool" => "mcp",
-            _ => node.data.node_type.as_str()
+            _ => node.data.node_type.as_str(),
         };
-        
+
         // Translate Dify's internal representation to Hera execution blocks
         let req_node = GraphNode {
             id: node.id,
@@ -84,7 +84,7 @@ pub fn parse_dify_json(json_str: &str) -> Result<WorkflowRequest, String> {
                 code: node.data.code,
                 system_prompt: node.data.system_prompt,
                 ..Default::default()
-            }
+            },
         };
 
         req_nodes.push(req_node);

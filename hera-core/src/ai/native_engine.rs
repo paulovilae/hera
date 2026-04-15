@@ -170,33 +170,35 @@ fn resolve_device() -> Result<Device, Box<dyn std::error::Error + Send + Sync>> 
                     ])
                     .output()
                     && output.status.success()
-                        && let Ok(stdout) = String::from_utf8(output.stdout) {
-                            let mut best_idx = 0;
-                            let mut max_free = 0;
+                    && let Ok(stdout) = String::from_utf8(output.stdout)
+                {
+                    let mut best_idx = 0;
+                    let mut max_free = 0;
 
-                            for line in stdout.lines() {
-                                let parts: Vec<&str> = line.split(',').collect();
-                                if parts.len() == 2
-                                    && let (Ok(idx), Ok(free)) = (
-                                        parts[0].trim().parse::<usize>(),
-                                        parts[1].trim().parse::<u64>(),
-                                    )
-                                        && free > max_free {
-                                            max_free = free;
-                                            best_idx = idx;
-                                        }
-                            }
-
-                            if max_free > 0 {
-                                println!(
-                                    "[LLM_ENGINE]: 🧠 Smart VRAM Profiler selected GPU {} ({} MiB free VRAM)",
-                                    best_idx, max_free
-                                );
-                                if let Ok(cuda) = Device::new_cuda(best_idx) {
-                                    selected = Some(cuda);
-                                }
-                            }
+                    for line in stdout.lines() {
+                        let parts: Vec<&str> = line.split(',').collect();
+                        if parts.len() == 2
+                            && let (Ok(idx), Ok(free)) = (
+                                parts[0].trim().parse::<usize>(),
+                                parts[1].trim().parse::<u64>(),
+                            )
+                            && free > max_free
+                        {
+                            max_free = free;
+                            best_idx = idx;
                         }
+                    }
+
+                    if max_free > 0 {
+                        println!(
+                            "[LLM_ENGINE]: 🧠 Smart VRAM Profiler selected GPU {} ({} MiB free VRAM)",
+                            best_idx, max_free
+                        );
+                        if let Ok(cuda) = Device::new_cuda(best_idx) {
+                            selected = Some(cuda);
+                        }
+                    }
+                }
 
                 // Fallback to naive iteration if nvidia-smi fails
                 if selected.is_none() {
@@ -631,13 +633,14 @@ impl NativeLlmEngine {
         }
 
         if generated_text.trim().is_empty()
-            && let Some(reason) = &failure_reason {
-                eprintln!("[LLM_ENGINE]: Generation failed before first token: {reason}");
-                return GenerationResult {
-                    text: format!("Error native generation: {reason}"),
-                    stats,
-                };
-            }
+            && let Some(reason) = &failure_reason
+        {
+            eprintln!("[LLM_ENGINE]: Generation failed before first token: {reason}");
+            return GenerationResult {
+                text: format!("Error native generation: {reason}"),
+                stats,
+            };
+        }
 
         GenerationResult {
             text: generated_text.trim().to_string(),
@@ -940,27 +943,28 @@ impl NativeLlmEngine {
 
                 // Progressive decoding
                 if let Ok(decoded) = self.tokenizer.decode(&generated_token_ids, true)
-                    && decoded.len() > prev_text_len {
-                        let new_text = decoded[prev_text_len..].to_string();
-                        prev_text_len = decoded.len();
+                    && decoded.len() > prev_text_len
+                {
+                    let new_text = decoded[prev_text_len..].to_string();
+                    prev_text_len = decoded.len();
 
-                        let _ = tx.blocking_send(Ok(crate::ai::ChatStreamResponse {
-                            id: chat_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: self.model_id.clone(),
-                            choices: vec![crate::ai::ChatStreamChoice {
-                                index: 0,
-                                delta: crate::ai::ChatStreamDelta {
-                                    role: None,
-                                    content: Some(new_text),
-                                    tool_calls: None,
-                                },
-                                finish_reason: None,
-                            }],
-                            stats: None,
-                        }));
-                    }
+                    let _ = tx.blocking_send(Ok(crate::ai::ChatStreamResponse {
+                        id: chat_id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created,
+                        model: self.model_id.clone(),
+                        choices: vec![crate::ai::ChatStreamChoice {
+                            index: 0,
+                            delta: crate::ai::ChatStreamDelta {
+                                role: None,
+                                content: Some(new_text),
+                                tool_calls: None,
+                            },
+                            finish_reason: None,
+                        }],
+                        stats: None,
+                    }));
+                }
 
                 if index > 0 {
                     generation_ms += step_start.elapsed().as_millis();
@@ -1025,13 +1029,14 @@ impl LLMEngine for NativeLlmEngine {
         let mut full_prompt = String::new();
 
         if let Some(tools) = &req.tools
-            && !tools.is_empty() {
-                full_prompt.push_str("<|im_start|>system\nYou are an AI assistant with access to the following tools. You may trigger a tool by generating a valid JSON payload wrapped in <tool_call> tags. Your available tools:\n");
-                if let Ok(tools_json) = serde_json::to_string_pretty(tools) {
-                    full_prompt.push_str(&tools_json);
-                }
-                full_prompt.push_str("\n<|im_end|>\n");
+            && !tools.is_empty()
+        {
+            full_prompt.push_str("<|im_start|>system\nYou are an AI assistant with access to the following tools. You may trigger a tool by generating a valid JSON payload wrapped in <tool_call> tags. Your available tools:\n");
+            if let Ok(tools_json) = serde_json::to_string_pretty(tools) {
+                full_prompt.push_str(&tools_json);
             }
+            full_prompt.push_str("\n<|im_end|>\n");
+        }
 
         for msg in &req.messages {
             let role = match msg.role.as_str() {
@@ -1138,13 +1143,14 @@ impl LLMEngine for NativeLlmEngine {
         let mut full_prompt = String::new();
 
         if let Some(tools) = &req.tools
-            && !tools.is_empty() {
-                full_prompt.push_str("<|im_start|>system\nYou are an AI assistant with access to the following tools. You may trigger a tool by generating a valid JSON payload wrapped in <tool_call> tags. Your available tools:\n");
-                if let Ok(tools_json) = serde_json::to_string_pretty(tools) {
-                    full_prompt.push_str(&tools_json);
-                }
-                full_prompt.push_str("\n<|im_end|>\n");
+            && !tools.is_empty()
+        {
+            full_prompt.push_str("<|im_start|>system\nYou are an AI assistant with access to the following tools. You may trigger a tool by generating a valid JSON payload wrapped in <tool_call> tags. Your available tools:\n");
+            if let Ok(tools_json) = serde_json::to_string_pretty(tools) {
+                full_prompt.push_str(&tools_json);
             }
+            full_prompt.push_str("\n<|im_end|>\n");
+        }
 
         for msg in &req.messages {
             let role = match msg.role.as_str() {

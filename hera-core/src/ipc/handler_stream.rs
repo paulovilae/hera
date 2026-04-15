@@ -1,10 +1,11 @@
 //! Handler: generate_stream (streaming LLM inference with tool execution).
 
-use crate::ai::{ChatMessage, ChatRequest, MessageContent};
 use super::context::{
-    build_full_system_prompt, build_new_chat_request, inject_system_prompt, parse_payload,
+    build_full_system_prompt, build_new_chat_request, inject_system_prompt,
+    is_lightweight_conversation, parse_payload,
 };
 use super::types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
+use crate::ai::{ChatMessage, ChatRequest, MessageContent};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -24,9 +25,10 @@ pub async fn handle_generate_stream(
             &parsed.prompt,
             parsed.assistant_last.as_deref(),
         ) {
-            if parsed.permissions.contains(&"all".to_string())
-                || parsed.permissions.contains(&tool_call.name)
-            {
+            if crate::ai::tool_executor::permissions_allow_tool(
+                &parsed.permissions,
+                &tool_call.name,
+            ) {
                 tracing::info!(
                     "🚀 [Hera IPC Stream] Fast-path tool intent detected: {}",
                     tool_call.name
@@ -66,10 +68,7 @@ pub async fn handle_generate_stream(
     let mut payload_mut = payload_clone.clone();
     if let Some(obj) = payload_mut.as_object_mut() {
         if !obj.contains_key("model") {
-            obj.insert(
-                "model".to_string(),
-                serde_json::json!("hera-local-model"),
-            );
+            obj.insert("model".to_string(), serde_json::json!("hera-local-model"));
         }
     }
 
@@ -80,13 +79,14 @@ pub async fn handle_generate_stream(
         .to_string();
 
     // Build or augment ChatRequest
-    let mut chat_req: Option<ChatRequest> =
-        serde_json::from_value(payload_mut.clone()).ok();
+    let mut chat_req: Option<ChatRequest> = serde_json::from_value(payload_mut.clone()).ok();
 
+    let lightweight_mode = is_lightweight_conversation(&parsed.prompt);
     let full_system_prompt = build_full_system_prompt(
         &parsed.persona_path,
         &parsed.app_name,
         &parsed.permissions,
+        lightweight_mode,
     )
     .await;
 
@@ -101,10 +101,11 @@ pub async fn handle_generate_stream(
     if let Some(req) = chat_req.clone() {
         let est_tokens = super::helpers::estimate_tokens(&req);
         tracing::info!(
-            "🔊 [Hera Stream] Starting stream for app='{}' — {} msgs, ~{} tokens",
+            "🔊 [Hera Stream] Starting stream for app='{}' — {} msgs, ~{} tokens (lightweight_mode={})",
             parsed.app_name,
             req.messages.len(),
-            est_tokens
+            est_tokens,
+            lightweight_mode
         );
 
         // Send stream_start
@@ -179,8 +180,7 @@ pub async fn handle_generate_stream(
                 }
 
                 // Parse tool calls from accumulated text
-                let parsed_calls =
-                    crate::ai::tool_executor::parse_tool_calls(&final_result_text);
+                let parsed_calls = crate::ai::tool_executor::parse_tool_calls(&final_result_text);
                 if !parsed_calls.is_empty() {
                     let mut execution_outputs = String::new();
                     for call in &parsed_calls {
@@ -192,13 +192,12 @@ pub async fn handle_generate_stream(
                         str_msg.push('\n');
                         let _ = stream.write_all(str_msg.as_bytes()).await;
 
-                        if parsed.permissions.contains(&"all".to_string())
-                            || parsed.permissions.contains(&call.name)
-                        {
-                            let tool_res =
-                                crate::ai::tool_executor::execute_tool(call).await;
-                            execution_outputs
-                                .push_str(&format!("\n\n{}", tool_res.output));
+                        if crate::ai::tool_executor::permissions_allow_tool(
+                            &parsed.permissions,
+                            &call.name,
+                        ) {
+                            let tool_res = crate::ai::tool_executor::execute_tool(call).await;
+                            execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
                         } else {
                             execution_outputs.push_str(&format!(
                                 "\n\nError: Not permitted to use tool '{}'",
@@ -245,9 +244,7 @@ pub async fn handle_generate_stream(
                                 role: "user".to_string(),
                                 content: MessageContent::Text(sys_msg),
                             });
-                            if let Ok(mut rx2) =
-                                state.engine.generate_stream(req2).await
-                            {
+                            if let Ok(mut rx2) = state.engine.generate_stream(req2).await {
                                 while let Some(chunk_res2) = rx2.recv().await {
                                     if let Ok(chunk2) = chunk_res2 {
                                         let chunk_text = chunk2
@@ -259,8 +256,7 @@ pub async fn handle_generate_stream(
                                             status: "chunk".to_string(),
                                             data: serde_json::json!({"text": chunk_text}),
                                         };
-                                        let mut cstr =
-                                            serde_json::to_string(&chunk_msg).unwrap();
+                                        let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
                                         cstr.push('\n');
                                         let _ = stream.write_all(cstr.as_bytes()).await;
                                     }

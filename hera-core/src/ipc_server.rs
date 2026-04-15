@@ -5,4 +5,4 @@
 //!
 //! All business logic now lives under `src/ipc/`.
 
-pub use crate::ipc::{serve, IpcPayload, IpcResponse, IpcState};
+pub use crate::ipc::{IpcPayload, IpcResponse, IpcState, serve};

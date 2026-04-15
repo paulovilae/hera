@@ -18,22 +18,21 @@ pub async fn handle_download_lora(request: &IpcPayload) -> HandlerOutcome {
     let lora_dir = "/home/paulo/models/image-stack/loras";
 
     // Read CivitAI token from Imaginclaw .env
-    let civitai_token =
-        std::fs::read_to_string("/home/paulo/Programs/apps/OS/Imaginclaw/.env")
-            .ok()
-            .and_then(|content| {
-                content
-                    .lines()
-                    .find(|l| l.starts_with("CIVITAI_TOKEN"))
-                    .map(|l| {
-                        l.split('=')
-                            .nth(1)
-                            .unwrap_or("")
-                            .trim_matches('"')
-                            .to_string()
-                    })
-            })
-            .unwrap_or_default();
+    let civitai_token = std::fs::read_to_string("/home/paulo/Programs/apps/OS/Imaginclaw/.env")
+        .ok()
+        .and_then(|content| {
+            content
+                .lines()
+                .find(|l| l.starts_with("CIVITAI_TOKEN"))
+                .map(|l| {
+                    l.split('=')
+                        .nth(1)
+                        .unwrap_or("")
+                        .trim_matches('"')
+                        .to_string()
+                })
+        })
+        .unwrap_or_default();
 
     if url.is_empty() {
         return HandlerOutcome::Result {
@@ -83,10 +82,7 @@ async fn download_from_civitai(
     custom_name: Option<String>,
     lora_dir: &str,
 ) -> String {
-    tracing::info!(
-        "📦 Fetching CivitAI model metadata for ID: {}",
-        model_id
-    );
+    tracing::info!("📦 Fetching CivitAI model metadata for ID: {}", model_id);
     let api_url = format!("https://civitai.com/api/v1/models/{}", model_id);
     let client = reqwest::Client::new();
     match client
@@ -98,9 +94,7 @@ async fn download_from_civitai(
         Ok(api_resp) if api_resp.status().is_success() => {
             match api_resp.json::<serde_json::Value>().await {
                 Ok(model_data) => {
-                    let versions = model_data
-                        .get("modelVersions")
-                        .and_then(|v| v.as_array());
+                    let versions = model_data.get("modelVersions").and_then(|v| v.as_array());
                     let first_version = versions.and_then(|arr| arr.first());
                     let files = first_version
                         .and_then(|ver| ver.get("files"))
@@ -137,10 +131,7 @@ async fn download_from_civitai(
                         let dest_path = format!("{}/{}", lora_dir, final_name);
                         match client
                             .get(dl_url)
-                            .header(
-                                "Authorization",
-                                format!("Bearer {}", civitai_token),
-                            )
+                            .header("Authorization", format!("Bearer {}", civitai_token))
                             .send()
                             .await
                         {
@@ -148,21 +139,14 @@ async fn download_from_civitai(
                                 match dl_resp.bytes().await {
                                     Ok(bytes) => match std::fs::write(&dest_path, &bytes) {
                                         Ok(_) => {
-                                            let size_mb =
-                                                bytes.len() as f64 / 1_048_576.0;
+                                            let size_mb = bytes.len() as f64 / 1_048_576.0;
                                             let tag_name = final_name
                                                 .trim_end_matches(".safetensors")
                                                 .to_string();
 
-                                            let auto_tags = extract_auto_tags(
-                                                &model_data,
-                                                &tag_name,
-                                            );
-                                            update_triggers_json(
-                                                lora_dir,
-                                                &tag_name,
-                                                &auto_tags,
-                                            );
+                                            let auto_tags =
+                                                extract_auto_tags(&model_data, &tag_name);
+                                            update_triggers_json(lora_dir, &tag_name, &auto_tags);
 
                                             tracing::info!(
                                                 "✅ LoRA saved: {} ({:.1} MB)",
@@ -171,7 +155,9 @@ async fn download_from_civitai(
                                             );
                                             format!(
                                                 "✅ LoRA downloaded: {} ({:.1} MB)\n⚡️ Auto-Triggers extracted: {}",
-                                                final_name, size_mb, auto_tags.join(", ")
+                                                final_name,
+                                                size_mb,
+                                                auto_tags.join(", ")
                                             )
                                         }
                                         Err(e) => format!("❌ Failed to save file: {}", e),
@@ -207,13 +193,8 @@ async fn download_from_civitai(
 }
 
 /// Download a LoRA from a direct URL (non-CivitAI).
-async fn download_direct(
-    url: &str,
-    custom_name: Option<String>,
-    lora_dir: &str,
-) -> String {
-    let final_name =
-        custom_name.unwrap_or_else(|| "downloaded_lora.safetensors".to_string());
+async fn download_direct(url: &str, custom_name: Option<String>, lora_dir: &str) -> String {
+    let final_name = custom_name.unwrap_or_else(|| "downloaded_lora.safetensors".to_string());
     let dest_path = format!("{}/{}", lora_dir, final_name);
     let client = reqwest::Client::new();
     match client.get(url).send().await {
@@ -233,10 +214,7 @@ async fn download_direct(
 }
 
 /// Extract trained words and model title from CivitAI model data.
-fn extract_auto_tags(
-    model_data: &serde_json::Value,
-    tag_name: &str,
-) -> Vec<String> {
+fn extract_auto_tags(model_data: &serde_json::Value, tag_name: &str) -> Vec<String> {
     let mut auto_tags = Vec::new();
     if let Some(trained) = model_data
         .get("modelVersions")
