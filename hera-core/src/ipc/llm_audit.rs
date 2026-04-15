@@ -58,20 +58,29 @@ pub fn prompt_preview(prompt: &str) -> String {
 
 pub fn append_llm_audit_event(event: &LlmAuditEvent) {
     let Ok(_guard) = write_lock().lock() else {
+        tracing::error!("LLM audit write lock poisoned");
         return;
     };
 
     let path = audit_path();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(error) = fs::create_dir_all(parent) {
+            tracing::error!("Failed to create LLM audit directory {:?}: {}", parent, error);
+            return;
+        }
     }
 
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+        tracing::error!("Failed to open LLM audit log at {:?}", path);
         return;
     };
 
-    if serde_json::to_writer(&mut file, event).is_ok() {
-        let _ = file.write_all(b"\n");
+    if let Err(error) = serde_json::to_writer(&mut file, event) {
+        tracing::error!("Failed to serialize LLM audit event: {}", error);
+        return;
+    }
+    if let Err(error) = file.write_all(b"\n") {
+        tracing::error!("Failed to finalize LLM audit event write: {}", error);
     }
 }
 
