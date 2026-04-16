@@ -2,7 +2,6 @@
 members = [
     "hera-core",
     "hera-execution",
-    "diakonos-core",
     "hera-web",
     "hera-docs",
     "hera-vector",

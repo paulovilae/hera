@@ -231,7 +231,8 @@ pub(crate) fn text_contains_app_alias(text: &str, aliases: &[String]) -> bool {
 }
 
 pub(crate) fn tool_risk_level(tool_name: &str) -> ToolRiskLevel {
-    if let Some(risk) = find_tool_runtime_metadata(tool_name).and_then(|metadata| metadata.risk_level)
+    if let Some(risk) =
+        find_tool_runtime_metadata(tool_name).and_then(|metadata| metadata.risk_level)
     {
         return risk;
     }
@@ -276,13 +277,43 @@ fn tool_allowed_callers(tool_name: &str) -> Vec<String> {
 
 fn extract_tool_caller(call: &ToolCall) -> String {
     call.arguments
-        .get("app_name")
+        .get("_hera")
+        .and_then(|value| value.get("caller"))
+        .or_else(|| {
+            call.arguments
+                .get("_hera")
+                .and_then(|value| value.get("app_name"))
+        })
+        .or_else(|| {
+            call.arguments
+                .get("_hera")
+                .and_then(|value| value.get("app"))
+        })
+        .or_else(|| call.arguments.get("app_name"))
         .or_else(|| call.arguments.get("app"))
         .or_else(|| call.arguments.get("caller"))
         .or_else(|| call.arguments.get("agent"))
         .and_then(|value| value.as_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn caller_allowed_for_tool(tool_name: &str, caller: &str) -> bool {
+    let allowed_callers = tool_allowed_callers(tool_name);
+    if allowed_callers.is_empty()
+        || allowed_callers.iter().any(|allowed| allowed == "all")
+        || caller.trim().is_empty()
+    {
+        return true;
+    }
+
+    let normalized_caller = caller.trim().to_ascii_lowercase();
+    allowed_callers.iter().any(|allowed| {
+        let normalized_allowed = allowed.trim().to_ascii_lowercase();
+        normalized_allowed == normalized_caller
+            || normalized_allowed == format!("app:{normalized_caller}")
+            || normalized_allowed == format!("agent:{normalized_caller}")
+    })
 }
 
 fn tool_result_envelope(call: &ToolCall, result: &ToolResult, duration_ms: u128) -> Value {
@@ -402,7 +433,6 @@ pub(crate) fn pm2_process_name_for_slug(slug: &str) -> &str {
         "audio-stt" => "hera-core",
         "audio-engine" => "hera-core",
         "argus" => "argus",
-        "diakonos" => "diakonos",
         "memento" => "memento-node",
         _ => slug,
     }
@@ -1121,7 +1151,7 @@ fn append_tool_calls_from_value(
 /// Returns a ToolCall if the user's intent clearly maps to a tool.
 pub fn detect_intent_from_user_message(
     user_msg: &str,
-    assistant_last: Option<&str>,
+    _assistant_last: Option<&str>,
 ) -> Option<ToolCall> {
     // Strip injected app context from Imaginclaw (e.g., "[System Context: ...]")
     // so length checks and pattern matching work on the actual user text.
@@ -1194,289 +1224,10 @@ pub fn detect_intent_from_user_message(
         }
     };
 
-    let mentions_verification = [
-        "verify",
-        "verification",
-        "health",
-        "health check",
-        "app health",
-        "check app",
-        "test ",
-        "tests",
-        "smoke",
-        "regression",
-        "diagnose only if",
-        "if something fails",
-        "if it fails",
-        "only if something fails",
-        "only if it fails",
-    ];
-    if let Some(app) = detect_app() {
-        let asks_for_verification = mentions_verification.iter().any(|kw| lower.contains(kw))
-            || lower_no_greeting.starts_with("test ")
-            || lower_no_greeting.starts_with("verify ")
-            || lower_no_greeting.starts_with("run regression")
-            || lower_no_greeting.starts_with("run smoke");
-        if asks_for_verification {
-            let runtime_suite = if lower.contains("smoke") {
-                "smoke"
-            } else {
-                "regression"
-            };
-            let run_runtime = !lower.contains("compile only") && !lower.contains("build only");
-            let include_logs = !lower.contains("without logs");
-            info!("🎯 [Hera] Intent detected: verify_app_health for '{}'", app);
-            return Some(ToolCall {
-                name: "verify_app_health".to_string(),
-                arguments: serde_json::json!({
-                    "app": app,
-                    "compile_checks": ["check"],
-                    "runtime_suite": runtime_suite,
-                    "run_runtime": run_runtime,
-                    "include_logs": include_logs,
-                    "timeout_seconds": 60
-                }),
-            });
-        }
-    }
-
-    let asks_for_all_app_status =
-        (lower.contains("all apps") || lower.contains("all app") || lower.contains("all services"))
-            && (lower.contains("status") || lower.contains("review") || lower.contains("health"));
-    if asks_for_all_app_status
-        || lower_no_greeting == "review teh status of all apps"
-        || lower_no_greeting == "review the status of all apps"
-    {
-        info!("🎯 [Hera] Intent detected: review_all_apps_status from user message");
-        return Some(ToolCall {
-            name: "review_all_apps_status".to_string(),
-            arguments: serde_json::json!({
-                "timeout_seconds": 10
-            }),
-        });
-    }
-
-    let asks_for_stack_gate = (lower.contains("canonical stack")
-        || lower.contains("release gate")
-        || lower.contains("release ready"))
-        || (lower.contains("verify") && lower.contains("stack"))
-        || lower_no_greeting == "verify canonical stack";
-    if asks_for_stack_gate {
-        info!("🎯 [Hera] Intent detected: verify_canonical_stack from user message");
-        return Some(ToolCall {
-            name: "verify_canonical_stack".to_string(),
-            arguments: serde_json::json!({
-                "checks": ["check"],
-                "timeout_seconds": 60
-            }),
-        });
-    }
-
-    // Contextual image modifier detection
-    if let Some(ast) = assistant_last
-        && (ast.contains("MEDIA:")
-            || ast.contains("Aquí tienes")
-            || ast.contains("Here is")
-            || ast.contains("la imagen"))
-    {
-        let is_modifier = lower.starts_with("ahora ")
-            || lower.starts_with("now ")
-            || lower.starts_with("con ")
-            || lower.starts_with("with ")
-            || lower.starts_with("sin ")
-            || lower.starts_with("without ")
-            || lower.starts_with("mas ")
-            || lower.starts_with("more ");
-
-        if is_modifier {
-            tracing::info!(
-                "🎯 [Hera] Intent detected: hera_draw from conversational context (modifier)"
-            );
-            return Some(ToolCall {
-                name: "hera_draw".to_string(),
-                arguments: serde_json::json!({"prompt": user_msg}),
-            });
-        }
-    }
-
-    // Draw/Image intent — Strict matching to prevent hijacking normal conversation
-    let exact_starts = [
-        "draw ",
-        "dibuja ",
-        "genera una imagen ",
-        "create an image ",
-        "make an image ",
-        "generate an image ",
-        "draw me ",
-        "hazme un dibujo",
-        "pinta ",
-        "haz una imagen",
-        "genera imagen",
-        "crea una imagen",
-        "make a picture",
-        "generate a picture",
-        "create a picture",
-        "haz un dibujo ",
-        "make me an image ",
-        "draw a ",
-        "hazme una foto ",
-        "toma una foto ",
-        "manda una foto ",
-        "hazme una imagen ",
-        "genera una foto ",
-        "crea una foto ",
-        "take a photo ",
-        "send a photo ",
-        "a picture of ",
-        "make me a picture ",
-        "send me an image ",
-        "show me an image ",
-        "haz una foto ",
-        "a photo of ",
-        "make a photo ",
-        "create a photo ",
-        "foto de ",
-        "do a photo ",
-        "do a picture ",
-        "do a foto ",
-        "do an image ",
-    ];
-
-    // Short exact matches
-    let exact_matches = [
-        "tu foto",
-        "una foto",
-        "mi foto",
-        "dame foto",
-        "dame una foto",
-        "una imagen",
-        "mi imagen",
-        "tu imagen",
-        "your photo",
-        "my photo",
-        "selfie",
-        "retrato",
-    ];
-
-    // Broad fuzzy detection: if a short message contains an image noun + an action verb, it's a draw request
-    let image_nouns = [
-        "photo", "foto", "picture", "imagen", "image", "drawing", "dibujo", "selfie", "retrato",
-        "pic ", "pic.",
-    ];
-    let action_verbs = [
-        "make", "do ", "create", "take", "send", "show", "generate", "haz", "genera", "crea",
-        "toma", "manda", "dame", "hazme", "draw", "paint", "pinta", "dibuja", "quiero", "want",
-    ];
-
-    let mut is_draw = false;
-
-    if exact_starts
-        .iter()
-        .any(|kw| lower_trimmed.starts_with(kw) || lower_no_greeting.starts_with(kw))
-    {
-        is_draw = true;
-    } else if clean_msg.len() < 40
-        && exact_matches.iter().any(|kw| {
-            lower_trimmed == *kw
-                || lower_trimmed.starts_with(kw)
-                || lower_no_greeting == *kw
-                || lower_no_greeting.starts_with(kw)
-        })
-    {
-        is_draw = true;
-    } else if clean_msg.len() < 80 {
-        // Fuzzy: short message contains both an image noun and an action verb
-        let has_noun = image_nouns.iter().any(|n| lower_trimmed.contains(n));
-        let has_verb = action_verbs.iter().any(|v| lower_trimmed.contains(v));
-        if has_noun && has_verb {
-            is_draw = true;
-        }
-    }
-
-    if is_draw {
-        let prompt = clean_msg.to_string();
-        tracing::info!("🎯 [Hera] Strict intent detected: hera_draw from user message");
-        return Some(ToolCall {
-            name: "hera_draw".to_string(),
-            arguments: serde_json::json!({"prompt": prompt}),
-        });
-    }
-
-    // Search intent
-    let search_keywords = [
-        "busca ",
-        "search ",
-        "look up ",
-        "google ",
-        "find out ",
-        "busca en internet",
-        "search the web",
-        "qué pasó con",
-        "what happened with",
-        "noticias de",
-        "news about",
-    ];
-    if search_keywords.iter().any(|kw| lower.contains(kw)) {
-        info!("🎯 [Hera] Intent detected: hera_search from user message");
-        return Some(ToolCall {
-            name: "hera_search".to_string(),
-            arguments: serde_json::json!({"query": clean_msg}),
-        });
-    }
-
-    // Speak intent
-    let speak_keywords = [
-        "say out loud",
-        "di en voz alta",
-        "habla ",
-        "speak ",
-        "read aloud",
-        "lee en voz alta",
-        "genera audio",
-    ];
-    if speak_keywords.iter().any(|kw| lower.contains(kw)) {
-        info!("🎯 [Hera] Intent detected: hera_speak from user message");
-        return Some(ToolCall {
-            name: "hera_speak".to_string(),
-            arguments: serde_json::json!({"text": clean_msg}),
-        });
-    }
-
-    // Video intent
-    let video_keywords = [
-        "genera un video",
-        "generate a video",
-        "make a video",
-        "create a video",
-        "haz un video",
-        "crea un video",
-    ];
-    if video_keywords.iter().any(|kw| lower.contains(kw)) {
-        info!("🎯 [Hera] Intent detected: hera_video from user message");
-        return Some(ToolCall {
-            name: "hera_video".to_string(),
-            arguments: serde_json::json!({"prompt": clean_msg}),
-        });
-    }
-
-    // Service restart/fix intent — catch repair requests
-    let restart_patterns = [
-        "restart ",
-        "reinicia ",
-        "restartea ",
-        "fix ",
-        "arregla ",
-        "repair ",
-        "repara ",
-        "levanta ",
-        "bring up ",
-        "start up ",
-        "arranca ",
-        "prende ",
-        "reiniciar ",
-        "reboot ",
-    ];
+    let command = lower_no_greeting.trim();
     let service_targets = [
+        ("imaginclaw", "imaginclaw"),
+        ("ava", "imaginclaw"),
         ("vetra", "vetra"),
         ("cartera", "cartera"),
         ("movilo", "movilo"),
@@ -1492,119 +1243,146 @@ pub fn detect_intent_from_user_message(
         ("os-v3", "os-v3"),
         ("imaginos", "imaginos"),
         ("memento", "memento"),
-        ("diakonos", "diakonos"),
         ("argus", "argus"),
     ];
-    for pattern in &restart_patterns {
-        if lower.starts_with(pattern)
-            || lower_no_greeting.starts_with(pattern)
-            || lower.contains(pattern)
-        {
-            // Try to extract the service name from the message
-            if let Some((alias, slug)) = service_targets
-                .iter()
-                .find(|(alias, _)| lower.contains(*alias))
-            {
-                let pm2_name = pm2_process_name_for_slug(slug);
-                info!(
-                    "🎯 [Hera] Intent detected: service_restart for '{}' via alias '{}'",
-                    pm2_name, alias
-                );
-                return Some(ToolCall {
-                    name: "service_restart".to_string(),
-                    arguments: serde_json::json!({"service_name": pm2_name}),
-                });
-            }
+
+    if let Some(rest) = command.strip_prefix("/draw ") {
+        let prompt = rest.trim();
+        if !prompt.is_empty() {
+            info!("🎯 [Hera] Explicit fast-path command: /draw");
+            return Some(ToolCall {
+                name: "hera_draw".to_string(),
+                arguments: serde_json::json!({"prompt": prompt}),
+            });
         }
     }
 
-    // Service diagnostics intent — catch questions about broken services / why something doesn't work
-    let diag_keywords = [
-        "diagnose",
-        "diagnostica",
-        "qué está mal",
-        "que esta mal",
-        "what's wrong",
-        "whats wrong",
-        "por qué no funciona",
-        "porque no funciona",
-        "why isn't it working",
-        "why isnt it working",
-        "check services",
-        "revisa los servicios",
-        "health check",
-        "chequeo de salud",
-        "servicios caídos",
-        "servicios caidos",
-        "services down",
-        "qué pasó con",
-        "que paso con",
-        "500 error",
-        "no responde",
-        "not responding",
-        "está caído",
-        "esta caido",
-        "is down",
-        "se cayó",
-        "se cayo",
-        "no carga",
-        "won't load",
-        "diagnóstico",
-        "diagnostico",
-        "qué está pasando",
-        "que esta pasando",
-        "what's happening",
-        "whats happening",
-    ];
-    if diag_keywords.iter().any(|kw| lower.contains(kw)) {
-        info!("🎯 [Hera] Intent detected: diagnose_services from user message");
+    if let Some(rest) = command.strip_prefix("/search ") {
+        let query = rest.trim();
+        if !query.is_empty() {
+            info!("🎯 [Hera] Explicit fast-path command: /search");
+            return Some(ToolCall {
+                name: "hera_search".to_string(),
+                arguments: serde_json::json!({"query": query}),
+            });
+        }
+    }
+
+    if let Some(rest) = command.strip_prefix("/speak ") {
+        let text = rest.trim();
+        if !text.is_empty() {
+            info!("🎯 [Hera] Explicit fast-path command: /speak");
+            return Some(ToolCall {
+                name: "hera_speak".to_string(),
+                arguments: serde_json::json!({"text": text}),
+            });
+        }
+    }
+
+    if let Some(rest) = command.strip_prefix("/video ") {
+        let prompt = rest.trim();
+        if !prompt.is_empty() {
+            info!("🎯 [Hera] Explicit fast-path command: /video");
+            return Some(ToolCall {
+                name: "hera_video".to_string(),
+                arguments: serde_json::json!({"prompt": prompt}),
+            });
+        }
+    }
+
+    if matches!(command, "/status" | "/system-status" | "/server-status") {
+        info!("🎯 [Hera] Explicit fast-path command: /status");
+        return Some(ToolCall {
+            name: "system_status".to_string(),
+            arguments: serde_json::json!({}),
+        });
+    }
+
+    if matches!(command, "/diagnose" | "/diagnose-services") {
+        info!("🎯 [Hera] Explicit fast-path command: /diagnose");
         return Some(ToolCall {
             name: "diagnose_services".to_string(),
             arguments: serde_json::json!({}),
         });
     }
 
-    // System status intent — catch conversational questions about server/GPU/CPU/memory
-    let status_keywords = [
-        "system status",
-        "server status",
-        "gpu status",
-        "cpu status",
-        "how is the server",
-        "como esta el server",
-        "como está el server",
-        "estado del servidor",
-        "estado del server",
-        "status del server",
-        "nvidia",
-        "vram",
-        "gpu load",
-        "gpu temp",
-        "como esta el gpu",
-        "como está el gpu",
-        "cuanta ram",
-        "cuánta ram",
-        "how much ram",
-        "memory usage",
-        "uso de memoria",
-        "system health",
-        "server health",
-        "how much vram",
-        "cuanta vram",
-        "cuánta vram",
-        "que procesos",
-        "qué procesos",
-        "what processes",
-        "esta corriendo",
-        "está corriendo",
-        "is running",
-    ];
-    if status_keywords.iter().any(|kw| lower.contains(kw)) {
-        info!("🎯 [Hera] Intent detected: system_status from user message");
+    if matches!(command, "/review-apps" | "/apps-status") {
+        info!("🎯 [Hera] Explicit fast-path command: /review-apps");
         return Some(ToolCall {
-            name: "system_status".to_string(),
-            arguments: serde_json::json!({}),
+            name: "review_all_apps_status".to_string(),
+            arguments: serde_json::json!({
+                "timeout_seconds": 10
+            }),
         });
+    }
+
+    if matches!(command, "/verify-stack" | "/stack-status") {
+        info!("🎯 [Hera] Explicit fast-path command: /verify-stack");
+        return Some(ToolCall {
+            name: "verify_canonical_stack".to_string(),
+            arguments: serde_json::json!({
+                "checks": ["check"],
+                "timeout_seconds": 60
+            }),
+        });
+    }
+
+    if let Some(rest) = command.strip_prefix("/verify-app ") {
+        let requested = rest.trim();
+        if !requested.is_empty() {
+            let matched_app = detect_app().or_else(|| {
+                service_targets
+                    .iter()
+                    .find(|(alias, _)| requested.contains(*alias))
+                    .and_then(|(_, slug)| match *slug {
+                        "vetra" => Some("vetra"),
+                        "cartera" => Some("cartera"),
+                        "movilo" => Some("movilo"),
+                        "latinos" => Some("latinos"),
+                        "os-v3" => Some("os-v3"),
+                        "desktop" => Some("desktop"),
+                        "paulo-vila-rust" => Some("paulo-vila-rust"),
+                        "capacita" => Some("capacita"),
+                        _ => None,
+                    })
+            });
+
+            if let Some(app) = matched_app {
+                info!(
+                    "🎯 [Hera] Explicit fast-path command: /verify-app for '{}'",
+                    app
+                );
+                return Some(ToolCall {
+                    name: "verify_app_health".to_string(),
+                    arguments: serde_json::json!({
+                        "app": app,
+                        "compile_checks": ["check"],
+                        "runtime_suite": "regression",
+                        "run_runtime": true,
+                        "include_logs": true,
+                        "timeout_seconds": 60
+                    }),
+                });
+            }
+        }
+    }
+
+    if let Some(rest) = command.strip_prefix("/restart ") {
+        let requested = rest.trim();
+        if let Some((alias, slug)) = service_targets
+            .iter()
+            .find(|(alias, _)| requested.contains(*alias))
+        {
+            let pm2_name = pm2_process_name_for_slug(slug);
+            info!(
+                "🎯 [Hera] Explicit fast-path command: /restart for '{}' via alias '{}'",
+                pm2_name, alias
+            );
+            return Some(ToolCall {
+                name: "service_restart".to_string(),
+                arguments: serde_json::json!({"service_name": pm2_name}),
+            });
+        }
     }
 
     None
@@ -1617,17 +1395,43 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
 
     let start = std::time::Instant::now();
     let tool_name = call.name.clone();
+    let caller = extract_tool_caller(call);
+    if !caller_allowed_for_tool(&tool_name, &caller) {
+        let error = format!(
+            "Caller '{}' is not allowed to execute tool '{}'.",
+            caller, tool_name
+        );
+        audit_tool_execution(
+            call,
+            false,
+            start.elapsed().as_millis(),
+            false,
+            Some(&error),
+        );
+        return ToolResult {
+            name: tool_name,
+            success: false,
+            output: error,
+        };
+    }
+
     let timeout = std::time::Duration::from_millis(tool_timeout_ms(&call.name));
     match tokio::time::timeout(timeout, execute_tool_inner(call)).await {
         Ok(result) => {
-            audit_tool_execution(call, result.success, start.elapsed().as_millis(), false, None);
+            audit_tool_execution(
+                call,
+                result.success,
+                start.elapsed().as_millis(),
+                false,
+                None,
+            );
             result
         }
         Err(_) => {
             tracing::error!(
                 "⏰ [Hera] Tool '{}' TIMED OUT after {:?}. Returning error.",
-                tool_name
-                , timeout
+                tool_name,
+                timeout
             );
             let error = format!(
                 "Error: Tool execution timed out after {} ms.",
@@ -1868,6 +1672,26 @@ async fn dispatch_raw_json_tool(call: &ToolCall) -> Option<Result<Value, String>
 pub async fn execute_tool_raw_json(call: &ToolCall) -> Result<Value, String> {
     let start = std::time::Instant::now();
     let tool_name = call.name.clone();
+    let caller = extract_tool_caller(call);
+    if !caller_allowed_for_tool(&tool_name, &caller) {
+        let error = format!(
+            "Caller '{}' is not allowed to execute tool '{}'.",
+            caller, tool_name
+        );
+        audit_tool_execution(
+            call,
+            false,
+            start.elapsed().as_millis(),
+            false,
+            Some(&error),
+        );
+        return Ok(tool_error_envelope(
+            call,
+            &error,
+            start.elapsed().as_millis(),
+        ));
+    }
+
     let timeout = std::time::Duration::from_millis(tool_timeout_ms(&call.name));
     match tokio::time::timeout(timeout, execute_tool_raw_json_inner(call)).await {
         Ok(result) => {
@@ -1904,7 +1728,10 @@ pub async fn execute_tool_raw_json(call: &ToolCall) -> Result<Value, String> {
 
             audit_tool_execution(
                 call,
-                envelope.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+                envelope
+                    .get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 start.elapsed().as_millis(),
                 false,
                 envelope.get("error").and_then(|v| v.as_str()),
@@ -1917,9 +1744,17 @@ pub async fn execute_tool_raw_json(call: &ToolCall) -> Result<Value, String> {
                 tool_name,
                 timeout
             );
-            let error = format!("Tool '{}' timed out after {} ms.", tool_name, timeout.as_millis());
+            let error = format!(
+                "Tool '{}' timed out after {} ms.",
+                tool_name,
+                timeout.as_millis()
+            );
             audit_tool_execution(call, false, start.elapsed().as_millis(), true, Some(&error));
-            Ok(tool_error_envelope(call, &error, start.elapsed().as_millis()))
+            Ok(tool_error_envelope(
+                call,
+                &error,
+                start.elapsed().as_millis(),
+            ))
         }
     }
 }
@@ -1928,12 +1763,6 @@ pub async fn execute_tool_raw_json(call: &ToolCall) -> Result<Value, String> {
 async fn execute_tool_raw_json_inner(call: &ToolCall) -> Result<Value, String> {
     if let Some(result) = dispatch_metadata_raw_json_tool(call).await {
         return result;
-    }
-    if is_registered_tool(&call.name) {
-        return Err(format!(
-            "Registered tool '{}' has no metadata-driven raw JSON dispatcher.",
-            call.name
-        ));
     }
 
     let result = execute_tool_inner(call).await;
@@ -2112,5 +1941,27 @@ mod tests {
             "Critical tools missing explicit risk metadata: {:?}",
             critical
         );
+    }
+
+    #[test]
+    fn explicit_restart_command_maps_to_service_restart() {
+        let call = detect_intent_from_user_message("/restart imaginclaw", None)
+            .expect("expected explicit /restart command to map");
+
+        assert_eq!(call.name, "service_restart");
+        assert_eq!(
+            call.arguments
+                .get("service_name")
+                .and_then(|value| value.as_str()),
+            Some("imaginclaw")
+        );
+    }
+
+    #[test]
+    fn explicit_status_command_maps_to_system_status() {
+        let call = detect_intent_from_user_message("/status", None)
+            .expect("expected explicit /status command to map");
+
+        assert_eq!(call.name, "system_status");
     }
 }

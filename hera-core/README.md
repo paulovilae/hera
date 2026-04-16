@@ -14,7 +14,6 @@ It is one component inside the canonical Ava bundle:
 - `Sentinel`
 - `Imaginclaw`
 - `Hera/hera-core`
-- `Hera/diakonos-core`
 - `Memento`
 
 Before diagnosing assistant capability or adding features, read:

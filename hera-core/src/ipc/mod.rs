@@ -10,13 +10,17 @@
 pub mod context;
 pub mod handler_audio;
 pub mod handler_dag;
+pub mod handler_delegation;
 pub mod handler_generate;
+pub mod handler_health;
 pub mod handler_lora;
 pub mod handler_media;
 pub mod handler_stream;
 pub mod handler_tools;
 pub mod helpers;
 pub mod llm_audit;
+pub mod route_profiles;
+pub mod runtime_tools;
 pub mod types;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -123,6 +127,24 @@ async fn dispatch(
         "execute_tool" => handler_tools::handle_execute_tool(request, state, stream).await,
         "generate" => handler_generate::handle_generate(request, state, stream).await,
         "generate_stream" => handler_stream::handle_generate_stream(request, state, stream).await,
+        "delegate_task" => handler_delegation::handle_delegate_task(request, state, stream).await,
+        "list_agent_runs" => {
+            handler_delegation::handle_list_agent_runs(request, state, stream).await
+        }
+        "get_agent_run" => handler_delegation::handle_get_agent_run(request, state, stream).await,
+        "await_agent_run" => {
+            handler_delegation::handle_await_agent_run(request, state, stream).await
+        }
+        "cancel_agent_run" => {
+            handler_delegation::handle_cancel_agent_run(request, state, stream).await
+        }
+        "resume_agent_run" => {
+            handler_delegation::handle_resume_agent_run(request, state, stream).await
+        }
+        "summarize_agent_run" => {
+            handler_delegation::handle_summarize_agent_run(request, state, stream).await
+        }
+        "route_health" => handler_health::handle_route_health(request, state, stream).await,
         "generate_image" => handler_media::handle_generate_image(request, state).await,
         "vision_analysis" => handler_media::handle_vision_analysis(request, state).await,
         "execute_dag" => handler_dag::handle_execute_dag(request, state).await,

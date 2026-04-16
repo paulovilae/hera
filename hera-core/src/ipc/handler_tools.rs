@@ -32,9 +32,34 @@ pub async fn handle_execute_tool(
         };
     }
 
+    let mut contextual_arguments = arguments.clone();
+    if let Some(object) = contextual_arguments.as_object_mut() {
+        if let Some(app_name) = request
+            .payload
+            .get("app")
+            .or_else(|| request.payload.get("app_name"))
+            .and_then(|value| value.as_str())
+        {
+            object
+                .entry("app_name".to_string())
+                .or_insert_with(|| serde_json::json!(app_name));
+            object
+                .entry("app".to_string())
+                .or_insert_with(|| serde_json::json!(app_name));
+            object
+                .entry("caller".to_string())
+                .or_insert_with(|| serde_json::json!(app_name));
+        }
+        for key in ["trace_id", "session_id", "chat_id"] {
+            if let Some(value) = request.payload.get(key).cloned() {
+                object.entry(key.to_string()).or_insert(value);
+            }
+        }
+    }
+
     let tool_call = crate::ai::tool_executor::ToolCall {
         name: tool_name.clone(),
-        arguments: arguments.clone(),
+        arguments: contextual_arguments.clone(),
     };
 
     match crate::ai::tool_executor::execute_tool_raw_json(&tool_call).await {
@@ -47,7 +72,7 @@ pub async fn handle_execute_tool(
                     "model": tool_name,
                     "tool_calls": [{
                         "name": tool_call.name,
-                        "arguments": arguments
+                        "arguments": contextual_arguments
                     }]
                 }),
             };

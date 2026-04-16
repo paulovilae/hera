@@ -29,7 +29,6 @@ base64 = "0.22.1"
 async-trait = "0.1.86"
 hera-execution = { path = "../hera-execution", optional = true }
 hera-web = { path = "../hera-web" }
-diakonos-core = { path = "../diakonos-core" }
 
 # Native AI Execution Engine
 candle-core = { version = "0.9.2", features = ["cuda"] }

@@ -1,14 +1,18 @@
 //! Handler: generate_stream (streaming LLM inference with tool execution).
 
 use super::context::{
-    build_full_system_prompt, build_new_chat_request, inject_system_prompt,
-    is_lightweight_conversation, parse_payload,
+    build_runtime_outcome_artifacts, parse_payload, prepare_chat_request,
+    prepare_runtime_execution_context, prepare_tool_result_followup_request,
 };
-use super::helpers::infer_origin_from_model;
-use super::llm_audit::{append_llm_audit_event, build_event};
+use super::helpers::{
+    RuntimePromotionContext, infer_origin_from_model, record_observation_and_promote_runtime_hint,
+    record_runtime_observation,
+};
+use super::llm_audit::append_llm_audit_event;
+use super::runtime_tools::{
+    FollowupStrategy, contextualize_tool_call, execute_parsed_tool_calls, execute_tool_followup,
+};
 use super::types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
-use crate::ai::{ChatMessage, ChatRequest, MessageContent};
-
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -21,12 +25,14 @@ pub async fn handle_generate_stream(
 ) -> HandlerOutcome {
     let started_at = Instant::now();
     let payload_clone = request.payload.clone();
-    let parsed = parse_payload(&payload_clone);
+    let mut parsed = parse_payload(&payload_clone);
     let provider_requested = payload_clone
         .get("provider")
         .and_then(|value| value.as_str())
         .unwrap_or("auto")
         .to_string();
+    let caller_overrode_budget = payload_clone.get("context_budget_mode").is_some()
+        || payload_clone.get("context_budget").is_some();
 
     // Fast-path intent detection
     if !parsed.prompt.is_empty() {
@@ -34,24 +40,26 @@ pub async fn handle_generate_stream(
             &parsed.prompt,
             parsed.assistant_last.as_deref(),
         ) {
+            let contextual_tool_call = contextualize_tool_call(&tool_call, &parsed);
             if crate::ai::tool_executor::permissions_allow_tool(
                 &parsed.permissions,
-                &tool_call.name,
+                &contextual_tool_call.name,
             ) {
                 tracing::info!(
                     "🚀 [Hera IPC Stream] Fast-path tool intent detected: {}",
-                    tool_call.name
+                    contextual_tool_call.name
                 );
 
                 let status_msg = IpcResponse {
                     status: "tool_status".to_string(),
-                    data: serde_json::json!({"name": tool_call.name.clone()}),
+                    data: serde_json::json!({"name": contextual_tool_call.name.clone()}),
                 };
                 let mut str_msg = serde_json::to_string(&status_msg).unwrap();
                 str_msg.push('\n');
                 let _ = stream.write_all(str_msg.as_bytes()).await;
 
-                let tool_result = crate::ai::tool_executor::execute_tool(&tool_call).await;
+                let tool_result =
+                    crate::ai::tool_executor::execute_tool(&contextual_tool_call).await;
 
                 let chunk_msg = IpcResponse {
                     status: "chunk".to_string(),
@@ -87,25 +95,20 @@ pub async fn handle_generate_stream(
         .unwrap_or("")
         .to_string();
 
-    // Build or augment ChatRequest
-    let mut chat_req: Option<ChatRequest> = serde_json::from_value(payload_mut.clone()).ok();
-
-    let lightweight_mode = is_lightweight_conversation(&parsed.prompt);
-    let full_system_prompt = build_full_system_prompt(
-        &parsed.persona_path,
-        &parsed.app_name,
-        &parsed.permissions,
-        lightweight_mode,
+    let prepared =
+        prepare_runtime_execution_context(&mut parsed, caller_overrode_budget, "generate_stream")
+            .await;
+    let runtime_preflight = prepared.runtime_preflight;
+    let prompt_assembly = prepared.prompt_assembly;
+    let lightweight_mode = prepared.lightweight_mode;
+    let chat_req = prepare_chat_request(
+        &payload_mut,
+        &prompt,
+        &parsed,
+        &prompt_assembly,
+        &state.engine,
     )
     .await;
-
-    if chat_req.is_none() {
-        if !prompt.is_empty() {
-            chat_req = Some(build_new_chat_request(&prompt, full_system_prompt));
-        }
-    } else if let Some(req) = &mut chat_req {
-        inject_system_prompt(req, full_system_prompt);
-    }
 
     if let Some(req) = chat_req.clone() {
         let est_tokens = super::helpers::estimate_tokens(&req);
@@ -202,85 +205,36 @@ pub async fn handle_generate_stream(
                 // Parse tool calls from accumulated text
                 let parsed_calls = crate::ai::tool_executor::parse_tool_calls(&final_result_text);
                 if !parsed_calls.is_empty() {
-                    let mut execution_outputs = String::new();
-                    for call in &parsed_calls {
-                        executed_tool_count += 1;
-                        let status_msg = IpcResponse {
-                            status: "tool_status".to_string(),
-                            data: serde_json::json!({"name": call.name.clone()}),
-                        };
-                        let mut str_msg = serde_json::to_string(&status_msg).unwrap();
-                        str_msg.push('\n');
-                        let _ = stream.write_all(str_msg.as_bytes()).await;
-
-                        if crate::ai::tool_executor::permissions_allow_tool(
-                            &parsed.permissions,
-                            &call.name,
+                    let tool_summary =
+                        execute_parsed_tool_calls(&parsed_calls, &parsed, Some(stream)).await;
+                    executed_tool_count += tool_summary.executed_tool_count;
+                    let execution_outputs = tool_summary.execution_outputs;
+                    if !tool_summary.has_media_call {
+                        let json_mode = payload_clone
+                            .get("json_mode")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if let Some(req2) = prepare_tool_result_followup_request(
+                            chat_req.clone(),
+                            &final_result_text,
+                            &execution_outputs,
+                            json_mode,
                         ) {
-                            let tool_res = crate::ai::tool_executor::execute_tool(call).await;
-                            execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
-                        } else {
-                            execution_outputs.push_str(&format!(
-                                "\n\nError: Not permitted to use tool '{}'",
-                                call.name
-                            ));
-                        }
-                    }
-
-                    let has_media_call = parsed_calls.iter().any(|c| {
-                        c.name == "hera_draw"
-                            || c.name == "hera_video"
-                            || c.name == "generate_qr_code"
-                    });
-                    if !has_media_call {
-                        if let Some(mut req2) = chat_req.clone() {
-                            // Strip tool schemas to prevent recursive tool calls
-                            if let Some(first) = req2.messages.first_mut() {
-                                if first.role == "system" {
-                                    first.content = MessageContent::Text(
-                                        "You are a helpful AI assistant. You have already executed tools and received the results. Your ONLY job now is to summarize the results for the user. DO NOT output any tool calls, <tool_call> tags, or function calls. DO NOT use <think> tags. Output ONLY the final answer.".to_string(),
-                                    );
+                            if let Ok(followup) = execute_tool_followup(
+                                &state.engine,
+                                req2,
+                                FollowupStrategy::Streaming(stream),
+                            )
+                            .await
+                            {
+                                if let Some(model) = followup.model {
+                                    response_origin = followup.origin.unwrap_or_else(|| {
+                                        infer_origin_from_model(&model).to_string()
+                                    });
+                                    response_model = model;
                                 }
-                            }
-                            req2.messages.push(ChatMessage {
-                                role: "assistant".to_string(),
-                                content: MessageContent::Text(final_result_text.clone()),
-                            });
-                            let json_mode = payload_clone
-                                .get("json_mode")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            let sys_msg = if json_mode {
-                                format!(
-                                    "Tool Execution Results: {}\n\nIMPORTANT: DO NOT call any more tools. DO NOT output <tool_call> tags. Provide your final response as RAW VALID JSON matching the exact schema requested in the original prompt. The JSON MUST contain a \"summary\" key with a human-readable response.",
-                                    execution_outputs
-                                )
-                            } else {
-                                format!(
-                                    "Tool Execution Results: {}\n\nIMPORTANT: DO NOT call any more tools. DO NOT output <tool_call> tags. Provide a friendly, conversational, and concise response to the user based on these results. Do not output raw JSON or mention the database tables directly.",
-                                    execution_outputs
-                                )
-                            };
-                            req2.messages.push(ChatMessage {
-                                role: "user".to_string(),
-                                content: MessageContent::Text(sys_msg),
-                            });
-                            if let Ok(mut rx2) = state.engine.generate_stream(req2).await {
-                                while let Some(chunk_res2) = rx2.recv().await {
-                                    if let Ok(chunk2) = chunk_res2 {
-                                        let chunk_text = chunk2
-                                            .choices
-                                            .first()
-                                            .and_then(|c| c.delta.content.clone())
-                                            .unwrap_or_default();
-                                        let chunk_msg = IpcResponse {
-                                            status: "chunk".to_string(),
-                                            data: serde_json::json!({"text": chunk_text}),
-                                        };
-                                        let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
-                                        cstr.push('\n');
-                                        let _ = stream.write_all(cstr.as_bytes()).await;
-                                    }
+                                if !followup.text.is_empty() {
+                                    final_result_text = followup.text;
                                 }
                             }
                         }
@@ -313,13 +267,12 @@ pub async fn handle_generate_stream(
                 dstr.push('\n');
                 let _ = stream.write_all(dstr.as_bytes()).await;
 
-                append_llm_audit_event(&build_event(
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                let outcome = build_runtime_outcome_artifacts(
                     "generate_stream",
-                    &parsed.app_name,
-                    &parsed.persona_path,
-                    &parsed.prompt,
-                    est_tokens,
-                    started_at.elapsed().as_millis() as u64,
+                    &parsed,
+                    &prompt_assembly,
+                    duration_ms,
                     first_token_ms,
                     lightweight_mode,
                     &provider_requested,
@@ -328,8 +281,31 @@ pub async fn handle_generate_stream(
                     true,
                     executed_tool_count,
                     final_result_text.len(),
+                    est_tokens,
+                    chat_req
+                        .as_ref()
+                        .map(|req| req.messages.len())
+                        .unwrap_or_default(),
                     None,
-                ));
+                );
+                append_llm_audit_event(&outcome.audit_event);
+                record_observation_and_promote_runtime_hint(
+                    outcome.observation_payload,
+                    RuntimePromotionContext {
+                        preflight: runtime_preflight.clone(),
+                        mode: "generate_stream",
+                        app_id: &parsed.app_name,
+                        route_profile: &parsed.route_profile_id,
+                        persona_path: &parsed.persona_path,
+                        session_id: &parsed.session_id,
+                        trace_id: &parsed.trace_id,
+                        chat_id: &parsed.chat_id,
+                        current_budget_mode: &parsed.context_budget.mode,
+                        persona_drift: parsed.persona_drift,
+                        success: true,
+                    },
+                )
+                .await;
             }
             Err(e) => {
                 let err_msg = IpcResponse {
@@ -339,13 +315,13 @@ pub async fn handle_generate_stream(
                 let mut estr = serde_json::to_string(&err_msg).unwrap();
                 estr.push('\n');
                 let _ = stream.write_all(estr.as_bytes()).await;
-                append_llm_audit_event(&build_event(
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                let error_text = e.to_string();
+                let outcome = build_runtime_outcome_artifacts(
                     "generate_stream",
-                    &parsed.app_name,
-                    &parsed.persona_path,
-                    &parsed.prompt,
-                    est_tokens,
-                    started_at.elapsed().as_millis() as u64,
+                    &parsed,
+                    &prompt_assembly,
+                    duration_ms,
                     first_token_ms,
                     lightweight_mode,
                     &provider_requested,
@@ -354,11 +330,257 @@ pub async fn handle_generate_stream(
                     false,
                     0,
                     0,
-                    Some(e.to_string()),
-                ));
+                    est_tokens,
+                    chat_req
+                        .as_ref()
+                        .map(|req| req.messages.len())
+                        .unwrap_or_default(),
+                    Some(error_text.clone()),
+                );
+                append_llm_audit_event(&outcome.audit_event);
+                let _ = record_runtime_observation(outcome.observation_payload).await;
             }
         }
     }
 
     HandlerOutcome::DirectResponse
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{
+        ChatRequest, ChatResponse, ChatStreamChoice, ChatStreamDelta, ChatStreamResponse,
+        InferenceError,
+    };
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::mpsc;
+
+    struct MockStreamEngine {
+        calls: Mutex<u32>,
+    }
+
+    impl MockStreamEngine {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::LLMEngine for MockStreamEngine {
+        async fn generate_content(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<ChatResponse, InferenceError> {
+            Err(InferenceError::ExecutionFailed(
+                "not used in handler_stream tests".to_string(),
+            ))
+        }
+
+        async fn generate_stream(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<mpsc::Receiver<Result<ChatStreamResponse, InferenceError>>, InferenceError>
+        {
+            let mut guard = self.calls.lock().expect("calls lock");
+            *guard += 1;
+            let call_no = *guard;
+            drop(guard);
+
+            let (tx, rx) = mpsc::channel(8);
+            tokio::spawn(async move {
+                let text = if call_no == 1 {
+                    "plain hello from stream".to_string()
+                } else {
+                    "final answer after tool".to_string()
+                };
+                let model = if call_no == 1 {
+                    "mock-local-stream-model".to_string()
+                } else {
+                    "mock-local-followup-model".to_string()
+                };
+                let _ = tx
+                    .send(Ok(ChatStreamResponse {
+                        id: format!("stream_{call_no}"),
+                        object: "chat.completion.chunk".to_string(),
+                        created: 0,
+                        model,
+                        choices: vec![ChatStreamChoice {
+                            index: 0,
+                            delta: ChatStreamDelta {
+                                role: None,
+                                content: Some(text),
+                                tool_calls: None,
+                            },
+                            finish_reason: Some("stop".to_string()),
+                        }],
+                        stats: None,
+                    }))
+                    .await;
+            });
+            Ok(rx)
+        }
+    }
+
+    struct MockToolCallEngine {
+        calls: Mutex<u32>,
+    }
+
+    impl MockToolCallEngine {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::LLMEngine for MockToolCallEngine {
+        async fn generate_content(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<ChatResponse, InferenceError> {
+            Err(InferenceError::ExecutionFailed(
+                "not used in handler_stream tests".to_string(),
+            ))
+        }
+
+        async fn generate_stream(
+            &self,
+            _req: ChatRequest,
+        ) -> Result<mpsc::Receiver<Result<ChatStreamResponse, InferenceError>>, InferenceError>
+        {
+            let mut guard = self.calls.lock().expect("calls lock");
+            *guard += 1;
+            let call_no = *guard;
+            drop(guard);
+
+            let (tx, rx) = mpsc::channel(8);
+            tokio::spawn(async move {
+                let (text, model) = if call_no == 1 {
+                    (
+                        "<tool_call>{\"name\":\"get_system_time\",\"arguments\":{}}</tool_call>"
+                            .to_string(),
+                        "mock-local-stream-model".to_string(),
+                    )
+                } else {
+                    (
+                        "final answer after tool".to_string(),
+                        "mock-local-followup-model".to_string(),
+                    )
+                };
+                let _ = tx
+                    .send(Ok(ChatStreamResponse {
+                        id: format!("stream_{call_no}"),
+                        object: "chat.completion.chunk".to_string(),
+                        created: 0,
+                        model,
+                        choices: vec![ChatStreamChoice {
+                            index: 0,
+                            delta: ChatStreamDelta {
+                                role: None,
+                                content: Some(text),
+                                tool_calls: None,
+                            },
+                            finish_reason: Some("stop".to_string()),
+                        }],
+                        stats: None,
+                    }))
+                    .await;
+            });
+            Ok(rx)
+        }
+    }
+
+    fn test_state(engine: Arc<dyn crate::ai::LLMEngine + Send + Sync>) -> IpcState {
+        IpcState {
+            engine: engine.clone(),
+            local_engine: engine,
+            flux_engine: None,
+            parler_engine: None,
+            whisper_engine: None,
+            vision_engine: None,
+            micro_engine: None,
+        }
+    }
+
+    async fn run_stream_request(
+        engine: Arc<dyn crate::ai::LLMEngine + Send + Sync>,
+        payload: serde_json::Value,
+    ) -> String {
+        let state = test_state(engine);
+        let request = IpcPayload {
+            action: "generate_stream".to_string(),
+            payload,
+        };
+        let (mut writer, mut reader) = tokio::net::UnixStream::pair().expect("unix pair");
+        let outcome = handle_generate_stream(&request, &state, &mut writer).await;
+        assert!(matches!(outcome, HandlerOutcome::DirectResponse));
+        drop(writer);
+
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.expect("read all");
+        String::from_utf8(buf).expect("utf8 output")
+    }
+
+    fn event_statuses(output: &str) -> Vec<String> {
+        output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|value| {
+                value
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn handler_stream_plain_text_emits_stream_start_chunk_done() {
+        let engine: Arc<dyn crate::ai::LLMEngine + Send + Sync> =
+            Arc::new(MockStreamEngine::new());
+        let output = run_stream_request(
+            engine,
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "hola"}
+                ]
+            }),
+        )
+        .await;
+
+        let statuses = event_statuses(&output);
+        assert_eq!(statuses, vec!["stream_start", "chunk", "done"]);
+        assert!(output.contains("plain hello from stream"));
+    }
+
+    #[tokio::test]
+    async fn handler_stream_tool_flow_emits_tool_status_before_final_chunk_and_done() {
+        let engine: Arc<dyn crate::ai::LLMEngine + Send + Sync> =
+            Arc::new(MockToolCallEngine::new());
+        let output = run_stream_request(
+            engine,
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "hola"}
+                ],
+                "permissions": ["get_system_time"]
+            }),
+        )
+        .await;
+
+        let statuses = event_statuses(&output);
+        assert_eq!(statuses, vec!["stream_start", "tool_status", "chunk", "done"]);
+        let tool_idx = output.find("\"status\":\"tool_status\"").expect("tool status");
+        let chunk_idx = output
+            .find("final answer after tool")
+            .expect("final followup chunk");
+        let done_idx = output.find("\"status\":\"done\"").expect("done");
+        assert!(tool_idx < chunk_idx);
+        assert!(chunk_idx < done_idx);
+    }
 }

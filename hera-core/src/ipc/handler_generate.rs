@@ -1,14 +1,18 @@
 //! Handler: generate (non-streaming LLM inference with tool execution).
 
 use super::context::{
-    build_full_system_prompt, build_new_chat_request, compress_if_needed, inject_system_prompt,
-    is_lightweight_conversation, parse_payload,
+    build_runtime_outcome_artifacts, latest_user_message_text, parse_payload, prepare_chat_request,
+    prepare_runtime_execution_context, prepare_tool_result_followup_request,
 };
-use super::helpers::infer_origin_from_model;
-use super::llm_audit::{append_llm_audit_event, build_event};
+use super::helpers::{
+    RuntimePromotionContext, infer_origin_from_model, record_observation_and_promote_runtime_hint,
+    record_runtime_observation,
+};
+use super::llm_audit::append_llm_audit_event;
+use super::runtime_tools::{
+    FollowupStrategy, contextualize_tool_call, execute_parsed_tool_calls, execute_tool_followup,
+};
 use super::types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
-use crate::ai::{ChatMessage, ChatRequest, MessageContent};
-
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -21,36 +25,57 @@ pub async fn handle_generate(
 ) -> HandlerOutcome {
     let started_at = Instant::now();
     let mut payload_clone = request.payload.clone();
-    let parsed = parse_payload(&payload_clone);
+    let mut parsed = parse_payload(&payload_clone);
     let provider_requested = payload_clone
         .get("provider")
         .and_then(|value| value.as_str())
         .unwrap_or("auto")
         .to_string();
+    let caller_overrode_budget = payload_clone.get("context_budget_mode").is_some()
+        || payload_clone.get("context_budget").is_some();
+    let explicit_user_command = latest_user_message_text(&payload_clone)
+        .filter(|message| message.trim_start().starts_with('/'));
 
     // 1. Fast-path intent detection
-    if !parsed.prompt.is_empty() {
+    let fast_path_prompt = explicit_user_command
+        .as_deref()
+        .unwrap_or(parsed.prompt.as_str());
+    tracing::info!(
+        "🧪 [Hera IPC] Fast-path probe explicit_user_command={:?} parsed_prompt={:?} fast_path_prompt={:?}",
+        explicit_user_command,
+        parsed.prompt,
+        fast_path_prompt
+    );
+    if !fast_path_prompt.is_empty() {
+        if fast_path_prompt.trim_start().starts_with('/') {
+            tracing::info!(
+                "🧭 [Hera IPC] Explicit command candidate received: {}",
+                fast_path_prompt.trim()
+            );
+        }
         if let Some(tool_call) = crate::ai::tool_executor::detect_intent_from_user_message(
-            &parsed.prompt,
+            fast_path_prompt,
             parsed.assistant_last.as_deref(),
         ) {
+            let contextual_tool_call = contextualize_tool_call(&tool_call, &parsed);
             if crate::ai::tool_executor::permissions_allow_tool(
                 &parsed.permissions,
-                &tool_call.name,
+                &contextual_tool_call.name,
             ) {
                 tracing::info!(
                     "🚀 [Hera IPC] Fast-path tool intent detected: {}",
-                    tool_call.name
+                    contextual_tool_call.name
                 );
-                let tool_result = crate::ai::tool_executor::execute_tool(&tool_call).await;
+                let tool_result =
+                    crate::ai::tool_executor::execute_tool(&contextual_tool_call).await;
 
                 let res = IpcResponse {
                     status: "success".to_string(),
                     data: serde_json::json!({
                         "result": tool_result.output,
                         "origin": "tool",
-                        "model": tool_call.name,
-                        "tool_calls": [tool_call]
+                        "model": contextual_tool_call.name,
+                        "tool_calls": [contextual_tool_call]
                     }),
                 };
                 let mut res_str = serde_json::to_string(&res).unwrap();
@@ -62,9 +87,14 @@ pub async fn handle_generate(
             } else {
                 tracing::info!(
                     "⚠️ [Hera IPC] Fast-path tool intent {} denied by permissions",
-                    tool_call.name
+                    contextual_tool_call.name
                 );
             }
+        } else if fast_path_prompt.trim_start().starts_with('/') {
+            tracing::warn!(
+                "⚠️ [Hera IPC] Explicit command was not recognized by fast-path: {}",
+                fast_path_prompt.trim()
+            );
         }
     }
 
@@ -81,30 +111,19 @@ pub async fn handle_generate(
         .unwrap_or("")
         .to_string();
 
-    // 3. Build or augment ChatRequest
-    let mut chat_req: Option<ChatRequest> = serde_json::from_value(payload_clone.clone()).ok();
-
-    let lightweight_mode = is_lightweight_conversation(&parsed.prompt);
-    let full_system_prompt = build_full_system_prompt(
-        &parsed.persona_path,
-        &parsed.app_name,
-        &parsed.permissions,
-        lightweight_mode,
+    let prepared =
+        prepare_runtime_execution_context(&mut parsed, caller_overrode_budget, "generate").await;
+    let runtime_preflight = prepared.runtime_preflight;
+    let prompt_assembly = prepared.prompt_assembly;
+    let lightweight_mode = prepared.lightweight_mode;
+    let chat_req = prepare_chat_request(
+        &payload_clone,
+        &prompt,
+        &parsed,
+        &prompt_assembly,
+        &state.engine,
     )
     .await;
-
-    if chat_req.is_none() {
-        if !prompt.is_empty() {
-            chat_req = Some(build_new_chat_request(&prompt, full_system_prompt));
-        }
-    } else if let Some(req) = &mut chat_req {
-        inject_system_prompt(req, full_system_prompt);
-    }
-
-    // 4. Context compression
-    if let Some(req) = &mut chat_req {
-        compress_if_needed(req, &state.engine).await;
-    }
 
     // 5. Generate
     if let Some(req) = chat_req.clone() {
@@ -145,90 +164,46 @@ pub async fn handle_generate(
                                 "🛠️ [Hera IPC] LLM emitted {} tool calls",
                                 parsed_calls.len()
                             );
-                            let mut execution_outputs = String::new();
-                            let mut executed_calls = Vec::new();
+                            let tool_summary =
+                                execute_parsed_tool_calls(&parsed_calls, &parsed, None).await;
+                            let execution_outputs = tool_summary.execution_outputs;
 
-                            for call in &parsed_calls {
-                                if crate::ai::tool_executor::permissions_allow_tool(
-                                    &parsed.permissions,
-                                    &call.name,
+                            if !tool_summary.has_media_call {
+                                let json_mode = payload_clone
+                                    .get("json_mode")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                if let Some(req2) = prepare_tool_result_followup_request(
+                                    chat_req.clone(),
+                                    &result_text,
+                                    &execution_outputs,
+                                    json_mode,
                                 ) {
-                                    let tool_res =
-                                        crate::ai::tool_executor::execute_tool(call).await;
-                                    execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
-                                    executed_calls.push(serde_json::json!({
-                                        "name": call.name,
-                                        "arguments": call.arguments
-                                    }));
-                                } else {
-                                    tracing::warn!(
-                                        "⚠️ [Hera IPC] LLM hallucinated tool {} which is denied by permissions",
-                                        call.name
-                                    );
-                                    execution_outputs.push_str(&format!(
-                                        "\n\nError: Not permitted to use tool '{}'",
-                                        call.name
-                                    ));
-                                }
-                            }
-
-                            let has_media_call = parsed_calls.iter().any(|c| {
-                                c.name == "hera_draw"
-                                    || c.name == "hera_video"
-                                    || c.name == "generate_qr_code"
-                            });
-
-                            if !has_media_call {
-                                if let Some(mut req2) = chat_req.clone() {
-                                    // Strip tool schemas to prevent recursive tool calls
-                                    if let Some(first) = req2.messages.first_mut() {
-                                        if first.role == "system" {
-                                            first.content = MessageContent::Text(
-                                                "You are a helpful AI assistant. You have already executed tools and received the results. Your ONLY job now is to summarize the results for the user. DO NOT output any tool calls, <tool_call> tags, or function calls. DO NOT use <think> tags. Output ONLY the final answer.".to_string(),
-                                            );
-                                        }
-                                    }
-                                    req2.messages.push(ChatMessage {
-                                        role: "assistant".to_string(),
-                                        content: MessageContent::Text(result_text.clone()),
-                                    });
-                                    let json_mode = payload_clone
-                                        .get("json_mode")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    let sys_msg = if json_mode {
-                                        format!(
-                                            "Tool Execution Results: {}\n\nIMPORTANT: DO NOT call any more tools. DO NOT output <tool_call> tags. Provide your final response as RAW VALID JSON matching the exact schema requested in the original prompt. The JSON MUST contain a \"summary\" key with a human-readable response.",
-                                            execution_outputs
-                                        )
-                                    } else {
-                                        format!(
-                                            "Tool Execution Results: {}\n\nIMPORTANT: DO NOT call any more tools. DO NOT output <tool_call> tags. Provide a friendly, conversational, and concise response to the user based on these results. Do not output raw JSON or mention the database tables directly.",
-                                            execution_outputs
-                                        )
-                                    };
-                                    req2.messages.push(ChatMessage {
-                                        role: "user".to_string(),
-                                        content: MessageContent::Text(sys_msg),
-                                    });
                                     tracing::info!(
                                         "🔄 [Hera IPC] Initiating second-pass generation to format Tool Results (json_mode: {})...",
                                         json_mode
                                     );
-                                    match state.engine.generate_content(req2).await {
-                                        Ok(resp2) => {
-                                            let p2_origin = infer_origin_from_model(&resp2.model);
+                                    match execute_tool_followup(
+                                        &state.engine,
+                                        req2,
+                                        FollowupStrategy::Buffered,
+                                    )
+                                    .await
+                                    {
+                                        Ok(followup) => {
+                                            let p2_origin =
+                                                followup.origin.as_deref().unwrap_or("unknown");
+                                            let p2_model = followup.model.as_deref().unwrap_or("");
                                             tracing::info!(
                                                 "🔄 [Hera Generate] Second-pass response from {} — model: {}",
                                                 p2_origin,
-                                                resp2.model
+                                                p2_model
                                             );
-                                            response_model = resp2.model.clone();
+                                            response_model =
+                                                followup.model.unwrap_or_else(String::new);
                                             response_origin = p2_origin.to_string();
-                                            if let Some(ch) = resp2.choices.first() {
-                                                if let Some(c) = &ch.message.content {
-                                                    result_text = c.clone();
-                                                }
+                                            if !followup.text.is_empty() {
+                                                result_text = followup.text;
                                             }
                                         }
                                         Err(e) => {
@@ -244,7 +219,8 @@ pub async fn handle_generate(
                                 result_text.push_str(&execution_outputs);
                             }
 
-                            tool_calls = Some(serde_json::Value::Array(executed_calls));
+                            tool_calls =
+                                Some(serde_json::Value::Array(tool_summary.executed_calls_json));
                         }
                     }
                     if let Some(tc) = &choice.message.tool_calls {
@@ -254,13 +230,12 @@ pub async fn handle_generate(
                     }
                 }
 
-                append_llm_audit_event(&build_event(
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                let outcome = build_runtime_outcome_artifacts(
                     "generate",
-                    &parsed.app_name,
-                    &parsed.persona_path,
-                    &parsed.prompt,
-                    est_tokens,
-                    started_at.elapsed().as_millis() as u64,
+                    &parsed,
+                    &prompt_assembly,
+                    duration_ms,
                     None,
                     lightweight_mode,
                     &provider_requested,
@@ -272,8 +247,31 @@ pub async fn handle_generate(
                         .and_then(|value| value.as_array().map(|items| items.len()))
                         .unwrap_or(0),
                     result_text.len(),
+                    est_tokens,
+                    chat_req
+                        .as_ref()
+                        .map(|req| req.messages.len())
+                        .unwrap_or_default(),
                     None,
-                ));
+                );
+                append_llm_audit_event(&outcome.audit_event);
+                record_observation_and_promote_runtime_hint(
+                    outcome.observation_payload,
+                    RuntimePromotionContext {
+                        preflight: runtime_preflight.clone(),
+                        mode: "generate",
+                        app_id: &parsed.app_name,
+                        route_profile: &parsed.route_profile_id,
+                        persona_path: &parsed.persona_path,
+                        session_id: &parsed.session_id,
+                        trace_id: &parsed.trace_id,
+                        chat_id: &parsed.chat_id,
+                        current_budget_mode: &parsed.context_budget.mode,
+                        persona_drift: parsed.persona_drift,
+                        success: true,
+                    },
+                )
+                .await;
 
                 return HandlerOutcome::Result {
                     result_text,
@@ -284,13 +282,13 @@ pub async fn handle_generate(
             }
             Err(e) => {
                 tracing::error!("LLM inference error: {}", e);
-                append_llm_audit_event(&build_event(
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                let error_text = e.to_string();
+                let outcome = build_runtime_outcome_artifacts(
                     "generate",
-                    &parsed.app_name,
-                    &parsed.persona_path,
-                    &parsed.prompt,
-                    est_tokens,
-                    started_at.elapsed().as_millis() as u64,
+                    &parsed,
+                    &prompt_assembly,
+                    duration_ms,
                     None,
                     lightweight_mode,
                     &provider_requested,
@@ -299,10 +297,17 @@ pub async fn handle_generate(
                     false,
                     0,
                     0,
-                    Some(e.to_string()),
-                ));
+                    est_tokens,
+                    chat_req
+                        .as_ref()
+                        .map(|req| req.messages.len())
+                        .unwrap_or_default(),
+                    Some(error_text.clone()),
+                );
+                append_llm_audit_event(&outcome.audit_event);
+                let _ = record_runtime_observation(outcome.observation_payload).await;
                 return HandlerOutcome::Result {
-                    result_text: format!("Error: {}", e),
+                    result_text: format!("Error: {}", error_text),
                     origin: "offline".to_string(),
                     model: String::new(),
                     tool_calls: None,

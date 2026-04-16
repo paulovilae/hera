@@ -1,5 +1,6 @@
 //! Platform tool executors: desktop, draw, search, speak, video, files, agents, skills, soul, user interaction
 use crate::ai::tool_executor::{ToolCall, ToolResult, find_skill_artifact, load_agent_artifact};
+use hera_execution::agents::hera::Hera;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,6 +10,7 @@ use tracing::info;
 const HERA_SOCKET: &str = "/tmp/hera-core.sock";
 const OS_ROOT: &str = "/home/paulo/Programs/apps/OS";
 const TMP_ROOT: &str = "/tmp";
+const SMARTOS_ROUTER_URL: &str = "http://127.0.0.1:3000";
 
 fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<PathBuf, String> {
     let raw = Path::new(path);
@@ -95,6 +97,10 @@ fn parse_ipc_result(response: &str) -> Result<String, String> {
     } else {
         Err("No content in Hera IPC response".to_string())
     }
+}
+
+fn hera_execution_agent() -> Hera {
+    Hera::new(SMARTOS_ROUTER_URL)
 }
 
 async fn run_agent_via_hera_ipc(persona: String, prompt: String) -> Result<String, String> {
@@ -613,20 +619,14 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
         .and_then(|h| h.as_u64())
         .map(|h| h as u32);
 
-    let request = diakonos_core::protocol::DiakonosRequest {
-        action: "draw_image".to_string(),
-        payload: serde_json::json!({
-            "prompt": prompt,
-            "width": width,
-            "height": height,
-        }),
-    };
-
-    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
+    let hera = hera_execution_agent();
+    match hera
+        .generate_image(
+            prompt, None, width, height, None, None, None, None, None, None, None,
+        )
         .await
     {
-        Ok(response) if response.status == "success" => {
-            let res = response.data;
+        Ok(res) => {
             let image_url = res
                 .get("image_url")
                 .and_then(|u| u.as_str())
@@ -648,16 +648,6 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
                 output: response,
             }
         }
-        Ok(response) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: response
-                .data
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Diakonos draw error")
-                .to_string(),
-        },
         Err(e) => {
             tracing::error!("🎨 [Hera] Image generation failed: {:?}", e);
             ToolResult {
@@ -675,20 +665,9 @@ pub(crate) async fn execute_search(call: &ToolCall) -> ToolResult {
         .get("query")
         .and_then(|q| q.as_str())
         .unwrap_or("");
-    let request = diakonos_core::protocol::DiakonosRequest {
-        action: "web_search".to_string(),
-        payload: serde_json::json!({ "query": query }),
-    };
-
-    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
-        .await
-    {
-        Ok(response) if response.status == "success" => {
-            let results = response
-                .data
-                .get("content")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
+    let hera = hera_execution_agent();
+    match hera.native_web_search(query).await {
+        Ok(results) => {
             info!("🌐 [Hera] Search completed for: {}", query);
             ToolResult {
                 name: call.name.clone(),
@@ -696,16 +675,6 @@ pub(crate) async fn execute_search(call: &ToolCall) -> ToolResult {
                 output: format!("Search results for '{}':\n{}", query, results),
             }
         }
-        Ok(response) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: response
-                .data
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Diakonos search error")
-                .to_string(),
-        },
         Err(e) => ToolResult {
             name: call.name.clone(),
             success: false,
@@ -722,19 +691,9 @@ pub(crate) async fn execute_speak(call: &ToolCall) -> ToolResult {
         .unwrap_or("");
     let voice = call.arguments.get("voice").and_then(|v| v.as_str());
 
-    let request = diakonos_core::protocol::DiakonosRequest {
-        action: "speak_text".to_string(),
-        payload: serde_json::json!({
-            "text": text,
-            "voice": voice
-        }),
-    };
-
-    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
-        .await
-    {
-        Ok(response) if response.status == "success" => {
-            let result = response.data;
+    let hera = hera_execution_agent();
+    match hera.synthesize_speech(text, voice).await {
+        Ok(result) => {
             info!("🔊 [Hera] Speech synthesized");
             ToolResult {
                 name: call.name.clone(),
@@ -745,16 +704,6 @@ pub(crate) async fn execute_speak(call: &ToolCall) -> ToolResult {
                 ),
             }
         }
-        Ok(response) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: response
-                .data
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Diakonos TTS error")
-                .to_string(),
-        },
         Err(e) => ToolResult {
             name: call.name.clone(),
             success: false,
@@ -770,16 +719,9 @@ pub(crate) async fn execute_video(call: &ToolCall) -> ToolResult {
         .and_then(|p| p.as_str())
         .unwrap_or("A smooth cinematic video");
 
-    let request = diakonos_core::protocol::DiakonosRequest {
-        action: "generate_video".to_string(),
-        payload: serde_json::json!({ "prompt": prompt }),
-    };
-
-    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
-        .await
-    {
-        Ok(response) if response.status == "success" => {
-            let result = response.data;
+    let hera = hera_execution_agent();
+    match hera.synthesize_video(prompt).await {
+        Ok(result) => {
             info!("🎬 [Hera] Video generated");
             ToolResult {
                 name: call.name.clone(),
@@ -790,16 +732,6 @@ pub(crate) async fn execute_video(call: &ToolCall) -> ToolResult {
                 ),
             }
         }
-        Ok(response) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: response
-                .data
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Diakonos video error")
-                .to_string(),
-        },
         Err(e) => ToolResult {
             name: call.name.clone(),
             success: false,
@@ -824,20 +756,13 @@ pub(crate) async fn execute_read_file(call: &ToolCall) -> ToolResult {
             };
         }
     };
-    let request = diakonos_core::protocol::DiakonosRequest {
-        action: "read_file".to_string(),
-        payload: serde_json::json!({ "path": resolved_path }),
-    };
-
-    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
-        .await
-    {
-        Ok(response) if response.status == "success" => {
-            let truncated = response
-                .data
-                .get("content")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
+    match std::fs::read_to_string(&resolved_path) {
+        Ok(content) => {
+            let truncated = if content.len() > 16_000 {
+                format!("{}... (truncated)", &content[..16_000])
+            } else {
+                content
+            };
             info!("📄 [Hera] Read file: {}", resolved_path.display());
             ToolResult {
                 name: call.name.clone(),
@@ -849,16 +774,6 @@ pub(crate) async fn execute_read_file(call: &ToolCall) -> ToolResult {
                 ),
             }
         }
-        Ok(response) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: response
-                .data
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Diakonos read_file error")
-                .to_string(),
-        },
         Err(e) => ToolResult {
             name: call.name.clone(),
             success: false,
@@ -1243,33 +1158,12 @@ pub(crate) async fn execute_web_scraper(call: &ToolCall) -> ToolResult {
         };
     }
 
-    let request = diakonos_core::protocol::DiakonosRequest {
-        action: "web_scrape".to_string(),
-        payload: serde_json::json!({ "url": parsed_url.as_str() }),
-    };
-
-    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
-        .await
-    {
-        Ok(response) if response.status == "success" => ToolResult {
+    let hera = hera_execution_agent();
+    match hera.native_web_scrape(parsed_url.as_str()).await {
+        Ok(content) => ToolResult {
             name: call.name.clone(),
             success: true,
-            output: response
-                .data
-                .get("content")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        },
-        Ok(response) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: response
-                .data
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Diakonos web scrape error")
-                .to_string(),
+            output: content,
         },
         Err(e) => ToolResult {
             name: call.name.clone(),

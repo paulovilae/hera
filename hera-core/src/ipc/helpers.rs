@@ -1,5 +1,4 @@
 //! IPC helper functions — Memento integration, model origin inference, token estimation.
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn memento_request(action: &str, payload: serde_json::Value) -> serde_json::Value {
@@ -11,6 +10,31 @@ fn memento_request(action: &str, payload: serde_json::Value) -> serde_json::Valu
             "token": std::env::var("MEMENTO_CLIENT_TOKEN").ok()
         }
     })
+}
+
+async fn call_memento(action: &str, payload: serde_json::Value) -> Option<serde_json::Value> {
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_millis(1200),
+        tokio::net::UnixStream::connect("/tmp/memento.sock"),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    let msg = memento_request(action, payload);
+    stream.write_all(msg.to_string().as_bytes()).await.ok()?;
+    let _ = stream.shutdown().await;
+
+    let mut raw_bytes = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(2000),
+        stream.read_to_end(&mut raw_bytes),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    serde_json::from_slice::<serde_json::Value>(&raw_bytes).ok()
 }
 
 /// Infer whether the response came from a local or cloud engine.
@@ -88,6 +112,282 @@ pub async fn fetch_semantic_memory(app_name: &str) -> String {
         }
     }
     String::new()
+}
+
+pub async fn fetch_runtime_preflight(
+    app_id: &str,
+    route_profile: &str,
+    persona_path: &str,
+    mode: &str,
+) -> Option<serde_json::Value> {
+    if app_id.is_empty() {
+        return None;
+    }
+    call_memento(
+        "get_runtime_preflight",
+        serde_json::json!({
+            "app_id": app_id,
+            "route_profile": route_profile,
+            "persona_path": persona_path,
+            "mode": mode
+        }),
+    )
+    .await
+}
+
+pub async fn record_runtime_observation(payload: serde_json::Value) -> Option<serde_json::Value> {
+    call_memento("record_runtime_observation", payload).await
+}
+
+pub async fn promote_runtime_hint(payload: serde_json::Value) {
+    let _ = call_memento("promote_runtime_hint", payload).await;
+}
+
+pub async fn refresh_runtime_preflight(
+    app_id: &str,
+    route_profile: &str,
+    persona_path: &str,
+    mode: &str,
+    fallback: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    fetch_runtime_preflight(app_id, route_profile, persona_path, mode)
+        .await
+        .or(fallback)
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimePromotionContext<'a> {
+    pub preflight: Option<serde_json::Value>,
+    pub mode: &'a str,
+    pub app_id: &'a str,
+    pub route_profile: &'a str,
+    pub persona_path: &'a str,
+    pub session_id: &'a str,
+    pub trace_id: &'a str,
+    pub chat_id: &'a str,
+    pub current_budget_mode: &'a str,
+    pub persona_drift: bool,
+    pub success: bool,
+}
+
+pub async fn record_observation_and_promote_runtime_hint(
+    observation_payload: serde_json::Value,
+    context: RuntimePromotionContext<'_>,
+) {
+    let _ = record_runtime_observation(observation_payload).await;
+    let postflight = refresh_runtime_preflight(
+        context.app_id,
+        context.route_profile,
+        context.persona_path,
+        context.mode,
+        context.preflight,
+    )
+    .await;
+
+    if let Some(hint_payload) = maybe_build_runtime_hint_promotion(
+        postflight.as_ref(),
+        context.app_id,
+        context.route_profile,
+        context.session_id,
+        context.trace_id,
+        context.chat_id,
+        context.current_budget_mode,
+        context.persona_drift,
+        context.success,
+    ) {
+        promote_runtime_hint(hint_payload).await;
+    } else if let Some(hint_payload) = maybe_build_negative_runtime_hint_promotion(
+        postflight.as_ref(),
+        context.app_id,
+        context.route_profile,
+        context.session_id,
+        context.trace_id,
+        context.chat_id,
+        context.current_budget_mode,
+        context.persona_drift,
+    ) {
+        promote_runtime_hint(hint_payload).await;
+    }
+}
+
+pub async fn save_agent_run_summary(payload: serde_json::Value) {
+    let _ = call_memento("save_agent_run_summary", payload).await;
+}
+
+fn learned_hint_in_cooldown(preflight: &serde_json::Value) -> bool {
+    preflight
+        .get("learned_hints")
+        .and_then(|value| value.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+}
+
+pub fn maybe_build_runtime_hint_promotion(
+    preflight: Option<&serde_json::Value>,
+    app_id: &str,
+    route_profile: &str,
+    session_id: &str,
+    trace_id: &str,
+    chat_id: &str,
+    current_budget_mode: &str,
+    persona_drift: bool,
+    success: bool,
+) -> Option<serde_json::Value> {
+    if !success || persona_drift || app_id.is_empty() || route_profile.is_empty() {
+        return None;
+    }
+
+    let preflight = preflight?;
+    let recommended_budget_mode = preflight
+        .get("recommended_budget_mode")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if recommended_budget_mode != current_budget_mode {
+        return None;
+    }
+
+    if learned_hint_in_cooldown(preflight) {
+        return None;
+    }
+
+    let matching_observation_count = preflight
+        .get("matching_observation_count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    if matching_observation_count < 2 {
+        return None;
+    }
+
+    if preflight
+        .get("known_regressions")
+        .and_then(|value| value.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let has_equivalent_hint = preflight
+        .get("learned_hints")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items.iter().any(|item| {
+                item.pointer("/data/recommended_budget_mode")
+                    .and_then(|value| value.as_str())
+                    == Some(current_budget_mode)
+            })
+        })
+        .unwrap_or(false);
+    if has_equivalent_hint {
+        return None;
+    }
+
+    let source_record_id = preflight
+        .pointer("/latest_observation/record_id")
+        .and_then(|value| value.as_i64());
+    let health_status = preflight
+        .get("health_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let title = format!("{} {} stable runtime hint", app_id, route_profile);
+    let content = format!(
+        "Promoted stable runtime hint for {} / {} after {} prior healthy observations. Keep context budget mode {}. health_status={}.",
+        app_id, route_profile, matching_observation_count, current_budget_mode, health_status
+    );
+
+    Some(serde_json::json!({
+        "app_id": app_id,
+        "route_profile": route_profile,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "chat_id": chat_id,
+        "recommended_budget_mode": current_budget_mode,
+        "title": title,
+        "content": content,
+        "hint_kind": "positive",
+        "hint_ttl_hours": 24,
+        "confidence": 0.91,
+        "source_record_id": source_record_id
+    }))
+}
+
+pub fn maybe_build_negative_runtime_hint_promotion(
+    preflight: Option<&serde_json::Value>,
+    app_id: &str,
+    route_profile: &str,
+    session_id: &str,
+    trace_id: &str,
+    chat_id: &str,
+    current_budget_mode: &str,
+    persona_drift: bool,
+) -> Option<serde_json::Value> {
+    if persona_drift || app_id.is_empty() || route_profile.is_empty() {
+        return None;
+    }
+
+    let preflight = preflight?;
+    if learned_hint_in_cooldown(preflight) {
+        return None;
+    }
+
+    let recommended_budget_mode = preflight
+        .get("recommended_budget_mode")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if recommended_budget_mode == current_budget_mode {
+        return None;
+    }
+
+    let regressions = preflight
+        .get("known_regressions")
+        .and_then(|value| value.as_array())?;
+    if regressions.len() < 2 {
+        return None;
+    }
+
+    let has_equivalent_hint = preflight
+        .get("learned_hints")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items.iter().any(|item| {
+                item.pointer("/data/recommended_budget_mode")
+                    .and_then(|value| value.as_str())
+                    == Some(recommended_budget_mode)
+            })
+        })
+        .unwrap_or(false);
+    if has_equivalent_hint {
+        return None;
+    }
+
+    let source_record_id = preflight
+        .pointer("/latest_observation/record_id")
+        .and_then(|value| value.as_i64());
+    let title = format!(
+        "{} {} avoid {} budget hint",
+        app_id, route_profile, current_budget_mode
+    );
+    let content = format!(
+        "Avoid context budget mode {} for {} / {}. Repeated regressions observed; prefer {} instead.",
+        current_budget_mode, app_id, route_profile, recommended_budget_mode
+    );
+
+    Some(serde_json::json!({
+        "app_id": app_id,
+        "route_profile": route_profile,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "chat_id": chat_id,
+        "recommended_budget_mode": recommended_budget_mode,
+        "title": title,
+        "content": content,
+        "hint_kind": "negative",
+        "hint_ttl_hours": 12,
+        "confidence": 0.93,
+        "source_record_id": source_record_id
+    }))
 }
 
 /// Fetch live DB schema from Memento for injection into tool context.

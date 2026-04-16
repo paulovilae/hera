@@ -11,6 +11,14 @@ fn allowed_pm2_service_name(input: &str) -> Option<String> {
         return None;
     }
 
+    let normalize_key = |value: &str| -> String {
+        value
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .flat_map(|ch| ch.to_lowercase())
+            .collect()
+    };
+
     if let Some(slug) = canonicalize_app_slug(trimmed) {
         return Some(pm2_process_name_for_slug(&slug).to_string());
     }
@@ -24,8 +32,8 @@ fn allowed_pm2_service_name(input: &str) -> Option<String> {
         "hera-core",
         "memento-node",
         "argus",
-        "diakonos",
         "os-v3",
+        "imaginclaw",
         "desktop-rust",
         "movilo",
         "vetra-rust",
@@ -34,10 +42,83 @@ fn allowed_pm2_service_name(input: &str) -> Option<String> {
         "paulo-vila",
     ];
 
-    core_services
-        .iter()
-        .find(|candidate| **candidate == sanitized)
-        .map(|value| (*value).to_string())
+    let sanitized_key = normalize_key(&sanitized);
+
+    for candidate in core_services {
+        if candidate == sanitized {
+            return Some(candidate.to_string());
+        }
+
+        let mut aliases = vec![
+            candidate.to_string(),
+            candidate.replace('-', " "),
+            candidate.replace('_', " "),
+        ];
+
+        if let Some(slug) = canonicalize_app_slug(candidate) {
+            aliases.extend(canonical_app_search_terms(&slug));
+        }
+
+        if candidate == "imaginclaw" {
+            aliases.extend([
+                "ava".to_string(),
+                "imagineclaw".to_string(),
+                "imaginary-claw".to_string(),
+                "imaginary claw".to_string(),
+            ]);
+        }
+
+        if aliases
+            .into_iter()
+            .any(|alias| normalize_key(&alias) == sanitized_key)
+        {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+fn aliases_for_process_owner(owner: &str) -> Vec<String> {
+    let lower = owner.trim().to_lowercase();
+    let mut aliases = canonical_app_search_terms(&lower);
+
+    for candidate in [
+        lower.clone(),
+        lower.replace('_', "-"),
+        lower.replace("-v3", ""),
+        lower.replace("-cli", ""),
+        lower.replace("-cl", ""),
+        lower.replace("-c", ""),
+        lower.replace("_rust-cl", ""),
+        lower.replace("-rust-cl", ""),
+        lower.replace("_rust", ""),
+        lower.replace("-rust", ""),
+    ] {
+        let normalized = candidate.trim_matches('-').trim_matches('_').to_string();
+        if normalized.is_empty() {
+            continue;
+        }
+        if let Some(slug) = canonicalize_app_slug(&normalized) {
+            for alias in canonical_app_search_terms(&slug) {
+                if !aliases.contains(&alias) {
+                    aliases.push(alias);
+                }
+            }
+        }
+        let collapsed = normalized.replace(['-', '_'], "");
+        if !collapsed.is_empty() && !aliases.contains(&collapsed) {
+            aliases.push(collapsed);
+        }
+        if normalized == "imaginclaw" && !aliases.contains(&"ava".to_string()) {
+            aliases.push("ava".to_string());
+        }
+        if !aliases.contains(&normalized) {
+            aliases.push(normalized);
+        }
+    }
+
+    aliases
 }
 
 pub(crate) async fn execute_caddy_domain_manager(call: &ToolCall) -> ToolResult {
@@ -373,7 +454,7 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
     for (port, hosts) in &unique_ports {
         if let Some(owner) = port_owners.get(port) {
             // Check if the owner process name matches what we'd expect
-            let owner_aliases = canonical_app_search_terms(owner);
+            let owner_aliases = aliases_for_process_owner(owner);
             let expected_any = hosts
                 .iter()
                 .any(|h| text_contains_app_alias(h, &owner_aliases));
@@ -804,6 +885,7 @@ pub(crate) async fn execute_service_restart(call: &ToolCall) -> ToolResult {
     };
 
     let mut report = String::new();
+    let delayed_self_restart = sanitized == "imaginclaw";
 
     // Step 1: Capture pre-restart state
     let pre_status = std::process::Command::new("pm2")
@@ -847,6 +929,40 @@ pub(crate) async fn execute_service_restart(call: &ToolCall) -> ToolResult {
     }
 
     // Step 4: Execute restart
+    if delayed_self_restart {
+        let delayed_command = format!("sleep 3; pm2 restart {} >/dev/null 2>&1", sanitized);
+        match std::process::Command::new("sh")
+            .args(["-lc", &delayed_command])
+            .spawn()
+        {
+            Ok(_) => {
+                report.push_str(&format!(
+                    "\n✅ Service '{}' restart scheduled. The current Imaginclaw request will finish before PM2 restarts the process.",
+                    sanitized
+                ));
+                info!(
+                    "🔧 [Hera] Scheduled delayed self-restart for '{}'",
+                    sanitized
+                );
+                return ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: report,
+                };
+            }
+            Err(error) => {
+                return ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!(
+                        "Failed to schedule delayed restart for '{}': {}",
+                        sanitized, error
+                    ),
+                };
+            }
+        }
+    }
+
     match std::process::Command::new("pm2")
         .args(["restart", &sanitized])
         .output()
@@ -912,6 +1028,27 @@ pub(crate) async fn execute_service_restart(call: &ToolCall) -> ToolResult {
             success: false,
             output: format!("Failed to execute pm2 restart: {}", e),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allowed_pm2_service_name;
+
+    #[test]
+    fn restart_allowlist_accepts_imaginclaw_aliases() {
+        assert_eq!(
+            allowed_pm2_service_name("imaginclaw").as_deref(),
+            Some("imaginclaw")
+        );
+        assert_eq!(
+            allowed_pm2_service_name("ava").as_deref(),
+            Some("imaginclaw")
+        );
+        assert_eq!(
+            allowed_pm2_service_name("imaginary-claw").as_deref(),
+            Some("imaginclaw")
+        );
     }
 }
 

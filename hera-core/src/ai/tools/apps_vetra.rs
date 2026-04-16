@@ -399,46 +399,42 @@ pub(crate) async fn execute_workflow(call: &ToolCall) -> ToolResult {
         };
     }
 
-    let request = diakonos_core::protocol::DiakonosRequest {
-        action: "execute_workflow_proxy".to_string(),
-        payload: serde_json::json!({
-            "app": app,
-            "workflow": workflow,
-            "payload": payload
-        }),
-    };
-
+    let url = format!("http://127.0.0.1:3006/execute/{}/{}", app, workflow);
     info!(
-        "🚀 [Hera] Delegating workflow execution to Diakonos: {}/{}",
+        "🚀 [Hera] Executing workflow via Argus: {}/{}",
         app, workflow
     );
 
-    match diakonos_core::client::send_request(diakonos_core::client::DIAKONOS_SOCKET, &request)
-        .await
-    {
-        Ok(response) if response.status == "success" => ToolResult {
-            name: call.name.clone(),
-            success: true,
-            output: serde_json::to_string_pretty(&response.data).unwrap_or_default(),
-        },
-        Ok(response) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: response
-                .data
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Diakonos returned an unknown error")
-                .to_string(),
-        },
+    match reqwest::Client::new().post(&url).json(payload).send().await {
+        Ok(response) if response.status().is_success() => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let parsed = serde_json::from_str::<Value>(&body)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": body }));
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: serde_json::to_string_pretty(&serde_json::json!({
+                    "status": status.as_u16(),
+                    "url": url,
+                    "body": parsed
+                }))
+                .unwrap_or_default(),
+            }
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Argus returned status {}: {}", status, body),
+            }
+        }
         Err(error) => ToolResult {
             name: call.name.clone(),
             success: false,
-            output: format!(
-                "Failed to reach Diakonos at {}: {}",
-                diakonos_core::client::DIAKONOS_SOCKET,
-                error
-            ),
+            output: format!("Failed to reach Argus workflow endpoint: {}", error),
         },
     }
 }
