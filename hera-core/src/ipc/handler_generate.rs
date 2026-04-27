@@ -11,6 +11,7 @@ use super::helpers::{
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
     FollowupStrategy, contextualize_tool_call, execute_parsed_tool_calls, execute_tool_followup,
+    summarize_tool_output_for_user, try_plan_schema_query,
 };
 use super::types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
 use std::time::Instant;
@@ -66,13 +67,14 @@ pub async fn handle_generate(
                     "🚀 [Hera IPC] Fast-path tool intent detected: {}",
                     contextual_tool_call.name
                 );
-                let tool_result =
-                    crate::ai::tool_executor::execute_tool(&contextual_tool_call).await;
+                let fast_path_result = crate::ai::tool_executor::execute_tool(&contextual_tool_call)
+                    .await
+                    .output;
 
                 let res = IpcResponse {
                     status: "success".to_string(),
                     data: serde_json::json!({
-                        "result": tool_result.output,
+                        "result": fast_path_result,
                         "origin": "tool",
                         "model": contextual_tool_call.name,
                         "tool_calls": [contextual_tool_call]
@@ -95,6 +97,41 @@ pub async fn handle_generate(
                 "⚠️ [Hera IPC] Explicit command was not recognized by fast-path: {}",
                 fast_path_prompt.trim()
             );
+        }
+    }
+
+    if let Some(planned_call) = try_plan_schema_query(&state.engine, &parsed).await {
+        let contextual_tool_call = contextualize_tool_call(&planned_call, &parsed);
+        if crate::ai::tool_executor::permissions_allow_tool(
+            &parsed.permissions,
+            &contextual_tool_call.name,
+        ) {
+            tracing::info!(
+                "🧠 [Hera IPC] Generic schema query plan generated for app '{}'",
+                parsed.app_name
+            );
+            let tool_result = crate::ai::tool_executor::execute_tool(&contextual_tool_call)
+                .await
+                .output;
+            let result_text = summarize_tool_output_for_user(&state.engine, &parsed, &tool_result)
+                .await
+                .unwrap_or(tool_result);
+
+            let res = IpcResponse {
+                status: "success".to_string(),
+                data: serde_json::json!({
+                    "result": result_text,
+                    "origin": "tool",
+                    "model": contextual_tool_call.name,
+                    "tool_calls": [contextual_tool_call]
+                }),
+            };
+            let mut res_str = serde_json::to_string(&res).unwrap();
+            res_str.push('\n');
+            if let Err(e) = stream.write_all(res_str.as_bytes()).await {
+                tracing::error!("❌ Failed to write IPC response for schema planner tool: {}", e);
+            }
+            return HandlerOutcome::DirectResponse;
         }
     }
 

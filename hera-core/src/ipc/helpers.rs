@@ -416,6 +416,16 @@ pub async fn fetch_db_schema_context(agent_identity: &str, app_name: &str) -> St
 
 /// Fetch schema for a single app from Memento.
 pub async fn fetch_single_app_schema(app_slug: &str) -> String {
+    fetch_single_app_schema_json(app_slug)
+        .await
+        .as_ref()
+        .map(|schema| format_schema_for_prompt(app_slug, schema))
+        .unwrap_or_default()
+}
+
+pub async fn fetch_single_app_schema_json(
+    app_slug: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     if let Ok(Ok(mut stream)) = tokio::time::timeout(
         std::time::Duration::from_millis(2000),
         tokio::net::UnixStream::connect("/tmp/memento.sock"),
@@ -438,12 +448,12 @@ pub async fn fetch_single_app_schema(app_slug: &str) -> String {
                     && resp.get("status").and_then(|s| s.as_str()) == Some("success")
                     && let Some(schema) = resp.get("schema").and_then(|s| s.as_object())
                 {
-                    return format_schema_for_prompt(app_slug, schema);
+                    return Some(schema.clone());
                 }
             }
         }
     }
-    String::new()
+    None
 }
 
 /// Fetch schemas for ALL registered apps from Memento.

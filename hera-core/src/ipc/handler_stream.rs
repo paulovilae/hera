@@ -11,6 +11,7 @@ use super::helpers::{
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
     FollowupStrategy, contextualize_tool_call, execute_parsed_tool_calls, execute_tool_followup,
+    summarize_tool_output_for_user, try_plan_schema_query,
 };
 use super::types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
 use std::time::Instant;
@@ -58,12 +59,13 @@ pub async fn handle_generate_stream(
                 str_msg.push('\n');
                 let _ = stream.write_all(str_msg.as_bytes()).await;
 
-                let tool_result =
-                    crate::ai::tool_executor::execute_tool(&contextual_tool_call).await;
+                let tool_result = crate::ai::tool_executor::execute_tool(&contextual_tool_call)
+                    .await
+                    .output;
 
                 let chunk_msg = IpcResponse {
                     status: "chunk".to_string(),
-                    data: serde_json::json!({"text": tool_result.output}),
+                    data: serde_json::json!({"text": tool_result}),
                 };
                 let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
                 cstr.push('\n');
@@ -78,6 +80,51 @@ pub async fn handle_generate_stream(
                 let _ = stream.write_all(dstr.as_bytes()).await;
                 return HandlerOutcome::DirectResponse;
             }
+        }
+    }
+
+    if let Some(planned_call) = try_plan_schema_query(&state.engine, &parsed).await {
+        let contextual_tool_call = contextualize_tool_call(&planned_call, &parsed);
+        if crate::ai::tool_executor::permissions_allow_tool(
+            &parsed.permissions,
+            &contextual_tool_call.name,
+        ) {
+            tracing::info!(
+                "🧠 [Hera IPC Stream] Generic schema query plan generated for app '{}'",
+                parsed.app_name
+            );
+
+            let status_msg = IpcResponse {
+                status: "tool_status".to_string(),
+                data: serde_json::json!({"name": contextual_tool_call.name.clone()}),
+            };
+            let mut str_msg = serde_json::to_string(&status_msg).unwrap();
+            str_msg.push('\n');
+            let _ = stream.write_all(str_msg.as_bytes()).await;
+
+            let tool_result = crate::ai::tool_executor::execute_tool(&contextual_tool_call)
+                .await
+                .output;
+            let result_text = summarize_tool_output_for_user(&state.engine, &parsed, &tool_result)
+                .await
+                .unwrap_or(tool_result);
+
+            let chunk_msg = IpcResponse {
+                status: "chunk".to_string(),
+                data: serde_json::json!({"text": result_text}),
+            };
+            let mut cstr = serde_json::to_string(&chunk_msg).unwrap();
+            cstr.push('\n');
+            let _ = stream.write_all(cstr.as_bytes()).await;
+
+            let done_msg = IpcResponse {
+                status: "done".to_string(),
+                data: serde_json::json!({}),
+            };
+            let mut dstr = serde_json::to_string(&done_msg).unwrap();
+            dstr.push('\n');
+            let _ = stream.write_all(dstr.as_bytes()).await;
+            return HandlerOutcome::DirectResponse;
         }
     }
 

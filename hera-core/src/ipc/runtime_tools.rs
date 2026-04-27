@@ -1,7 +1,7 @@
 use super::context::ParsedPayload;
-use super::helpers::infer_origin_from_model;
+use super::helpers::{fetch_single_app_schema_json, infer_origin_from_model};
 use super::types::IpcResponse;
-use crate::ai::{ChatRequest, LLMEngine};
+use crate::ai::{ChatMessage, ChatRequest, LLMEngine, MessageContent};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -125,6 +125,244 @@ pub async fn execute_parsed_tool_calls(
         has_media_call,
     }
 }
+
+pub async fn try_plan_schema_query(
+    engine: &Arc<dyn LLMEngine + Send + Sync>,
+    parsed: &ParsedPayload,
+) -> Option<crate::ai::tool_executor::ToolCall> {
+    if parsed.app_name.is_empty()
+        || !parsed.permissions.iter().any(|perm| perm == "memento_query")
+        || parsed.prompt.trim().is_empty()
+        || parsed.prompt.trim_start().starts_with('/')
+    {
+        return None;
+    }
+
+    let schema = fetch_single_app_schema_json(&parsed.app_name).await?;
+    if schema.is_empty() {
+        return None;
+    }
+
+    let conversation_context = if parsed.recent_messages.is_empty() {
+        String::new()
+    } else {
+        let start = parsed.recent_messages.len().saturating_sub(6);
+        let excerpt = parsed.recent_messages[start..]
+            .iter()
+            .map(|(role, content)| format!("{role}: {content}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\nRecent conversation:\n{}", excerpt)
+    };
+
+    let schema_json = serde_json::to_string_pretty(&schema).ok()?;
+    let planner_system = format!(
+        "You are Hera's generic schema-aware query planner.\n\
+Return only one raw JSON object.\n\
+Never explain. Never use markdown. Never emit <tool_call> tags.\n\
+Given an app schema and a user request, decide whether a SQL query is required.\n\
+Allowed output schema:\n\
+{{\"should_query\":true,\"query\":\"SELECT ...\",\"limit\":50,\"reason\":\"short\"}}\n\
+or\n\
+{{\"should_query\":false,\"reason\":\"short\"}}\n\
+Rules:\n\
+- SQL must be SELECT or WITH only.\n\
+- Use only tables and columns present in the schema.\n\
+- Prefer concise queries.\n\
+- If aggregating numeric columns with SUM/AVG, CAST the aggregate to double precision so JSON transport stays typed.\n\
+- If the user asks for grouping, include grouped dimensions.\n\
+- Resolve ambiguous follow-up questions using the recent conversation when it is provided.\n\
+- If the request can be answered without data access, set should_query=false.\n\
+App: {}{}\nSchema:\n{}",
+        parsed.app_name, conversation_context, schema_json
+    );
+
+    let req = ChatRequest {
+        model: "hera-local-model".to_string(),
+        vision_model: None,
+        tts_model: None,
+        stt_model: None,
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: MessageContent::Text(planner_system),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text(parsed.prompt.clone()),
+            },
+        ],
+        temperature: Some(0.0),
+        max_tokens: Some(300),
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        repeat_penalty: None,
+        seed: None,
+        stop: None,
+        endpoint: None,
+        api_key: None,
+        provider: Some("local".to_string()),
+        stream: Some(false),
+        nsfw: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("medium".to_string()),
+    };
+
+    let resp = engine.generate_content(req).await.ok()?;
+    let content = resp
+        .choices
+        .first()
+        .and_then(|choice| choice.message.content.clone())?;
+    let plan_value = parse_first_json_object(&content)?;
+
+    if !plan_value
+        .get("should_query")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let query = plan_value.get("query").and_then(|value| value.as_str())?;
+    if !is_safe_select_query(query, &schema) {
+        tracing::warn!(
+            app = %parsed.app_name,
+            "Rejected schema planner query because validation failed: {}",
+            query
+        );
+        return None;
+    }
+
+    Some(crate::ai::tool_executor::ToolCall {
+        name: "memento_query".to_string(),
+        arguments: serde_json::json!({
+            "app": parsed.app_name,
+            "query": query,
+            "limit": plan_value.get("limit").and_then(|value| value.as_u64()).unwrap_or(50)
+        }),
+    })
+}
+
+pub async fn summarize_tool_output_for_user(
+    engine: &Arc<dyn LLMEngine + Send + Sync>,
+    parsed: &ParsedPayload,
+    tool_output: &str,
+) -> Option<String> {
+    let req = ChatRequest {
+        model: "hera-local-model".to_string(),
+        vision_model: None,
+        tts_model: None,
+        stt_model: None,
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: MessageContent::Text(
+                    "You are Hera. Summarize tool results for the user in the same language as the original question. Be concise, clear, and directly answer the request. Do not mention SQL, tables, or internal tools.".to_string(),
+                ),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text(format!(
+                    "Original request:\n{}\n\nTool result:\n{}",
+                    parsed.prompt, tool_output
+                )),
+            },
+        ],
+        temperature: Some(0.1),
+        max_tokens: Some(300),
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        repeat_penalty: None,
+        seed: None,
+        stop: None,
+        endpoint: None,
+        api_key: None,
+        provider: Some("local".to_string()),
+        stream: Some(false),
+        nsfw: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: Some("low".to_string()),
+    };
+
+    let resp = engine.generate_content(req).await.ok()?;
+    resp.choices
+        .first()
+        .and_then(|choice| choice.message.content.clone())
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn parse_first_json_object(text: &str) -> Option<serde_json::Value> {
+    let trimmed = if let Some(end_idx) = text.find("</think>") {
+        text[end_idx + "</think>".len()..].trim()
+    } else {
+        text.trim()
+    };
+
+    let start = trimmed.find('{')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end = None;
+
+    for (idx, ch) in trimmed[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + idx + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end = end?;
+    serde_json::from_str::<serde_json::Value>(&trimmed[start..end]).ok()
+}
+
+fn is_safe_select_query(
+    query: &str,
+    schema: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let normalized = query.trim().to_lowercase();
+    if !(normalized.starts_with("select") || normalized.starts_with("with")) {
+        return false;
+    }
+    if normalized.contains(';') {
+        return false;
+    }
+    for forbidden in ["insert ", "update ", "delete ", "drop ", "alter ", "truncate "] {
+        if normalized.contains(forbidden) {
+            return false;
+        }
+    }
+
+    let known_tables: Vec<String> = schema.keys().cloned().collect();
+    known_tables.iter().any(|table| normalized.contains(table))
+}
+
 
 pub async fn execute_tool_followup(
     engine: &Arc<dyn LLMEngine + Send + Sync>,

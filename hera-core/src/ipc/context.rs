@@ -47,6 +47,7 @@ pub struct PreparedRuntimeContext {
 pub struct ParsedPayload {
     pub prompt: String,
     pub assistant_last: Option<String>,
+    pub recent_messages: Vec<(String, String)>,
     pub permissions: Vec<String>,
     pub persona_path: String,
     pub app_name: String,
@@ -540,10 +541,23 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         .unwrap_or("")
         .to_string();
     let mut assistant_last: Option<String> = None;
+    let mut recent_messages: Vec<(String, String)> = Vec::new();
 
     // Extract prompt from messages array if not provided directly
     if prompt.is_empty() {
         if let Some(messages) = payload.get("messages").and_then(|m| m.as_array()) {
+            recent_messages = messages
+                .iter()
+                .filter_map(|message| {
+                    let role = message.get("role").and_then(|value| value.as_str())?;
+                    let content = message.get("content").and_then(extract_message_text)?;
+                    let trimmed = content.trim().to_string();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    Some((role.to_string(), trimmed))
+                })
+                .collect();
             let mut latest_user_index: Option<usize> = None;
             for (index, message) in messages.iter().enumerate().rev() {
                 if let Some("user") = message.get("role").and_then(|value| value.as_str())
@@ -617,6 +631,7 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
     ParsedPayload {
         prompt,
         assistant_last,
+        recent_messages,
         permissions,
         persona_path,
         app_name,
@@ -687,7 +702,7 @@ pub async fn build_full_system_prompt(
     let json_directive = if lightweight_mode {
         ""
     } else {
-        "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be ONLY the raw JSON tool call. DO NOT write conversational text or explanations before or after the JSON tool block. The UI stream will crash if text and code logic bleed together."
+        "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be EXACTLY this format, with NO conversational text: <tool_call>{\"name\": \"function_name\", \"arguments\": {\"arg1\": \"val\"}}</tool_call>"
     };
     let language_directive = match language_hint {
         "es" => "\nLANGUAGE RULE: Respond in Spanish unless the user explicitly switches language.",
