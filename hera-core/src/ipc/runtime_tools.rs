@@ -154,6 +154,26 @@ pub async fn try_plan_schema_query(
             .join("\n");
         format!("\nRecent conversation:\n{}", excerpt)
     };
+    let runtime_context = {
+        let mut lines = Vec::new();
+        if !parsed.sender_name.is_empty() {
+            lines.push(format!("sender_name: {}", parsed.sender_name));
+        }
+        if !parsed.page_title.is_empty() {
+            lines.push(format!("page_title: {}", parsed.page_title));
+        }
+        if !parsed.page_url.is_empty() {
+            lines.push(format!("page_url: {}", parsed.page_url));
+        }
+        if !parsed.page_context.is_empty() {
+            lines.push(format!("page_context: {}", parsed.page_context));
+        }
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("\nRuntime context:\n{}", lines.join("\n"))
+        }
+    };
 
     let schema_json = serde_json::to_string_pretty(&schema).ok()?;
     let planner_system = format!(
@@ -172,9 +192,11 @@ Rules:\n\
 - If aggregating numeric columns with SUM/AVG, CAST the aggregate to double precision so JSON transport stays typed.\n\
 - If the user asks for grouping, include grouped dimensions.\n\
 - Resolve ambiguous follow-up questions using the recent conversation when it is provided.\n\
+- Use runtime context (current debtor/account/page context) when it identifies the subject of the request.\n\
+- If runtime context already identifies the debtor or account reference, prefer that context instead of asking the user to repeat it.\n\
 - If the request can be answered without data access, set should_query=false.\n\
-App: {}{}\nSchema:\n{}",
-        parsed.app_name, conversation_context, schema_json
+App: {}{}{}\nSchema:\n{}",
+        parsed.app_name, conversation_context, runtime_context, schema_json
     );
 
     let req = ChatRequest {

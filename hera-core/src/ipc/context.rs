@@ -55,6 +55,11 @@ pub struct ParsedPayload {
     pub trace_id: String,
     pub session_id: String,
     pub chat_id: String,
+    pub app_id: String,
+    pub sender_name: String,
+    pub page_url: String,
+    pub page_title: String,
+    pub page_context: String,
     pub route_profile_id: String,
     pub expected_persona_path: String,
     pub persona_drift: bool,
@@ -117,6 +122,11 @@ pub async fn prepare_runtime_execution_context(
         &parsed.context_budget,
         lightweight_mode,
         &parsed.language_hint,
+        &parsed.app_id,
+        &parsed.sender_name,
+        &parsed.page_url,
+        &parsed.page_title,
+        &parsed.page_context,
     )
     .await;
 
@@ -618,6 +628,11 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
     let trace_id = extract_optional_string(payload, "trace_id");
     let session_id = extract_optional_string(payload, "session_id");
     let chat_id = extract_optional_string(payload, "chat_id");
+    let app_id = extract_optional_string(payload, "app_id");
+    let sender_name = extract_optional_string(payload, "sender_name");
+    let page_url = extract_optional_string(payload, "page_url");
+    let page_title = extract_optional_string(payload, "page_title");
+    let page_context = extract_optional_string(payload, "page_context");
     let context_budget = if payload.get("context_budget_mode").is_some()
         || payload.get("context_budget").is_some()
     {
@@ -639,6 +654,11 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         trace_id,
         session_id,
         chat_id,
+        app_id,
+        sender_name,
+        page_url,
+        page_title,
+        page_context,
         route_profile_id: route_profile.id.to_string(),
         expected_persona_path: route_profile.persona_path.to_string(),
         persona_drift,
@@ -656,6 +676,11 @@ pub async fn build_full_system_prompt(
     budget: &ContextBudget,
     lightweight_mode: bool,
     language_hint: &str,
+    app_id: &str,
+    sender_name: &str,
+    page_url: &str,
+    page_title: &str,
+    page_context: &str,
 ) -> PromptAssembly {
     let memento_ctx = if budget.include_memory {
         clamp_chars(
@@ -714,15 +739,40 @@ pub async fn build_full_system_prompt(
             "\nLANGUAGE RULE: Respond in the same language used by the user in their latest message. If the message is mixed, prefer the dominant language and keep the answer consistent."
         }
     };
+    let mut runtime_context_lines = Vec::new();
+    if !app_id.is_empty() {
+        runtime_context_lines.push(format!("widget_app_id: {}", app_id));
+    }
+    if !sender_name.is_empty() {
+        runtime_context_lines.push(format!("sender_name: {}", sender_name));
+    }
+    if !page_title.is_empty() {
+        runtime_context_lines.push(format!("page_title: {}", page_title));
+    }
+    if !page_url.is_empty() {
+        runtime_context_lines.push(format!("page_url: {}", page_url));
+    }
+    if !page_context.is_empty() {
+        runtime_context_lines.push(format!("page_context: {}", page_context));
+    }
+    let runtime_context_directive = if runtime_context_lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nRUNTIME CONTEXT:\n{}\nUse this runtime context when relevant, but do not invent facts beyond it.",
+            runtime_context_lines.join("\n")
+        )
+    };
 
     let system_prompt = format!(
-        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}",
+        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}",
         base_system_prompt,
         schemas,
         db_schema_ctx,
         think_directive,
         json_directive,
-        language_directive
+        language_directive,
+        runtime_context_directive
     );
 
     PromptAssembly {
