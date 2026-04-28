@@ -194,6 +194,8 @@ Rules:\n\
 - Resolve ambiguous follow-up questions using the recent conversation when it is provided.\n\
 - Use runtime context (current debtor/account/page context) when it identifies the subject of the request.\n\
 - If runtime context already identifies the debtor or account reference, prefer that context instead of asking the user to repeat it.\n\
+- If runtime context includes an exact identifier such as *_id, document_id, account_reference, reference, uuid, or pid, prefer filtering with that exact identifier over human names.\n\
+- Avoid filtering by name alone when runtime context already includes a more specific identifier.\n\
 - If the request can be answered without data access, set should_query=false.\n\
 App: {}{}{}\nSchema:\n{}",
         parsed.app_name, conversation_context, runtime_context, schema_json
