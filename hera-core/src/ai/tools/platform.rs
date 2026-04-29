@@ -1000,8 +1000,23 @@ edition = "2021"
             },
         }
     } else if lang.to_lowercase() == "python" {
+        // Sanitize LLM-generated code: strip single spurious leading spaces.
+        // Local models occasionally emit lines with exactly 1 leading space on
+        // what should be top-level statements (e.g. " y = np.sin(x)").
+        // Real Python indentation uses 2+ spaces; 1-space is almost always an LLM error.
+        let sanitized: String = code
+            .lines()
+            .map(|line| {
+                if line.starts_with(' ') && !line.starts_with("  ") {
+                    line.trim_start_matches(' ')
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let p = format!("{}/{}.py", beans_dir, bean_name);
-        if let Err(e) = std::fs::write(&p, code) {
+        if let Err(e) = std::fs::write(&p, &sanitized) {
             return ToolResult {
                 name: call.name.clone(),
                 success: false,
