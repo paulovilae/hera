@@ -2,6 +2,7 @@ use super::context::ParsedPayload;
 use super::helpers::{fetch_single_app_schema_json, infer_origin_from_model};
 use super::types::IpcResponse;
 use crate::ai::{ChatMessage, ChatRequest, LLMEngine, MessageContent};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -116,7 +117,7 @@ pub async fn execute_parsed_tool_calls(
             call.name.as_str(),
             "hera_draw" | "hera_video" | "generate_qr_code"
         )
-    });
+    }) || execution_outputs.contains("MEDIA: ");
 
     ToolExecutionSummary {
         execution_outputs,
@@ -129,6 +130,312 @@ pub async fn execute_parsed_tool_calls(
 pub async fn try_plan_schema_query(
     engine: &Arc<dyn LLMEngine + Send + Sync>,
     parsed: &ParsedPayload,
+) -> Option<crate::ai::tool_executor::ToolCall> {
+    plan_schema_query_internal(engine, parsed, None).await
+}
+
+pub async fn retry_plan_schema_query(
+    engine: &Arc<dyn LLMEngine + Send + Sync>,
+    parsed: &ParsedPayload,
+    previous_query: &str,
+    previous_result: &str,
+) -> Option<crate::ai::tool_executor::ToolCall> {
+    let feedback = format!(
+        "Previous query attempt:\n{}\n\nPrevious result:\n{}\n\n\
+Choose a different table/column strategy if the previous query failed, referenced a missing column, \
+or returned zero rows despite the runtime context identifying the subject.",
+        previous_query, previous_result
+    );
+    let replanned = plan_schema_query_internal(engine, parsed, Some(&feedback)).await?;
+    let new_query = replanned
+        .arguments
+        .get("query")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    if new_query.eq_ignore_ascii_case(previous_query.trim()) {
+        return None;
+    }
+    Some(replanned)
+}
+
+fn normalized_slug(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn structured_runtime_context(parsed: &ParsedPayload) -> String {
+    let mut lines = Vec::new();
+    let mut workspace_user = None;
+    let mut workspace_company_slug = None;
+    if !parsed.sender_name.is_empty() {
+        lines.push(format!("sender_name: {}", parsed.sender_name));
+    }
+    if !parsed.page_title.is_empty() {
+        lines.push(format!("page_title: {}", parsed.page_title));
+    }
+    if !parsed.page_url.is_empty() {
+        lines.push(format!("page_url: {}", parsed.page_url));
+    }
+    if !parsed.page_context.is_empty() {
+        lines.push(format!("page_context_raw: {}", parsed.page_context));
+        if let Ok(page_context) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&parsed.page_context)
+        {
+            for (key, value) in &page_context {
+                if let Some(text) = value.as_str() {
+                    lines.push(format!("{key}: {text}"));
+                    if key == "workspace_user" && !text.trim().is_empty() {
+                        workspace_user = Some(text.to_string());
+                    }
+                }
+            }
+            if let Some(company) = page_context
+                .get("workspace_company")
+                .and_then(|value| value.as_str())
+            {
+                let slug = page_context
+                    .get("workspace_company_slug")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| normalized_slug(company));
+                if !slug.is_empty() {
+                    lines.push(format!("workspace_company_slug: {}", slug));
+                    workspace_company_slug = Some(slug);
+                }
+            }
+        }
+    }
+    if let Some(user) = workspace_user {
+        lines.push(format!(
+            "runtime_filter_hint_user: use '{}' for person-scoped columns such as user_id, applicant_user_id, owner_email, assignee_user_id, uploaded_by, created_by, or *_email",
+            user
+        ));
+    }
+    if let Some(company_slug) = workspace_company_slug {
+        lines.push(format!(
+            "runtime_filter_hint_org: use '{}' for organization-scoped columns such as company_id, client_id, workspace_id, account_id, or owner_id",
+            company_slug
+        ));
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\nRuntime context:\n{}", lines.join("\n"))
+    }
+}
+
+fn normalized_token(value: &str) -> String {
+    value.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+}
+
+fn tokenize(value: &str) -> Vec<String> {
+    normalized_token(value)
+        .split_whitespace()
+        .filter(|token| token.len() >= 2)
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn is_first_person_request(prompt: &str) -> bool {
+    let normalized = normalized_token(prompt);
+    [
+        " my ",
+        " mine ",
+        " our ",
+        " mis ",
+        " mi ",
+        " mio ",
+        " mia ",
+        " mias ",
+        " mios ",
+        " nuestro ",
+        " nuestra ",
+        " nuestros ",
+        " nuestras ",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn schema_column_names(cols: &serde_json::Value) -> Vec<String> {
+    cols.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.get("column").and_then(|n| n.as_str()))
+                .map(|name| name.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn runtime_identifier_tokens(parsed: &ParsedPayload) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    if !parsed.sender_name.is_empty() {
+        tokens.extend(tokenize(&parsed.sender_name));
+    }
+    if let Ok(page_context) =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&parsed.page_context)
+    {
+        for value in page_context.values() {
+            if let Some(text) = value.as_str() {
+                tokens.extend(tokenize(text));
+            }
+        }
+    }
+    tokens
+}
+
+fn has_runtime_ownership_columns(columns: &[String]) -> bool {
+    columns.iter().any(|column| {
+        column.ends_with("_id")
+            || column.ends_with("_email")
+            || column.contains("owner")
+            || column.contains("applicant")
+            || column.contains("client")
+            || column.contains("company")
+            || column.contains("party_")
+            || column == "user_id"
+    })
+}
+
+fn ownership_column_strength(columns: &[String]) -> (usize, usize) {
+    let mut direct = 0usize;
+    let mut indirect = 0usize;
+    for column in columns {
+        if matches!(
+            column.as_str(),
+            "user_id" | "company_id" | "client_id" | "owner_id" | "owner_email"
+                | "applicant_user_id" | "assignee_user_id" | "created_by" | "uploaded_by"
+        ) || column.starts_with("owner_")
+            || column.starts_with("applicant_")
+            || column.starts_with("assignee_")
+        {
+            direct += 1;
+        } else if column.ends_with("_email") || column.contains("party_") {
+            indirect += 1;
+        }
+    }
+    (direct, indirect)
+}
+
+fn reduce_schema_for_planner(
+    schema: &serde_json::Map<String, serde_json::Value>,
+    parsed: &ParsedPayload,
+) -> serde_json::Map<String, serde_json::Value> {
+    if schema.len() <= 12 {
+        return schema.clone();
+    }
+
+    let prompt_tokens: HashSet<String> = tokenize(&parsed.prompt).into_iter().collect();
+    let runtime_tokens = runtime_identifier_tokens(parsed);
+    let prefer_runtime_ownership = !runtime_tokens.is_empty() && is_first_person_request(&parsed.prompt);
+
+    let mut scored_tables = schema
+        .iter()
+        .map(|(table, cols)| {
+            let columns = schema_column_names(cols);
+            let mut score = 0usize;
+            let (direct_ownership_columns, indirect_ownership_columns) =
+                ownership_column_strength(&columns);
+
+            let table_tokens: HashSet<String> = tokenize(table).into_iter().collect();
+            let matched_prompt_terms = prompt_tokens
+                .iter()
+                .filter(|token| {
+                    table_tokens.contains(*token)
+                        || columns.iter().any(|column| tokenize(column).iter().any(|part| part == *token))
+                })
+                .count();
+            score += matched_prompt_terms * 6;
+
+            let matched_runtime_terms = runtime_tokens
+                .iter()
+                .filter(|token| {
+                    table_tokens.contains(*token)
+                        || columns.iter().any(|column| tokenize(column).iter().any(|part| part == *token))
+                })
+                .count();
+            score += matched_runtime_terms * 4;
+
+            if prefer_runtime_ownership && has_runtime_ownership_columns(&columns) {
+                score += 12;
+                score += direct_ownership_columns * 7;
+                score += indirect_ownership_columns * 2;
+            }
+
+            if columns.iter().any(|column| column == "created_at" || column == "updated_at") {
+                score += 1;
+            }
+
+            (
+                table.clone(),
+                cols.clone(),
+                score,
+                matched_prompt_terms,
+                direct_ownership_columns,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    scored_tables.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    let direct_owner_candidates_exist = prefer_runtime_ownership
+        && scored_tables
+            .iter()
+            .any(|(_, _, score, _matched_prompt_terms, direct_ownership_columns)| {
+                *score > 0 && *direct_ownership_columns > 0
+            });
+
+    let kept = scored_tables
+        .iter()
+        .filter(|(_, _, _, _matched_prompt_terms, direct_ownership_columns)| {
+            !direct_owner_candidates_exist || *direct_ownership_columns > 0
+        })
+        .take_while(|(_, _, score, _, _)| *score > 0)
+        .take(12)
+        .map(|(table, cols, _, _, _)| (table.clone(), cols.clone()))
+        .collect::<serde_json::Map<_, _>>();
+
+    if kept.is_empty() {
+        schema.clone()
+    } else {
+        kept
+    }
+}
+
+pub(crate) fn should_retry_schema_query(result_text: &str) -> bool {
+    result_text.contains("returned 0 results")
+        || result_text.contains("Query error:")
+        || result_text.contains("does not exist")
+        || result_text.contains("Memento error:")
+}
+
+async fn plan_schema_query_internal(
+    engine: &Arc<dyn LLMEngine + Send + Sync>,
+    parsed: &ParsedPayload,
+    feedback: Option<&str>,
 ) -> Option<crate::ai::tool_executor::ToolCall> {
     if parsed.app_name.is_empty()
         || !parsed.permissions.iter().any(|perm| perm == "memento_query")
@@ -154,28 +461,19 @@ pub async fn try_plan_schema_query(
             .join("\n");
         format!("\nRecent conversation:\n{}", excerpt)
     };
-    let runtime_context = {
-        let mut lines = Vec::new();
-        if !parsed.sender_name.is_empty() {
-            lines.push(format!("sender_name: {}", parsed.sender_name));
-        }
-        if !parsed.page_title.is_empty() {
-            lines.push(format!("page_title: {}", parsed.page_title));
-        }
-        if !parsed.page_url.is_empty() {
-            lines.push(format!("page_url: {}", parsed.page_url));
-        }
-        if !parsed.page_context.is_empty() {
-            lines.push(format!("page_context: {}", parsed.page_context));
-        }
-        if lines.is_empty() {
-            String::new()
-        } else {
-            format!("\nRuntime context:\n{}", lines.join("\n"))
-        }
-    };
+    let runtime_context = structured_runtime_context(parsed);
+    let retry_feedback = feedback
+        .map(|value| format!("\nPlanner feedback:\n{}", value))
+        .unwrap_or_default();
 
-    let schema_json = serde_json::to_string_pretty(&schema).ok()?;
+    let reduced_schema = reduce_schema_for_planner(&schema, parsed);
+    tracing::info!(
+        "🧠 [Hera IPC] Schema planner app='{}' reduced tables {} -> {}",
+        parsed.app_name,
+        schema.len(),
+        reduced_schema.len()
+    );
+    let schema_json = serde_json::to_string_pretty(&reduced_schema).ok()?;
     let planner_system = format!(
         "You are Hera's generic schema-aware query planner.\n\
 Return only one raw JSON object.\n\
@@ -198,10 +496,16 @@ Rules:\n\
 - Use runtime context (current debtor/account/page context) when it identifies the subject of the request.\n\
 - If runtime context already identifies the debtor or account reference, prefer that context instead of asking the user to repeat it.\n\
 - If runtime context includes an exact identifier such as *_id, document_id, account_reference, reference, uuid, or pid, prefer filtering with that exact identifier over human names.\n\
+- If runtime context includes user/company identifiers, treat first-person requests like 'my', 'mis', 'mine', 'our', or 'nuestro' as user-scoped and add ownership filters.\n\
+- Prefer tables that can be filtered by the runtime identifiers already present in context, such as company_id, client_id, owner_id, owner_email, applicant_user_id, user_id, or party_*_email.\n\
+- When multiple tables match the domain noun (for example a summary table versus a dossier table), prefer the table that contains both the requested business fields and the ownership filter columns required by runtime context.\n\
+- Distinguish person-scoped identifiers from organization-scoped identifiers. Use user/email runtime values for person-scoped columns, and company/account slug runtime values for organization-scoped columns.\n\
+- Prefer direct ownership columns such as company_id, client_id, workspace_id, account_id, owner_id, owner_email, applicant_user_id, or user_id over weaker contact columns such as party_*, name, or generic email fields when both could match.\n\
+- If the previous query failed because a column was missing or returned zero rows, do not reuse the same table/column combination on retry.\n\
 - Avoid filtering by name alone when runtime context already includes a more specific identifier.\n\
 - If the request can be answered without data access, set should_query=false.\n\
-App: {}{}{}\nSchema:\n{}",
-        parsed.app_name, conversation_context, runtime_context, schema_json
+App: {}{}{}{}\nSchema:\n{}",
+        parsed.app_name, conversation_context, runtime_context, retry_feedback, schema_json
     );
 
     let req = ChatRequest {
@@ -254,7 +558,7 @@ App: {}{}{}\nSchema:\n{}",
     }
 
     let query = plan_value.get("query").and_then(|value| value.as_str())?;
-    if !is_safe_select_query(query, &schema) {
+    if !is_safe_select_query(query, &reduced_schema) {
         tracing::warn!(
             app = %parsed.app_name,
             "Rejected schema planner query because validation failed: {}",
