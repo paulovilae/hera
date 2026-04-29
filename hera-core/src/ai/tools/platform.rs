@@ -1012,20 +1012,31 @@ edition = "2021"
         let mut pip_log = String::new();
         if !packages.is_empty() {
             let mut cmd = std::process::Command::new("python3");
-            cmd.arg("-m").arg("pip").arg("install").arg("--user");
+            cmd.arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg("--user")
+                .arg("--break-system-packages")
+                .arg("--quiet");
             for pkg in &packages {
                 cmd.arg(pkg);
             }
-            if let Ok(out) = cmd.output() {
-                if !out.status.success() {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    return ToolResult {
-                        name: call.name.clone(),
-                        success: false,
-                        output: format!("Failed to install Python packages:\n{}", err),
-                    };
+            match cmd.output() {
+                Ok(out) if out.status.success() => {
+                    pip_log = format!("Installed: {:?}", packages);
                 }
-                pip_log = format!("Successfully installed: {:?}", packages);
+                Ok(out) => {
+                    // PEP 668 or already-installed: warn but still run the code.
+                    // The package may already be available; don't abort.
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    pip_log = format!(
+                        "pip warning (code still runs): {}",
+                        err.lines().next().unwrap_or("non-zero exit")
+                    );
+                }
+                Err(e) => {
+                    pip_log = format!("pip unavailable ({}), proceeding anyway", e);
+                }
             }
         }
 
