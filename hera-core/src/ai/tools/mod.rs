@@ -10,3 +10,4 @@ pub mod data;
 pub mod infra_health;
 pub mod infra_smoke;
 pub mod platform;
+pub mod productivity;

@@ -4,7 +4,7 @@
 //! from Qwen output, and dispatches tool execution to existing Hera methods.
 
 use crate::ai::tools::{
-    apps_latinos, apps_movilo, apps_vetra, data, infra_health, infra_smoke, platform,
+    apps_latinos, apps_movilo, apps_vetra, data, infra_health, infra_smoke, platform, productivity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -421,6 +421,8 @@ pub(crate) fn permissions_allow_tool(permissions: &[String], tool_name: &str) ->
 
 pub(crate) fn pm2_process_name_for_slug(slug: &str) -> &str {
     match slug {
+        "acciona" => "acciona-rust",
+        "cartera" => "cartera-rust",
         "vetra" => "vetra-rust",
         "movilo" => "movilo",
         "latinos" => "latinos-rust",
@@ -1394,7 +1396,29 @@ pub fn detect_intent_from_user_message(
         }
     }
 
-    if matches!(command, "/status" | "/system-status" | "/server-status") {
+    if matches!(
+        command,
+        "/status"
+            | "/system-status"
+            | "/server-status"
+            | "estado del sistema"
+            | "estado del servidor"
+            | "system status"
+            | "server status"
+            | "status of all apps"
+            | "review app status"
+            | "review all apps status"
+    ) {
+        info!("🎯 [Hera] Explicit fast-path command: review_all_apps_status");
+        return Some(ToolCall {
+            name: "review_all_apps_status".to_string(),
+            arguments: serde_json::json!({
+                "timeout_seconds": 10
+            }),
+        });
+    }
+
+    if matches!(command, "/health-overview" | "/machine-status") {
         info!("🎯 [Hera] Explicit fast-path command: /status");
         return Some(ToolCall {
             name: "system_status".to_string(),
@@ -1568,6 +1592,9 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "desktop_click" => platform::execute_desktop_click(call).await,
         "desktop_type" => platform::execute_desktop_type(call).await,
         "edit_app_theme" => platform::execute_edit_app_theme(call).await,
+        "read_email" => productivity::execute_read_email(call).await,
+        "list_calendar_events" => productivity::execute_list_calendar_events(call).await,
+        "read_notes" => productivity::execute_read_notes(call).await,
         _ => return None,
     };
     Some(result)
@@ -1634,6 +1661,8 @@ async fn dispatch_data_tool(call: &ToolCall) -> Option<ToolResult> {
         "api_request" => data::execute_api_request(call).await,
         "git_manager" => data::execute_git_manager(call).await,
         "memento_vector_search" => data::execute_memento_vector_search(call).await,
+        "save_memory" => productivity::execute_save_memory(call).await,
+        "query_memory" => productivity::execute_query_memory(call).await,
         _ => return None,
     };
     Some(result)
