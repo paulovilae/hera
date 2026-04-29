@@ -719,8 +719,9 @@ pub async fn build_full_system_prompt(
         )
     };
 
-    let think_directive = if lightweight_mode {
-        "\n\nRespond naturally and briefly. Do not use tools. Do not use <think> tags."
+    let think_directive = if lightweight_mode || budget.allow_tools {
+        // When tools are enabled: skip chain-of-thought — go straight to tool call
+        "\n\nRespond naturally and briefly. Do not use <think> tags."
     } else {
         "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag."
     };
