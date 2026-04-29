@@ -54,10 +54,10 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
         id: "vetra_widget",
         app: "vetra",
         persona_path: "/home/paulo/Programs/apps/OS/Agents/vetra.md",
-        default_context_budget_mode: "lightweight",
+        default_context_budget_mode: "standard",
         prefer_stream: true,
-        target_p95_ms: 700,
-        target_first_token_ms: Some(40),
+        target_p95_ms: 1600,
+        target_first_token_ms: Some(60),
     },
     RouteProfile {
         id: "os_v3_chat",
