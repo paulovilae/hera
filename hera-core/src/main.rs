@@ -109,12 +109,17 @@ async fn main() {
     );
 
     // Mount Sovereign Local LLM Engine
+    let primary_local_url = std::env::var("HERA_PRIMARY_OMNI_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080/v1/chat/completions".to_string());
+    let secondary_local_url = std::env::var("HERA_SECONDARY_OMNI_URL").ok();
+    let tertiary_local_url = std::env::var("HERA_TERTIARY_OMNI_URL").ok();
+
     let local_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = if capabilities
         .runtime_enabled(CapabilityId::LocalLlm)
     {
         info!("🧠 Initializing Sovereign Local LLM Engine (via Local Omni Node)...");
         let local_omni = hera_core::ai::openai_compat::OpenAICompatEngine::new(
-            "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+            primary_local_url.clone(),
             "".to_string(),
         );
         info!("🧠 Sovereign Native Omni Engine mounted!");
@@ -168,9 +173,36 @@ async fn main() {
         Arc::new(NoCloudEngine) as Arc<dyn hera_core::ai::LLMEngine + Send + Sync>
     };
 
-    // Compose: Local-first → Cloud fallback
+    let secondary_engine: Option<Arc<dyn hera_core::ai::LLMEngine + Send + Sync>> =
+        secondary_local_url
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .map(|url| {
+                Arc::new(hera_core::ai::openai_compat::OpenAICompatEngine::new(
+                    url,
+                    "".to_string(),
+                )) as Arc<dyn hera_core::ai::LLMEngine + Send + Sync>
+            });
+
+    let tertiary_engine: Option<Arc<dyn hera_core::ai::LLMEngine + Send + Sync>> =
+        tertiary_local_url
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .map(|url| {
+                Arc::new(hera_core::ai::openai_compat::OpenAICompatEngine::new(
+                    url,
+                    "".to_string(),
+                )) as Arc<dyn hera_core::ai::LLMEngine + Send + Sync>
+            });
+
+    // Compose: owned compute first → external cloud last
     let router_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = Arc::new(
-        hera_core::ai::router::RouterEngine::new(local_engine, cloud_engine),
+        hera_core::ai::router::RouterEngine::with_fallbacks(
+            local_engine,
+            secondary_engine,
+            tertiary_engine,
+            cloud_engine,
+        ),
     );
 
     // Orchestrator Backend — uses same local-first RouterEngine for sovereign operation
@@ -183,7 +215,7 @@ async fn main() {
         info!("👁️ Native Vision Engine (Unified Local Omni) mounted via local network.");
         Some(Arc::new(
             hera_core::ai::openai_compat::OpenAICompatEngine::new(
-                "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+                primary_local_url.clone(),
                 "".to_string(),
             ),
         ))
@@ -200,7 +232,7 @@ async fn main() {
         info!("🧠 Initializing Micro-LLM Engine (Unified Local Omni)...");
         Some(Arc::new(
             hera_core::ai::openai_compat::OpenAICompatEngine::new(
-                "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+                primary_local_url,
                 "".to_string(),
             ),
         ))

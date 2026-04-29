@@ -1161,3 +1161,56 @@ pub(crate) async fn execute_read_pm2_logs(call: &ToolCall) -> ToolResult {
         output: result,
     }
 }
+
+pub(crate) async fn execute_query_federation_state(call: &ToolCall) -> ToolResult {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    
+    // Attempt to hit Sentinel proxy first (Port 3000)
+    let url = "http://127.0.0.1:3000/api/platform/distributed/federation";
+    match client.get(url).send().await {
+        Ok(res) => {
+            let status = res.status();
+            match res.text().await {
+                Ok(text) => ToolResult {
+                    name: call.name.clone(),
+                    success: status.is_success(),
+                    output: format!("Federation State (Status {}):\n{}", status, text)
+                },
+                Err(e) => ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("Failed to read response body: {}", e)
+                }
+            }
+        },
+        Err(_) => {
+            // fallback directly to OS-v3 on 3001
+            let url2 = "http://127.0.0.1:3001/api/platform/distributed/federation";
+            match client.get(url2).send().await {
+                Ok(res) => {
+                    let status = res.status();
+                    match res.text().await {
+                        Ok(text) => ToolResult {
+                            name: call.name.clone(),
+                            success: status.is_success(),
+                            output: format!("Federation State (Status {}):\n{}", status, text)
+                        },
+                        Err(e) => ToolResult {
+                            name: call.name.clone(),
+                            success: false,
+                            output: format!("Failed to read response body: {}", e)
+                        }
+                    }
+                },
+                Err(e) => ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("Failed to query federation state: {}", e)
+                }
+            }
+        }
+    }
+}

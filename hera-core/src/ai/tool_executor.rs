@@ -976,7 +976,7 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
                 json_str = json_str.trim_start_matches("```").trim();
                 json_str = json_str.trim_end_matches("```").trim();
 
-                match serde_json::from_str::<serde_json::Value>(json_str) {
+                match parse_tool_call_json(json_str) {
                     Ok(val) => {
                         append_tool_calls_from_value(&mut calls, &val, open_tag);
                     }
@@ -1085,23 +1085,48 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
                 }
             }
 
+            let mut json_str = String::new();
             if end_idx > 0 {
-                let json_str = &stripped[..end_idx];
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
-                    && let (Some(name), Some(args)) = (
+                json_str = stripped[..end_idx].to_string();
+            } else if brace_count > 0 {
+                json_str = stripped.to_string();
+                for _ in 0..brace_count {
+                    json_str.push('}');
+                }
+            }
+
+            if !json_str.is_empty() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    let mut parsed_name = None;
+                    let mut parsed_args = None;
+
+                    if let (Some(name), Some(args)) = (
                         val.get("name").and_then(|n| n.as_str()),
-                        val.get("arguments"),
-                    )
-                {
-                    calls.push(ToolCall {
-                        name: name.to_string(),
-                        arguments: args.clone(),
-                    });
-                    info!(
-                        "🔧 [Hera] Parsed RAW JSON tool call (after think-strip): {} with args: {}",
-                        name,
-                        serde_json::to_string(args).unwrap_or_default()
-                    );
+                        val.get("arguments").or_else(|| val.get("parameters")),
+                    ) {
+                        parsed_name = Some(name.to_string());
+                        parsed_args = Some(args.clone());
+                    } else if let Some(func) = val.get("function") {
+                        if let (Some(name), Some(args)) = (
+                            func.get("name").and_then(|n| n.as_str()),
+                            func.get("arguments").or_else(|| func.get("parameters")),
+                        ) {
+                            parsed_name = Some(name.to_string());
+                            parsed_args = Some(args.clone());
+                        }
+                    }
+
+                    if let (Some(name), Some(args)) = (parsed_name, parsed_args) {
+                        calls.push(ToolCall {
+                            name: name.clone(),
+                            arguments: args.clone(),
+                        });
+                        info!(
+                            "🔧 [Hera] Parsed RAW JSON tool call (after think-strip): {} with args: {}",
+                            name,
+                            serde_json::to_string(&args).unwrap_or_default()
+                        );
+                    }
                 }
             }
         }
@@ -1109,6 +1134,76 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
 
     calls
 }
+
+fn parse_tool_call_json(json_str: &str) -> Result<serde_json::Value, serde_json::Error> {
+    match serde_json::from_str::<serde_json::Value>(json_str) {
+        Ok(value) => Ok(value),
+        Err(first_error) => {
+            if !matches!(
+                first_error.classify(),
+                serde_json::error::Category::Eof
+            ) {
+                return Err(first_error);
+            }
+
+            let repaired = repair_truncated_json(json_str);
+            if repaired == json_str {
+                return Err(first_error);
+            }
+
+            serde_json::from_str::<serde_json::Value>(&repaired).map_err(|_| first_error)
+        }
+    }
+}
+
+fn repair_truncated_json(input: &str) -> String {
+    let mut repaired = input.trim().to_string();
+    if repaired.is_empty() {
+        return repaired;
+    }
+
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut brace_balance = 0usize;
+    let mut bracket_balance = 0usize;
+
+    for ch in repaired.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => brace_balance += 1,
+            '}' => brace_balance = brace_balance.saturating_sub(1),
+            '[' => bracket_balance += 1,
+            ']' => bracket_balance = bracket_balance.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    if in_string {
+        repaired.push('"');
+    }
+    for _ in 0..bracket_balance {
+        repaired.push(']');
+    }
+    for _ in 0..brace_balance {
+        repaired.push('}');
+    }
+
+    repaired
+}
+
 
 fn append_tool_calls_from_value(
     calls: &mut Vec<ToolCall>,
@@ -1129,10 +1224,19 @@ fn append_tool_calls_from_value(
         return;
     }
 
-    if let (Some(name), Some(args)) = (
-        value.get("name").and_then(|n| n.as_str()),
-        value.get("arguments"),
-    ) {
+    let (name_val, args_val) = if let Some(func) = value.get("function") {
+        (
+            func.get("name"),
+            func.get("arguments").or_else(|| func.get("parameters")),
+        )
+    } else {
+        (
+            value.get("name"),
+            value.get("arguments").or_else(|| value.get("parameters")),
+        )
+    };
+
+    if let (Some(name), Some(args)) = (name_val.and_then(|n| n.as_str()), args_val) {
         calls.push(ToolCall {
             name: name.to_string(),
             arguments: args.clone(),
@@ -1552,6 +1656,7 @@ async fn dispatch_metadata_raw_json_tool(call: &ToolCall) -> Option<Result<Value
 async fn dispatch_infra_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
         "caddy_domain_manager" => infra_health::execute_caddy_domain_manager(call).await,
+        "query_federation_state" => infra_health::execute_query_federation_state(call).await,
         "system_status" => infra_health::execute_system_status(call).await,
         "diagnose_services" => infra_health::execute_diagnose_services(call).await,
         "service_restart" => infra_health::execute_service_restart(call).await,
@@ -1964,4 +2069,22 @@ mod tests {
 
         assert_eq!(call.name, "system_status");
     }
+
+    #[test]
+    fn parses_truncated_tool_call_json_by_closing_braces() {
+        let text = r#"<tool_call>{"name":"memento_query","arguments":{"app":"cartera","query":"SELECT 1"}</tool_call>"#;
+
+        let calls = parse_tool_calls(text);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memento_query");
+        assert_eq!(
+            calls[0]
+                .arguments
+                .get("app")
+                .and_then(|value| value.as_str()),
+            Some("cartera")
+        );
+    }
+
 }

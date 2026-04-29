@@ -191,6 +191,9 @@ Rules:\n\
 - Prefer concise queries.\n\
 - If aggregating numeric columns with SUM/AVG, CAST the aggregate to double precision so JSON transport stays typed.\n\
 - If the user asks for grouping, include grouped dimensions.\n\
+- Do not invent categorical filters or enum values unless the user explicitly asked for that category.\n\
+- Do not guess status values, workflow states, or labels such as pending/active/completed unless they were stated by the user or are unambiguously required by runtime context.\n\
+- For global totals like the total value of a portfolio, prefer summing an explicit total column or the whole table without filters unless the user requested a subset.\n\
 - Resolve ambiguous follow-up questions using the recent conversation when it is provided.\n\
 - Use runtime context (current debtor/account/page context) when it identifies the subject of the request.\n\
 - If runtime context already identifies the debtor or account reference, prefer that context instead of asking the user to repeat it.\n\

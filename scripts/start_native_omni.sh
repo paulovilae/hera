@@ -6,15 +6,25 @@ echo "🚀 Starting ImagineOS Native Omni Engine (Qwen3-VL 30B)"
 
 MODEL_DIR="/data/models/llm-stack"
 MODEL_BIN="/home/paulo/llama.cpp/build/bin/llama-server"
+WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-300}"
+WAIT_INTERVAL_SECONDS="${WAIT_INTERVAL_SECONDS:-5}"
 
 # Identify specific Qwen3-VL and Projector
 MODEL_FILE="$MODEL_DIR/Qwen3-VL-30B-A3B-Instruct-UD-Q4_K_XL.gguf"
 MMPROJ_FILE="$MODEL_DIR/Qwen3-VL-mmproj-F16.gguf"
 
-if [ ! -f "$MODEL_FILE" ] || [ ! -f "$MMPROJ_FILE" ]; then
-    echo "❌ Error: Required GGUF model or mmproj projector not found in $MODEL_DIR"
-    exit 1
-fi
+deadline=$((SECONDS + WAIT_TIMEOUT_SECONDS))
+while [ ! -f "$MODEL_FILE" ] || [ ! -f "$MMPROJ_FILE" ]; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "❌ Error: Required GGUF model or mmproj projector not found in $MODEL_DIR after ${WAIT_TIMEOUT_SECONDS}s"
+        exit 1
+    fi
+
+    echo "⏳ Waiting for model assets in $MODEL_DIR (retry in ${WAIT_INTERVAL_SECONDS}s)"
+    [ -f "$MODEL_FILE" ] || echo "   missing model: $MODEL_FILE"
+    [ -f "$MMPROJ_FILE" ] || echo "   missing projector: $MMPROJ_FILE"
+    sleep "$WAIT_INTERVAL_SECONDS"
+done
 
 echo "🧠 Model: $MODEL_FILE"
 echo "👁️ Projector: $MMPROJ_FILE"

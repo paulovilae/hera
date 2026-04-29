@@ -18,7 +18,7 @@ use std::{
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::ai::{ChatMessage, ChatRequest, ContentPart, ImageUrlContent, MessageContent};
 use crate::ipc::{IpcState, helpers::estimate_tokens};
@@ -159,12 +159,20 @@ pub async fn serve_rest_api(port: u16, ipc: IpcState) {
         .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            warn!(
+                "⚠️ Hera REST API did not start on http://{}: {}",
+                addr, error
+            );
+            return;
+        }
+    };
     info!(
         "🚀 Hera REST API (Claude-compatible) bound to http://{}",
         addr
     );
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     if let Err(e) = axum::serve(listener, app).await {
         error!("❌ Hera REST API Server Error: {}", e);
     }
