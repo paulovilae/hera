@@ -398,7 +398,12 @@ pub(crate) async fn execute_review_all_apps_status_json(call: &ToolCall) -> Resu
 
         let note = match summary_status {
             "healthy" => "online + smoke ok".to_string(),
-            "degraded" => "online but smoke failed".to_string(),
+            "degraded" => smoke_result
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(|value| value.as_str())
+                .map(|error| format!("online but smoke unavailable: {}", error))
+                .unwrap_or_else(|| "online but smoke failed".to_string()),
             _ => format!("pm2 status={}", pm2_status),
         };
 

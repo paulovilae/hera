@@ -100,22 +100,66 @@ pub async fn handle_generate(
         }
     }
 
+    let schema_plan_started_at = Instant::now();
     if let Some(planned_call) = try_plan_schema_query(&state.engine, &parsed).await {
+        let planner_latency_ms = schema_plan_started_at.elapsed().as_millis();
         let contextual_tool_call = contextualize_tool_call(&planned_call, &parsed);
         if crate::ai::tool_executor::permissions_allow_tool(
             &parsed.permissions,
             &contextual_tool_call.name,
         ) {
+            let initial_query = contextual_tool_call
+                .arguments
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
             tracing::info!(
-                "🧠 [Hera IPC] Generic schema query plan generated for app '{}'",
-                parsed.app_name
+                "🧠 [Hera IPC] Generic schema query plan generated for app '{}' in {}ms",
+                parsed.app_name,
+                planner_latency_ms
             );
-            let tool_result = crate::ai::tool_executor::execute_tool(&contextual_tool_call)
+            let tool_started_at = Instant::now();
+            let mut tool_result = crate::ai::tool_executor::execute_tool(&contextual_tool_call)
                 .await
                 .output;
+            let mut replanned = false;
+            if super::runtime_tools::should_retry_schema_query(&tool_result) {
+                let retry_started_at = Instant::now();
+                if let Some(replanned_call) = super::runtime_tools::retry_plan_schema_query(
+                    &state.engine,
+                    &parsed,
+                    &initial_query,
+                    &tool_result,
+                )
+                .await
+                {
+                    let contextual_retry_call = contextualize_tool_call(&replanned_call, &parsed);
+                    tracing::info!(
+                        "🧠 [Hera IPC] Retrying schema query for app '{}' after {}ms planner retry",
+                        parsed.app_name,
+                        retry_started_at.elapsed().as_millis()
+                    );
+                    tool_result = crate::ai::tool_executor::execute_tool(&contextual_retry_call)
+                        .await
+                        .output;
+                    replanned = true;
+                }
+            }
+            let tool_latency_ms = tool_started_at.elapsed().as_millis();
+            let summarize_started_at = Instant::now();
             let result_text = summarize_tool_output_for_user(&state.engine, &parsed, &tool_result)
                 .await
                 .unwrap_or(tool_result);
+            let summarize_latency_ms = summarize_started_at.elapsed().as_millis();
+            tracing::info!(
+                "⏱️ [Hera IPC] Schema planner path app='{}' planner_ms={} tool_ms={} summarize_ms={} retried={}",
+                parsed.app_name,
+                planner_latency_ms,
+                tool_latency_ms,
+                summarize_latency_ms,
+                replanned
+            );
 
             let res = IpcResponse {
                 status: "success".to_string(),

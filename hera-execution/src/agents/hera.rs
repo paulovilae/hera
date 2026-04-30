@@ -3,7 +3,7 @@ use crate::mcp::client::McpHttpClient;
 use serde_json::json;
 use base64::prelude::*;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Hera is the primary Multimodal Rust Agent orchestrator inside the Execution Layer.
@@ -13,6 +13,14 @@ pub struct Hera {
     pub mcp_client: McpHttpClient,
     pub http_client: reqwest::Client,
     pub draw_url: String,
+}
+
+fn generated_outputs_dir() -> Result<PathBuf> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .ok_or_else(|| anyhow!("failed to resolve ImagineOS repo root"))?;
+    Ok(repo_root.join("Hera/playground/outputs"))
 }
 
 /// Represents a checkpoint model available for image generation.
@@ -373,13 +381,13 @@ impl Hera {
             };
             
             let image_data = BASE64_STANDARD.decode(&clean_b64)?;
-            let output_dir = "/home/paulo/Programs/apps/hera/playground/outputs";
-            fs::create_dir_all(output_dir)?;
-            
+            let output_dir = generated_outputs_dir()?;
+            fs::create_dir_all(&output_dir)?;
+
             let filename = format!("hera_drawn_{}.png", Uuid::new_v4());
-            let filepath = format!("{}/{}", output_dir, filename);
+            let filepath = output_dir.join(&filename);
             fs::write(&filepath, image_data)?;
-            
+
             return Ok(json!({
                 "status": "success",
                 "image_url": format!("/outputs/{}", filename),
@@ -468,9 +476,12 @@ impl Hera {
 
     /// Searches DuckDuckGo HTML and extracts top snippets.
     pub async fn native_web_search(&self, query: &str) -> Result<String> {
-        let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding::encode(query));
-        let res = self.http_client.get(&url)
+        let url = "https://lite.duckduckgo.com/lite/";
+        let params = [("q", query)];
+        
+        let res = self.http_client.post(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+            .form(&params)
             .send().await?;
             
         if !res.status().is_success() {
@@ -478,21 +489,25 @@ impl Hera {
         }
         let html_content = res.text().await?;
         let document = scraper::Html::parse_document(&html_content);
-        let result_selector = scraper::Selector::parse(".result__body").unwrap();
-        let title_selector = scraper::Selector::parse(".result__title").unwrap();
-        let snippet_selector = scraper::Selector::parse(".result__snippet").unwrap();
-        let url_selector = scraper::Selector::parse(".result__url").unwrap();
+        
+        let link_selector = scraper::Selector::parse(".result-link").unwrap();
+        let snippet_selector = scraper::Selector::parse(".result-snippet").unwrap();
+
+        let links: Vec<_> = document.select(&link_selector).collect();
+        let snippets: Vec<_> = document.select(&snippet_selector).collect();
 
         let mut results = Vec::new();
-        for element in document.select(&result_selector).take(5) {
-            let title = element.select(&title_selector).next().map(|e| e.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default();
-            let snippet = element.select(&snippet_selector).next().map(|e| e.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default();
-            let link = element.select(&url_selector).next().map(|e| e.text().collect::<Vec<_>>().join("").trim().to_string()).unwrap_or_default();
+        let count = links.len().min(snippets.len());
+        for i in 0..count.min(5) {
+            let title = links[i].text().collect::<Vec<_>>().join(" ").trim().to_string();
+            let url = links[i].value().attr("href").unwrap_or_default().to_string();
+            let snippet = snippets[i].text().collect::<Vec<_>>().join(" ").trim().to_string();
             
             if !title.is_empty() && !snippet.is_empty() {
-                results.push(format!("Title: {}\nURL: {}\nSnippet: {}\n", title, link, snippet));
+                results.push(format!("Title: {}\nURL: {}\nSnippet: {}\n", title, url, snippet));
             }
         }
+
         if results.is_empty() {
             Ok("No results found.".to_string())
         } else {
