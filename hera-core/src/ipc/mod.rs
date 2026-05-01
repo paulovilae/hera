@@ -23,11 +23,16 @@ pub mod route_profiles;
 pub mod runtime_tools;
 pub mod types;
 
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tracing::{error, info};
+use tokio::sync::Semaphore;
+use tracing::{error, info, warn};
 
 pub use types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
+
+/// Maximum concurrent LLM requests — prevents thread-pile-up under burst load.
+const MAX_CONCURRENT_REQUESTS: usize = 12;
 
 /// Main IPC server loop — binds to Unix socket and dispatches to handlers.
 pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
@@ -42,11 +47,28 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
         socket_path
     );
 
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
     loop {
         match listener.accept().await {
             Ok((mut stream, _addr)) => {
                 let state = state.clone();
+                let sem = semaphore.clone();
                 tokio::spawn(async move {
+                    let permit = match sem.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            warn!("⚠️ IPC concurrency limit reached ({MAX_CONCURRENT_REQUESTS}), waiting for slot");
+                            match sem.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    error!("❌ Semaphore closed: {e}");
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    let _permit = permit; // held until task completes
                     let mut buffer = Vec::new();
                     let mut chunk = vec![0; 65536];
                     loop {

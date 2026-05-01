@@ -91,6 +91,9 @@ async fn watchdog_tick(state: &mut WatchdogState) -> Result<(), String> {
     // ── 5. Check Sentinel (port 3000) ──
     check_sentinel(state, &mut emergencies);
 
+    // ── 6. Purge expired audit_log rows ──
+    purge_audit_log().await;
+
     // ── 6. Process emergencies ──
     for emergency in &emergencies {
         log_watchdog_event(emergency);
@@ -381,6 +384,58 @@ fn check_sentinel(state: &mut WatchdogState, emergencies: &mut Vec<Emergency>) {
         }
         Err(_) => {} // curl not available, skip
     }
+}
+
+/// Purge expired audit_log rows and rows older than 30 days.
+/// Runs on every watchdog tick (every 60s) — cheap because it only deletes rows
+/// whose retention_until has passed or which are older than 30 days.
+async fn purge_audit_log() {
+    let db_url = std::env::var("OS_V3_DATABASE_URL").unwrap_or_else(|_| {
+        "postgresql://imaginos:imaginos_secure_2026@127.0.0.1:5432/os_core_db".to_string()
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let Ok(client) = client else { return };
+
+    // Use psql directly — no SeaORM dep needed in watchdog
+    let output = std::process::Command::new("psql")
+        .arg(&db_url)
+        .arg("-c")
+        .arg(
+            "DELETE FROM audit_log WHERE \
+             (retention_until IS NOT NULL AND retention_until < NOW()) \
+             OR timestamp < NOW() - INTERVAL '30 days'; \
+             VACUUM (ANALYZE, FREEZE) audit_log;",
+        )
+        .env("PGPASSWORD", std::env::var("PGPASSWORD").unwrap_or_default())
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let deleted: u64 = out
+                .lines()
+                .find(|l| l.starts_with("DELETE"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            if deleted > 0 {
+                info!("🧹 [Watchdog] Purged {} expired audit_log rows", deleted);
+            }
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            if !err.is_empty() {
+                warn!("🐕 [Watchdog] audit_log purge warning: {}", err.trim());
+            }
+        }
+        Err(e) => {
+            warn!("🐕 [Watchdog] audit_log purge skipped (psql unavailable): {}", e);
+        }
+    }
+    // suppress unused import warning
+    drop(client);
 }
 
 /// Log a watchdog event to the persistent log file
