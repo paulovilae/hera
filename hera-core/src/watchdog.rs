@@ -386,17 +386,14 @@ fn check_sentinel(state: &mut WatchdogState, emergencies: &mut Vec<Emergency>) {
     }
 }
 
-/// Purge expired audit_log rows and rows older than 30 days.
-/// Runs on every watchdog tick (every 60s) — cheap because it only deletes rows
-/// whose retention_until has passed or which are older than 30 days.
+/// Purge expired audit_log rows.
+/// - Sentinel ingress traces (high volume): expire after 7 days
+/// - All other rows: expire after 30 days
+/// - Rows with explicit retention_until: expire when that timestamp passes
 async fn purge_audit_log() {
     let db_url = std::env::var("OS_V3_DATABASE_URL").unwrap_or_else(|_| {
         "postgresql://imaginos:imaginos_secure_2026@127.0.0.1:5432/os_core_db".to_string()
     });
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build();
-    let Ok(client) = client else { return };
 
     // Use psql directly — no SeaORM dep needed in watchdog
     let output = std::process::Command::new("psql")
@@ -405,8 +402,10 @@ async fn purge_audit_log() {
         .arg(
             "DELETE FROM audit_log WHERE \
              (retention_until IS NOT NULL AND retention_until < NOW()) \
+             OR (capability_used IN ('ingress_trace', 'sentinel_edge') \
+                 AND timestamp < NOW() - INTERVAL '7 days') \
              OR timestamp < NOW() - INTERVAL '30 days'; \
-             VACUUM (ANALYZE, FREEZE) audit_log;",
+             VACUUM (ANALYZE) audit_log;",
         )
         .env("PGPASSWORD", std::env::var("PGPASSWORD").unwrap_or_default())
         .output();
@@ -434,8 +433,6 @@ async fn purge_audit_log() {
             warn!("🐕 [Watchdog] audit_log purge skipped (psql unavailable): {}", e);
         }
     }
-    // suppress unused import warning
-    drop(client);
 }
 
 /// Log a watchdog event to the persistent log file
