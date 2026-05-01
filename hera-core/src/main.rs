@@ -47,9 +47,11 @@ async fn main() {
     // Initialize Flux Native engine lazily or synchronously
     // By Sovereign Directive, Candle FLUX is deprecated due to VRAM inefficiency.
     // Image Generation is now delegated to the native sd.cpp REST node in ipc_server.rs.
+    #[cfg(feature = "local-llm")]
     let flux_engine: Option<Arc<hera_core::ai::engine_flux::FluxEngine>> = None;
 
     // Initialize Parler-TTS Native engine
+    #[cfg(feature = "local-llm")]
     let parler_engine = if capabilities.runtime_enabled(CapabilityId::AudioTts) {
         info!("🎤 Initializing Native Parler-TTS Audio Engine...");
         match hera_core::ai::engine_parler::ParlerEngine::new() {
@@ -67,6 +69,7 @@ async fn main() {
     };
 
     // Initialize Whisper Native engine
+    #[cfg(feature = "local-llm")]
     let whisper_engine: Option<Arc<dyn SpeechToTextEngine + Send + Sync>> =
         if capabilities.runtime_enabled(CapabilityId::AudioStt) {
             info!("👂 Initializing Native Whisper STT Engine...");
@@ -101,8 +104,11 @@ async fn main() {
         } else {
             None
         };
+    #[cfg(not(feature = "local-llm"))]
+    let whisper_engine: Option<Arc<dyn SpeechToTextEngine + Send + Sync>> = None;
 
-    // Initialize LlamaBackend globally
+    // Initialize LlamaBackend globally (local-llm only — requires CUDA on GPU nodes)
+    #[cfg(feature = "local-llm")]
     let _llama_backend = Arc::new(
         llama_cpp_2::llama_backend::LlamaBackend::init()
             .expect("Failed to initialize global LlamaBackend"),
@@ -242,7 +248,9 @@ async fn main() {
     let state = IpcState {
         engine: Arc::new(context_engine),
         local_engine: Arc::clone(&router_engine),
+        #[cfg(feature = "local-llm")]
         flux_engine,
+        #[cfg(feature = "local-llm")]
         parler_engine,
         whisper_engine,
         vision_engine: vision_engine.clone(),

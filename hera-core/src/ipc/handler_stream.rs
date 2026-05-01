@@ -546,7 +546,9 @@ mod tests {
         IpcState {
             engine: engine.clone(),
             local_engine: engine,
+            #[cfg(feature = "local-llm")]
             flux_engine: None,
+            #[cfg(feature = "local-llm")]
             parler_engine: None,
             whisper_engine: None,
             vision_engine: None,

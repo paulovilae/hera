@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::ai::quantized_qwen3_moe_local::GGUFQWenMoE;
+use crate::ai::GenerationStats;
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::qwen2::ModelForCausalLM as Qwen2;
@@ -93,23 +94,6 @@ pub struct NativeLlmEngine {
     pub device: Device,
     pub temperature: f64,
     pub model_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationStats {
-    pub model: String,
-    pub max_context_tokens: usize,
-    pub max_new_tokens: usize,
-    pub effective_context_tokens: usize,
-    pub truncated_prompt_tokens: usize,
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub total_tokens: usize,
-    pub reading_ms: u128,
-    pub generation_ms: u128,
-    pub total_ms: u128,
-    pub tokens_per_second: f64,
-    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4,6 +4,7 @@ use super::types::{HandlerOutcome, IpcPayload, IpcState};
 use crate::ai::{ChatMessage, ChatRequest, ContentPart, MessageContent};
 
 /// Handle the "generate_image" action — FLUX/sd.cpp image generation with auto-LoRA.
+#[cfg_attr(not(feature = "local-llm"), allow(unused_variables))]
 pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> HandlerOutcome {
     let prompt_val = match request.payload.get("prompt").and_then(|p| p.as_str()) {
         Some(p) => p,
@@ -62,19 +63,26 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
         .and_then(|h| h.as_u64())
         .unwrap_or(768) as usize;
 
-    let result_text = if let Some(flux) = &state.flux_engine {
+    let result_text = {
+    #[cfg(feature = "local-llm")]
+    if let Some(flux) = &state.flux_engine {
         match flux.generate_image(&prompt, width, height).await {
             Ok(image_bytes) => {
                 use base64::{Engine as _, engine::general_purpose};
                 let b64 = general_purpose::STANDARD.encode(&image_bytes);
-                format!("data:image/png;base64,{}", b64)
+                return HandlerOutcome::Result {
+                    result_text: format!("data:image/png;base64,{}", b64),
+                    origin: "unknown".to_string(),
+                    model: String::new(),
+                    tool_calls: None,
+                };
             }
             Err(e) => {
                 tracing::error!("Flux inference error: {}", e);
-                format!("Error: {}", e)
             }
         }
-    } else {
+    }
+    {
         // Fallback to sd.cpp REST API
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
@@ -109,7 +117,7 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
                 format!("Error connecting to Native Image Generator: {}", e)
             }
         }
-    };
+    }};
 
     HandlerOutcome::Result {
         result_text,

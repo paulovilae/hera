@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
+#[cfg(feature = "local-llm")]
 use crate::ai::engine_parler::ParlerEngine;
 use crate::ai::{LLMEngine, SpeechToTextEngine};
 
@@ -13,7 +14,9 @@ use crate::ai::{LLMEngine, SpeechToTextEngine};
 pub struct IpcState {
     pub engine: Arc<dyn LLMEngine + Send + Sync>,
     pub local_engine: Arc<dyn LLMEngine + Send + Sync>,
+    #[cfg(feature = "local-llm")]
     pub flux_engine: Option<Arc<crate::ai::engine_flux::FluxEngine>>,
+    #[cfg(feature = "local-llm")]
     pub parler_engine: Option<Arc<ParlerEngine>>,
     pub whisper_engine: Option<Arc<dyn SpeechToTextEngine + Send + Sync>>,
     pub vision_engine: Option<Arc<dyn LLMEngine + Send + Sync>>,

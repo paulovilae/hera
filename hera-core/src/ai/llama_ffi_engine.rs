@@ -299,7 +299,7 @@ impl LLMEngine for LlamaFfiEngine {
                 0.0
             };
 
-            let stats = crate::ai::native_engine::GenerationStats {
+            let stats = crate::ai::GenerationStats {
                 model: "qwen-3.5-35b-ffi".to_string(),
                 max_context_tokens: 8192,
                 max_new_tokens: max_tokens as usize,

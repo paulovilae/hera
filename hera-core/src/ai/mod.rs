@@ -5,22 +5,34 @@
 //! (e.g., Gemini HTTP endpoints, local Llama GPU endpoints).
 
 pub mod context_engine;
-pub mod engine_faster_whisper;
-pub mod engine_flux;
-pub mod engine_gguf;
-pub mod engine_hub;
-pub mod engine_moondream;
-pub mod engine_parler;
-pub mod engine_whisper;
 pub mod gemini;
-pub mod llama_ffi_engine;
-pub mod native_engine;
 pub mod openai_compat;
-pub mod q8_t5;
-pub mod quantized_qwen3_moe_local;
 pub mod router;
 pub mod tool_executor;
 pub mod tools;
+
+#[cfg(feature = "local-llm")]
+pub mod engine_faster_whisper;
+#[cfg(feature = "local-llm")]
+pub mod engine_flux;
+#[cfg(feature = "local-llm")]
+pub mod engine_gguf;
+#[cfg(feature = "local-llm")]
+pub mod engine_hub;
+#[cfg(feature = "local-llm")]
+pub mod engine_moondream;
+#[cfg(feature = "local-llm")]
+pub mod engine_parler;
+#[cfg(feature = "local-llm")]
+pub mod engine_whisper;
+#[cfg(feature = "local-llm")]
+pub mod llama_ffi_engine;
+#[cfg(feature = "local-llm")]
+pub mod native_engine;
+#[cfg(feature = "local-llm")]
+pub mod q8_t5;
+#[cfg(feature = "local-llm")]
+pub mod quantized_qwen3_moe_local;
 
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +187,23 @@ pub trait SpeechToTextEngine {
 // --- Streaming API Schema ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationStats {
+    pub model: String,
+    pub max_context_tokens: usize,
+    pub max_new_tokens: usize,
+    pub effective_context_tokens: usize,
+    pub truncated_prompt_tokens: usize,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub reading_ms: u128,
+    pub generation_ms: u128,
+    pub total_ms: u128,
+    pub tokens_per_second: f64,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatStreamResponse {
     pub id: String,
     pub object: String,
@@ -182,7 +211,7 @@ pub struct ChatStreamResponse {
     pub model: String,
     pub choices: Vec<ChatStreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stats: Option<crate::ai::native_engine::GenerationStats>,
+    pub stats: Option<crate::ai::GenerationStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
