@@ -27,13 +27,19 @@ const MAX_AUTO_RESTARTS: u32 = 3;
 /// In-memory state for tracking restart attempts per service
 struct WatchdogState {
     restart_counts: HashMap<String, u32>,
+    /// Last restart count at which a PM2_HIGH_RESTARTS warning was emitted per service.
+    /// Only warn again once restarts have grown by at least HIGH_RESTART_WARN_STEP.
+    high_restart_last_warned: HashMap<String, u64>,
     last_tick: std::time::Instant,
 }
+
+const HIGH_RESTART_WARN_STEP: u64 = 20;
 
 impl WatchdogState {
     fn new() -> Self {
         Self {
             restart_counts: HashMap::new(),
+            high_restart_last_warned: HashMap::new(),
             last_tick: std::time::Instant::now(),
         }
     }
@@ -213,18 +219,30 @@ fn check_pm2_services(state: &mut WatchdogState, emergencies: &mut Vec<Emergency
             }
         }
 
-        // Detect crash loops even for "online" services
+        // Detect crash loops even for "online" services — but only log once per
+        // HIGH_RESTART_WARN_STEP increment to avoid flooding the watchdog log.
         if status == "online" && restarts > 20 {
-            emergencies.push(Emergency {
-                severity: Severity::Warning,
-                category: "PM2_HIGH_RESTARTS".to_string(),
-                service: name.to_string(),
-                message: format!(
-                    "Service '{}' is online but has {} restarts — possible instability",
-                    name, restarts
-                ),
-                action_taken: "logged warning".to_string(),
-            });
+            let last = state
+                .high_restart_last_warned
+                .get(name)
+                .copied()
+                .unwrap_or(0);
+            let bucket = (restarts / HIGH_RESTART_WARN_STEP) * HIGH_RESTART_WARN_STEP;
+            if bucket > last {
+                state
+                    .high_restart_last_warned
+                    .insert(name.to_string(), bucket);
+                emergencies.push(Emergency {
+                    severity: Severity::Warning,
+                    category: "PM2_HIGH_RESTARTS".to_string(),
+                    service: name.to_string(),
+                    message: format!(
+                        "Service '{}' is online but has {} restarts — possible instability",
+                        name, restarts
+                    ),
+                    action_taken: "logged warning".to_string(),
+                });
+            }
         }
     }
 }
@@ -469,8 +487,26 @@ fn log_watchdog_event(emergency: &Emergency) {
             .open(WATCHDOG_LOG)
             .ok();
         if let Some(ref mut f) = file {
-            use std::io::Write;
+            use std::io::{Seek, SeekFrom, Write};
             let _ = writeln!(f, "{}", line);
+            // Rotate when file exceeds 2 MB — keep last 2000 lines
+            if f.seek(SeekFrom::End(0)).unwrap_or(0) > 2 * 1024 * 1024 {
+                drop(file);
+                let _ = rotate_watchdog_log(2000);
+            }
+        }
+    }
+}
+
+fn rotate_watchdog_log(keep_lines: usize) {
+    if let Ok(content) = std::fs::read_to_string(WATCHDOG_LOG) {
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        if lines.len() > keep_lines {
+            let tail = lines[lines.len() - keep_lines..].join("\n");
+            let _ = std::fs::write(WATCHDOG_LOG, format!("{tail}\n"));
         }
     }
 }
