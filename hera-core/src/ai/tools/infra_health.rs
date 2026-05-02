@@ -256,7 +256,7 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
     }
 
     // ── 2. Get PM2 process list ──
-    let mut pm2_services: Vec<(String, String, u64, u64)> = Vec::new(); // (name, status, restarts, pid)
+    let mut pm2_services: Vec<(String, String, u64, u64, u64)> = Vec::new(); // (name, status, restarts, pid, pm_uptime_ms)
     if let Ok(output) = std::process::Command::new("pm2").arg("jlist").output()
         && output.status.success()
     {
@@ -280,7 +280,12 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
                     .and_then(|r| r.as_u64())
                     .unwrap_or(0);
                 let pid = proc.get("pid").and_then(|p| p.as_u64()).unwrap_or(0);
-                pm2_services.push((name, status, restarts, pid));
+                let pm_uptime_ms = proc
+                    .get("pm2_env")
+                    .and_then(|e| e.get("pm_uptime"))
+                    .and_then(|u| u.as_u64())
+                    .unwrap_or(0);
+                pm2_services.push((name, status, restarts, pid, pm_uptime_ms));
             }
         }
     }
@@ -412,7 +417,7 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
             (None, _) => {
                 down.push(format!("🔴 {} (:{}) → NO LISTENER", host_label, port));
                 // Check if there's a PM2 process that should own this port
-                let possible_pm2 = pm2_services.iter().find(|(name, _, _, _)| {
+                let possible_pm2 = pm2_services.iter().find(|(name, _, _, _, _)| {
                     let host_base = host_label.split('.').next().unwrap_or("").to_lowercase();
                     let pm2_aliases = canonical_app_search_terms(name);
                     text_contains_app_alias(&host_label, &pm2_aliases)
@@ -420,7 +425,7 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
                             host_base.contains(alias) || alias.contains(&host_base)
                         })
                 });
-                if let Some((pm2_name, pm2_status, restarts, _)) = possible_pm2 {
+                if let Some((pm2_name, pm2_status, restarts, _, _)) = possible_pm2 {
                     root_causes.push(format!(
                         "Port {} ({}) has no listener but PM2 shows '{}' as {} with {} restarts — process may have crashed or port is misconfigured",
                         port, host_label, pm2_name, pm2_status, restarts
@@ -471,14 +476,37 @@ pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
         }
     }
 
-    // Check for PM2 crash loops
-    for (name, status, restarts, _) in &pm2_services {
-        if *restarts > 10 {
+    // Check for PM2 crash loops — use uptime-aware logic to avoid false alarms
+    // from services that have high lifetime restart counts due to the CD pipeline.
+    // A real crash loop is: errored status, OR online but restarted within the last 5 minutes.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    for (name, status, restarts, _, pm_uptime_ms) in &pm2_services {
+        let uptime_ms = now_ms.saturating_sub(*pm_uptime_ms);
+        let recently_crashed = *pm_uptime_ms > 0 && uptime_ms < 300_000 && *restarts > 0;
+        if status == "errored" {
             root_causes.push(format!(
-                "🔄 CRASH LOOP: PM2 service '{}' has {} restarts (status: {}) — likely a persistent error preventing stable startup",
-                name, restarts, status
+                "❌ BROKEN: PM2 service '{}' is in errored state (status: errored, restarts: {})",
+                name, restarts
             ));
-            proposed_fixes.push(format!("Investigate root cause: `pm2 logs {} --err --lines 30` then fix the underlying error before restarting", name));
+            proposed_fixes.push(format!(
+                "Check error: `pm2 logs {} --err --lines 30` — fix the underlying error (missing DB, bad config, port conflict)",
+                name
+            ));
+        } else if recently_crashed {
+            root_causes.push(format!(
+                "⚠️ UNSTABLE: PM2 service '{}' restarted {:.0}s ago (restarts: {}, status: {})",
+                name,
+                uptime_ms / 1000,
+                restarts,
+                status
+            ));
+            proposed_fixes.push(format!(
+                "Service is actively crashing: `pm2 logs {} --err --lines 30`",
+                name
+            ));
         }
     }
 
@@ -797,6 +825,10 @@ pub(crate) async fn execute_system_status(call: &ToolCall) -> ToolResult {
             let out_str = String::from_utf8_lossy(&output.stdout);
             if let Ok(procs) = serde_json::from_str::<Vec<serde_json::Value>>(&out_str) {
                 report.push_str(&format!("\nPM2 Services ({} total):\n", procs.len()));
+                let now_ms_status = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
                 for proc in &procs {
                     let name = proc.get("name").and_then(|n| n.as_str()).unwrap_or("?");
                     let status = proc
@@ -810,10 +842,20 @@ pub(crate) async fn execute_system_status(call: &ToolCall) -> ToolResult {
                         .and_then(|r| r.as_u64())
                         .unwrap_or(0);
                     let pid = proc.get("pid").and_then(|p| p.as_u64()).unwrap_or(0);
+                    let pm_uptime_ms = proc
+                        .get("pm2_env")
+                        .and_then(|e| e.get("pm_uptime"))
+                        .and_then(|u| u.as_u64())
+                        .unwrap_or(0);
 
                     let emoji = if status == "online" { "🟢" } else { "🔴" };
-                    let crash_flag = if restarts > 10 {
-                        " ⚠️ CRASH LOOP"
+                    // Real crash: errored status, or restarted within the last 5 minutes.
+                    // High lifetime restart counts from the CD pipeline are NOT a crash.
+                    let uptime_ms = now_ms_status.saturating_sub(pm_uptime_ms);
+                    let crash_flag = if status == "errored" {
+                        " ❌ BROKEN"
+                    } else if pm_uptime_ms > 0 && uptime_ms < 300_000 && restarts > 0 {
+                        " ⚠️ UNSTABLE"
                     } else {
                         ""
                     };
