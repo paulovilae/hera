@@ -1396,11 +1396,15 @@ pub fn detect_intent_from_user_message(
         }
     }
 
+    // "Estado OS" / "Estado del sistema" — full PM2 status with restart counts
     if matches!(
         command,
         "/status"
             | "/system-status"
             | "/server-status"
+            | "/health-overview"
+            | "/machine-status"
+            | "estado os"
             | "estado del sistema"
             | "estado del servidor"
             | "system status"
@@ -1409,17 +1413,7 @@ pub fn detect_intent_from_user_message(
             | "review app status"
             | "review all apps status"
     ) {
-        info!("🎯 [Hera] Explicit fast-path command: review_all_apps_status");
-        return Some(ToolCall {
-            name: "review_all_apps_status".to_string(),
-            arguments: serde_json::json!({
-                "timeout_seconds": 10
-            }),
-        });
-    }
-
-    if matches!(command, "/health-overview" | "/machine-status") {
-        info!("🎯 [Hera] Explicit fast-path command: /status");
+        info!("🎯 [Hera] Explicit fast-path command: system_status");
         return Some(ToolCall {
             name: "system_status".to_string(),
             arguments: serde_json::json!({}),

@@ -9,6 +9,8 @@ use tracing::info;
 
 const HERA_SOCKET: &str = "/tmp/hera-core.sock";
 const OS_ROOT: &str = "/home/paulo/Programs/apps/OS";
+const OS_ROOT_ALT: &str = "/mnt/workspace/Programs/apps/OS";
+const HOME_ROOT: &str = "/home/paulo";
 const TMP_ROOT: &str = "/tmp";
 const SMARTOS_ROUTER_URL: &str = "http://127.0.0.1:3000";
 
@@ -28,7 +30,12 @@ fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<PathBuf, Strin
         )
     };
 
-    if candidate.starts_with(OS_ROOT) || (allow_tmp && candidate.starts_with(TMP_ROOT)) {
+    // Allow OS root (both symlink and canonical paths), home dir, and /tmp
+    let in_os_root = candidate.starts_with(OS_ROOT) || candidate.starts_with(OS_ROOT_ALT);
+    let in_home = candidate.starts_with(HOME_ROOT);
+    let in_tmp = allow_tmp && candidate.starts_with(TMP_ROOT);
+
+    if in_os_root || in_home || in_tmp {
         Ok(candidate)
     } else {
         Err(format!(
