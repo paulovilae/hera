@@ -1251,6 +1251,82 @@ pub(crate) async fn execute_spline_interact(call: &ToolCall) -> ToolResult {
     }
 }
 
+// ── generate_access_link ──────────────────────────────────────────────────
+// Calls OS-v3 POST /api/auth/magic-link/create, returns a 30-min login URL
+// that Ava can send to Paulo over Telegram.
+pub(crate) async fn execute_generate_access_link(call: &ToolCall) -> ToolResult {
+    let redirect = call
+        .arguments
+        .get("redirect")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/editor")
+        .to_string();
+
+    // Read shared secret
+    let secret_path = std::env::var("OS_AUTH_SHARED_SECRET_FILE")
+        .unwrap_or_else(|_| "/home/paulo/.config/imagineos/secrets/os-auth-shared-secret".to_string());
+    let secret = match std::fs::read_to_string(&secret_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Could not read shared secret: {}", e),
+            }
+        }
+    };
+
+    let os_v3_url = std::env::var("OS_V3_INTERNAL_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:5177".to_string());
+    let endpoint = format!("{}/api/auth/magic-link/create", os_v3_url);
+
+    let body = serde_json::json!({
+        "email": "vilapaulo@gmail.com",
+        "name": "Paulo",
+        "redirect": redirect,
+        "admin": true
+    });
+
+    let client = reqwest::Client::new();
+    match client
+        .post(&endpoint)
+        .header("x-os-secret", &secret)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    let url = json["url"].as_str().unwrap_or("").to_string();
+                    info!("🔗 [Hera] Magic link generated → {}", url);
+                    ToolResult {
+                        name: call.name.clone(),
+                        success: true,
+                        output: format!("🔗 Aquí tu acceso (válido 30 min):\n{}", url),
+                    }
+                }
+                Err(e) => ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("Invalid response from OS-v3: {}", e),
+                },
+            }
+        }
+        Ok(resp) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("OS-v3 returned HTTP {}", resp.status()),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Could not reach OS-v3: {}", e),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ai::tool_executor::parse_tool_calls;

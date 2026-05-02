@@ -239,7 +239,7 @@ pub(crate) fn tool_risk_level(tool_name: &str) -> ToolRiskLevel {
 
     match tool_name {
         "run_code" | "write_file" | "update_soul" | "service_restart" | "api_request"
-        | "git_manager" | "desktop_click" | "desktop_type" => ToolRiskLevel::Critical,
+        | "git_manager" | "desktop_click" | "desktop_type" | "generate_access_link" => ToolRiskLevel::Critical,
         "read_file"
         | "web_scraper"
         | "spawn_parallel_agents"
@@ -1582,6 +1582,7 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "run_code" => platform::execute_run_code(call).await,
         "web_scraper" => platform::execute_web_scraper(call).await,
         "write_file" => platform::execute_write_file(call).await,
+        "generate_access_link" => platform::execute_generate_access_link(call).await,
         "spline_interact" => platform::execute_spline_interact(call).await,
         "desktop_click" => platform::execute_desktop_click(call).await,
         "desktop_type" => platform::execute_desktop_type(call).await,
