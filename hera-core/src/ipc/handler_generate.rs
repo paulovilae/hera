@@ -237,77 +237,109 @@ pub async fn handle_generate(
                 if let Some(choice) = resp.choices.first() {
                     if let Some(content) = &choice.message.content {
                         result_text = content.clone();
+                    }
 
-                        // 6. Parse and execute output tool calls
-                        let parsed_calls = crate::ai::tool_executor::parse_tool_calls(&result_text);
-                        if !parsed_calls.is_empty() {
-                            tracing::info!(
-                                "🛠️ [Hera IPC] LLM emitted {} tool calls",
-                                parsed_calls.len()
-                            );
-                            let tool_summary =
-                                execute_parsed_tool_calls(&parsed_calls, &parsed, None).await;
-                            let execution_outputs = tool_summary.execution_outputs;
+                    // 6. Parse and execute output tool calls
+                    let mut parsed_calls = crate::ai::tool_executor::parse_tool_calls(&result_text);
 
-                            if !tool_summary.has_media_call {
-                                let json_mode = payload_clone
-                                    .get("json_mode")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                if let Some(req2) = prepare_tool_result_followup_request(
-                                    chat_req.clone(),
-                                    &result_text,
-                                    &execution_outputs,
-                                    json_mode,
+                    if let Some(tc_array) = &choice.message.tool_calls {
+                        for tc in tc_array {
+                            let mut extracted_name = None;
+                            let mut extracted_args = None;
+                            
+                            if let (Some(name), Some(args)) = (
+                                tc.get("name").and_then(|n| n.as_str()),
+                                tc.get("arguments").or_else(|| tc.get("parameters")),
+                            ) {
+                                extracted_name = Some(name);
+                                extracted_args = Some(args);
+                            } else if let Some(func) = tc.get("function") {
+                                if let (Some(name), Some(args)) = (
+                                    func.get("name").and_then(|n| n.as_str()),
+                                    func.get("arguments").or_else(|| func.get("parameters")),
                                 ) {
-                                    tracing::info!(
-                                        "🔄 [Hera IPC] Initiating second-pass generation to format Tool Results (json_mode: {})...",
-                                        json_mode
-                                    );
-                                    match execute_tool_followup(
-                                        &state.engine,
-                                        req2,
-                                        FollowupStrategy::Buffered,
-                                    )
-                                    .await
-                                    {
-                                        Ok(followup) => {
-                                            let p2_origin =
-                                                followup.origin.as_deref().unwrap_or("unknown");
-                                            let p2_model = followup.model.as_deref().unwrap_or("");
-                                            tracing::info!(
-                                                "🔄 [Hera Generate] Second-pass response from {} — model: {}",
-                                                p2_origin,
-                                                p2_model
-                                            );
-                                            response_model =
-                                                followup.model.unwrap_or_else(String::new);
-                                            response_origin = p2_origin.to_string();
-                                            if !followup.text.is_empty() {
-                                                result_text = followup.text;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("Second pass inference failed: {}", e);
-                                            result_text.push_str(&format!(
-                                                "\n\n[Error forming final response: {}]\n{}",
-                                                e, execution_outputs
-                                            ));
-                                        }
+                                    extracted_name = Some(name);
+                                    extracted_args = Some(args);
+                                }
+                            }
+                            
+                            if let (Some(name), Some(args)) = (extracted_name, extracted_args) {
+                                let mut args_val = args.clone();
+                                if let Some(s) = args.as_str() {
+                                    if let Ok(parsed_args) = serde_json::from_str(s) {
+                                        args_val = parsed_args;
                                     }
                                 }
-                            } else {
-                                result_text.push_str(&execution_outputs);
+                                parsed_calls.push(crate::ai::tool_executor::ToolCall {
+                                    name: name.to_string(),
+                                    arguments: args_val,
+                                });
                             }
-
-                            tool_calls =
-                                Some(serde_json::Value::Array(tool_summary.executed_calls_json));
                         }
                     }
-                    if let Some(tc) = &choice.message.tool_calls {
-                        if tool_calls.is_none() {
-                            tool_calls = Some(serde_json::json!(tc));
+
+                    if !parsed_calls.is_empty() {
+                        tracing::info!(
+                            "🛠️ [Hera IPC] LLM emitted {} tool calls",
+                            parsed_calls.len()
+                        );
+                        let tool_summary =
+                            execute_parsed_tool_calls(&parsed_calls, &parsed, None).await;
+                        let execution_outputs = tool_summary.execution_outputs;
+
+                        if !tool_summary.has_media_call {
+                            let json_mode = payload_clone
+                                .get("json_mode")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            if let Some(req2) = prepare_tool_result_followup_request(
+                                chat_req.clone(),
+                                &result_text,
+                                &execution_outputs,
+                                json_mode,
+                            ) {
+                                tracing::info!(
+                                    "🔄 [Hera IPC] Initiating second-pass generation to format Tool Results (json_mode: {})...",
+                                    json_mode
+                                );
+                                match execute_tool_followup(
+                                    &state.engine,
+                                    req2,
+                                    FollowupStrategy::Buffered,
+                                )
+                                .await
+                                {
+                                    Ok(followup) => {
+                                        let p2_origin =
+                                            followup.origin.as_deref().unwrap_or("unknown");
+                                        let p2_model = followup.model.as_deref().unwrap_or("");
+                                        tracing::info!(
+                                            "🔄 [Hera Generate] Second-pass response from {} — model: {}",
+                                            p2_origin,
+                                            p2_model
+                                        );
+                                        response_model =
+                                            followup.model.unwrap_or_else(String::new);
+                                        response_origin = p2_origin.to_string();
+                                        if !followup.text.is_empty() {
+                                            result_text = followup.text;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Second pass inference failed: {}", e);
+                                        result_text.push_str(&format!(
+                                            "\n\n[Error forming final response: {}]\n{}",
+                                            e, execution_outputs
+                                        ));
+                                    }
+                                }
+                            }
+                        } else {
+                            result_text.push_str(&execution_outputs);
                         }
+
+                        tool_calls =
+                            Some(serde_json::Value::Array(tool_summary.executed_calls_json));
                     }
                 }
 

@@ -283,6 +283,7 @@ async fn dispatch_latinos_tool(call: &ToolCall) -> Option<ToolResult> {
         "scan_opportunities" => {
             apps_latinos::execute_latinos_bridge(call, "scan_opportunities").await
         }
+        "generate_pdf" => apps_latinos::execute_latinos_bridge(call, "generate_pdf").await,
         _ => return None,
     };
     Some(result)
