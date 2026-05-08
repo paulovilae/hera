@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["local-llm", "vision", "audio", "desktop-control", "execution-tools"]
+# Default is CPU-only router. LLM inference is delegated to external modules
+# (llama-server / candle-server) via HERA_PRIMARY_OMNI_URL and friends.
+# Single binary deploys to all nodes regardless of GPU presence.
+default = ["vision", "audio", "desktop-control", "execution-tools"]
+# Opt-in feature for edge nodes that need local inference (requires CUDA at runtime).
 local-llm = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:hf-hub", "dep:tokenizers", "dep:hound", "dep:llama-cpp-2"]
 vision = []
 audio = []
