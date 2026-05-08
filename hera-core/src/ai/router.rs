@@ -17,6 +17,30 @@ pub struct RouterEngine {
     cloud_engine: Arc<dyn LLMEngine + Send + Sync>,
 }
 
+/// Append a sovereignty marker to the assistant message. The bot persona (e.g. memo.md)
+/// can interpret these markers, but more importantly: the marker is deterministic
+/// regardless of LLM behavior. Imaginclaw / chat UIs use it to display the right image.
+///
+/// Local engines → Memo (the male blue-cat mascot — "we're sovereign")
+/// Cloud engines → Memo Familia (signals reliance on external API)
+fn tag_response_engine(response: &mut ChatResponse, engine_tag: &str) {
+    let (label, image_path) = match engine_tag {
+        "local-primary" | "local-secondary" | "local-tertiary" => {
+            ("Memo (Local Sovereign LLM)", "/imaginclaw/assets/memo_stand.jpg")
+        }
+        "cloud" => {
+            ("Memo Familia (Cloud API)", "/imaginclaw/assets/memo_family.jpg")
+        }
+        _ => return,
+    };
+    let marker = format!("\n\n![{}]({})", label, image_path);
+    if let Some(choice) = response.choices.first_mut() {
+        if let Some(content) = choice.message.content.as_mut() {
+            content.push_str(&marker);
+        }
+    }
+}
+
 impl RouterEngine {
     pub fn new(
         local_engine: Arc<dyn LLMEngine + Send + Sync>,
@@ -56,8 +80,9 @@ impl LLMEngine for RouterEngine {
                 primary_req.model
             );
             match self.primary_engine.generate_content(primary_req).await {
-                Ok(response) => {
+                Ok(mut response) => {
                     info!("✅ Primary sovereign execution successful");
+                    tag_response_engine(&mut response, "local-primary");
                     return Ok(response);
                 }
                 Err(e) => {
@@ -76,8 +101,9 @@ impl LLMEngine for RouterEngine {
                     with_explicit_endpoint(local_req.clone(), std::env::var("HERA_SECONDARY_OMNI_URL").ok());
                 info!("🕯️ Routing inference execution via Secondary Sovereign Engine...");
                 match secondary_engine.generate_content(secondary_req).await {
-                    Ok(response) => {
+                    Ok(mut response) => {
                         info!("✅ Secondary sovereign execution successful");
+                        tag_response_engine(&mut response, "local-secondary");
                         return Ok(response);
                     }
                     Err(e) => {
@@ -97,8 +123,9 @@ impl LLMEngine for RouterEngine {
                     with_explicit_endpoint(local_req.clone(), std::env::var("HERA_TERTIARY_OMNI_URL").ok());
                 info!("🕯️ Routing inference execution via Tertiary Sovereign Engine...");
                 match tertiary_engine.generate_content(tertiary_req).await {
-                    Ok(response) => {
+                    Ok(mut response) => {
                         info!("✅ Tertiary sovereign execution successful");
+                        tag_response_engine(&mut response, "local-tertiary");
                         return Ok(response);
                     }
                     Err(e) => {
@@ -118,8 +145,9 @@ impl LLMEngine for RouterEngine {
         if (provider == "auto" || provider == "gemini" || provider == "cloud") && cloud_allowed {
             info!("☁️ Re-routing inference execution onto Cloud MultiModal Engine...");
             match self.cloud_engine.generate_content(cloud_req).await {
-                Ok(response) => {
+                Ok(mut response) => {
                     info!("✅ Cloud failover successful");
+                    tag_response_engine(&mut response, "cloud");
                     return Ok(response);
                 }
                 Err(e) => {
