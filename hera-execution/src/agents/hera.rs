@@ -43,10 +43,12 @@ pub struct LoraEntry {
 impl Hera {
     /// Mounts Hera to the Sovereign OS routing bounds.
     pub fn new(smartos_router_url: &str) -> Self {
+        let draw_url = std::env::var("HERA_DRAW_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string());
         Self {
             mcp_client: McpHttpClient::new(smartos_router_url),
             http_client: reqwest::Client::new(),
-            draw_url: "http://127.0.0.1:8999".to_string(), // Direct sd.cpp bind
+            draw_url,
         }
     }
 
