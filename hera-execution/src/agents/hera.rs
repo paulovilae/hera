@@ -4,6 +4,7 @@ use serde_json::json;
 use base64::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Hera is the primary Multimodal Rust Agent orchestrator inside the Execution Layer.
@@ -45,9 +46,13 @@ impl Hera {
     pub fn new(smartos_router_url: &str) -> Self {
         let draw_url = std::env::var("HERA_DRAW_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string());
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_default();
         Self {
             mcp_client: McpHttpClient::new(smartos_router_url),
-            http_client: reqwest::Client::new(),
+            http_client,
             draw_url,
         }
     }
