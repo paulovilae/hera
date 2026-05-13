@@ -3,6 +3,13 @@
 use super::types::{HandlerOutcome, IpcPayload, IpcState};
 use crate::ai::{ChatMessage, ChatRequest, ContentPart, MessageContent};
 
+/// Returns the sd.cpp image generation base URL.
+/// Override with HERA_DRAW_URL to point at a mesh node (e.g. genesis via Tailscale).
+fn draw_url() -> String {
+    std::env::var("HERA_DRAW_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string())
+}
+
 /// Handle the "generate_image" action — FLUX/sd.cpp image generation with auto-LoRA.
 #[cfg_attr(not(feature = "local-llm"), allow(unused_variables))]
 pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> HandlerOutcome {
@@ -83,7 +90,8 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
         }
     }
     {
-        // Fallback to sd.cpp REST API
+        // Fallback to sd.cpp REST API (endpoint configurable via HERA_DRAW_URL)
+        let draw_endpoint = format!("{}/v1/images/generations", draw_url());
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
             "prompt": prompt,
@@ -92,7 +100,7 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
             "response_format": "b64_json"
         });
         match client
-            .post("http://127.0.0.1:8999/v1/images/generations")
+            .post(&draw_endpoint)
             .json(&payload)
             .send()
             .await
@@ -304,6 +312,7 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .unwrap_or_default();
+        let flux_draw_endpoint = format!("{}/v1/images/generations", draw_url());
         let flux_payload = serde_json::json!({
             "prompt": enhanced,
             "width": width,
@@ -312,7 +321,7 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
             "cfg_scale": 1.0,
         });
         match flux_client
-            .post("http://127.0.0.1:8999/v1/images/generations")
+            .post(&flux_draw_endpoint)
             .json(&flux_payload)
             .send()
             .await
