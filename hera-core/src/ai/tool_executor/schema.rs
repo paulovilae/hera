@@ -325,6 +325,7 @@ fn is_latinos_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "list_bots"
+            | "list_markets"
             | "get_bot_status"
             | "market_research"
             | "analyze_market_research"

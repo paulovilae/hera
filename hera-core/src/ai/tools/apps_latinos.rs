@@ -4,6 +4,13 @@ use crate::ai::tools::data::execute_memento_query;
 use serde_json::Value;
 use std::process::Command;
 
+fn latinos_tools_python() -> String {
+    std::env::var("LATINOS_TOOLS_PYTHON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/home/paulo/.venvs/latinos-tools/bin/python".to_string())
+}
+
 pub(crate) async fn execute_market_research_json(call: &ToolCall) -> Result<Value, String> {
     let ticker = call
         .arguments
@@ -14,7 +21,7 @@ pub(crate) async fn execute_market_research_json(call: &ToolCall) -> Result<Valu
         .ok_or_else(|| "Missing 'ticker' argument".to_string())?;
 
     let script_path = "/home/paulo/Programs/apps/OS/Tools/apps/latinos/scripts/market_research.py";
-    let output = Command::new("python3")
+    let output = Command::new(latinos_tools_python())
         .arg(script_path)
         .arg(ticker)
         .output()
@@ -128,6 +135,45 @@ pub(crate) async fn execute_list_bots(call: &ToolCall) -> ToolResult {
     result
 }
 
+pub(crate) async fn execute_list_markets(call: &ToolCall) -> ToolResult {
+    let limit = call
+        .arguments
+        .get("limit")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(25)
+        .clamp(1, 100);
+
+    let memento_call = ToolCall {
+        name: "memento_query".to_string(),
+        arguments: serde_json::json!({
+            "app": "latinos",
+            "query": format!(
+                "WITH symbols AS (
+                    SELECT UPPER(symbol) AS symbol, COUNT(*)::bigint AS cached_candles, MAX(ts) AS last_seen
+                    FROM latinos_market_data
+                    GROUP BY UPPER(symbol)
+                    UNION ALL
+                    SELECT UPPER(COALESCE(symbol, market)) AS symbol, 0::bigint AS cached_candles, MAX(completed_at) AS last_seen
+                    FROM latinos_backtests
+                    WHERE COALESCE(symbol, market) IS NOT NULL
+                    GROUP BY UPPER(COALESCE(symbol, market))
+                )
+                SELECT symbol, SUM(cached_candles) AS cached_candles, MAX(last_seen) AS last_seen
+                FROM symbols
+                WHERE symbol IS NOT NULL AND symbol <> ''
+                GROUP BY symbol
+                ORDER BY cached_candles DESC, last_seen DESC NULLS LAST, symbol ASC
+                LIMIT {}",
+                limit
+            )
+        }),
+    };
+
+    let mut result = execute_memento_query(&memento_call).await;
+    result.name = call.name.clone();
+    result
+}
+
 pub(crate) async fn execute_get_bot_status(call: &ToolCall) -> ToolResult {
     let Some(bot_id) = call
         .arguments
@@ -209,7 +255,7 @@ pub(crate) async fn execute_latinos_bridge(call: &ToolCall, tool: &str) -> ToolR
     let script = "/home/paulo/Programs/apps/OS/Tools/apps/latinos/scripts/latinos_bridge.py";
 
     // Build CLI args from the tool call arguments
-    let mut cmd = tokio::process::Command::new("python3");
+    let mut cmd = tokio::process::Command::new(latinos_tools_python());
     cmd.arg(script).arg(tool);
 
     // Forward known arguments as flags

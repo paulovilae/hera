@@ -271,6 +271,7 @@ async fn dispatch_movilo_tool(call: &ToolCall) -> Option<ToolResult> {
 async fn dispatch_latinos_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
         "list_bots" => apps_latinos::execute_list_bots(call).await,
+        "list_markets" => apps_latinos::execute_list_markets(call).await,
         "get_bot_status" => apps_latinos::execute_get_bot_status(call).await,
         "market_research" | "analyze_market_research" => {
             apps_latinos::execute_market_research(call).await
