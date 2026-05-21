@@ -100,8 +100,18 @@ The 1500-line file limit applies. `tool_executor.rs` is already large; split by 
 
 ## Build
 
+**IMPORTANT — GPU nodes must use `--features local-llm`.** Without that flag,
+the primary engine becomes a stub that fails every request with "Local LLM
+engine is explicitly disabled", causing Hera to failover to secondary URLs
+via WireGuard (10-40s latency). On 2026-05-21 this was the root cause of
+~40s chat latency on paulovila.org; rebuilding genesis Hera with the flag
+brought latency back to ~1s.
+
 ```bash
-# From OS root (as submodule)
+# GPU nodes (genesis, atlas) — required for sovereign-local routing
+cd Hera && cargo build --release --bin hera-core --features local-llm
+
+# CPU-only nodes (anchor) — no GPU, uses cloud/secondary path
 cd Hera && cargo build --release --bin hera-core
 
 # Run in IPC mode (production)
@@ -110,6 +120,13 @@ IPC_MODE=true ./target/release/hera-core
 # Local CLI (routes through Hera IPC)
 cargo run -p hera-core --bin claude -- -p "your prompt"
 cargo run -p hera-core --bin claude    # interactive
+```
+
+### Verifying after restart
+
+```bash
+pm2 logs hera-core --lines 30 --nostream | grep -E "Sovereign|🧠"
+# Expect "🧠 Sovereign Native Omni Engine mounted!" — NOT "disabled"
 ```
 
 ---
