@@ -8,6 +8,7 @@
 //!   - `Result { ... }`: data for the dispatcher to format and send
 
 pub mod context;
+pub mod difficulty;
 pub mod handler_audio;
 pub mod handler_dag;
 pub mod handler_delegation;

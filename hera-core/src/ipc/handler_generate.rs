@@ -343,6 +343,41 @@ pub async fn handle_generate(
                     }
                 }
 
+                // Frame B3: quality cascade. If a non-tool local answer is poor
+                // (empty / too short / disclaims) and didn't already come from
+                // cloud, escalate once to the cloud failover. Sovereign-first:
+                // this only fires on demonstrated local-quality failure, and only
+                // replaces the answer if the escalation is actually better.
+                if tool_calls.is_none() && response_origin != "cloud" {
+                    let difficulty = super::difficulty::Difficulty::from_reasoning_effort(
+                        &parsed.reasoning_effort,
+                    );
+                    if super::difficulty::is_low_quality_answer(&result_text, difficulty)
+                        && let Some(mut cloud_req) = chat_req.clone()
+                    {
+                        cloud_req.provider = Some("cloud".to_string());
+                        tracing::info!(
+                            "⬆️ [Hera B3] Local answer low-quality (difficulty={}); escalating to cloud failover",
+                            difficulty.as_str()
+                        );
+                        match state.engine.generate_content(cloud_req).await {
+                            Ok(resp2) => {
+                                if let Some(choice) = resp2.choices.first()
+                                    && let Some(content) = &choice.message.content
+                                    && !super::difficulty::is_low_quality_answer(content, difficulty)
+                                {
+                                    result_text = content.clone();
+                                    response_origin = "cloud".to_string();
+                                    response_model = resp2.model.clone();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("B3 cloud escalation failed: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 let duration_ms = started_at.elapsed().as_millis() as u64;
                 let outcome = build_runtime_outcome_artifacts(
                     "generate",

@@ -68,6 +68,8 @@ pub struct ParsedPayload {
     pub expected_persona_path: String,
     pub persona_drift: bool,
     pub context_budget: ContextBudget,
+    /// reasoning_effort hint derived from query difficulty (low/medium/high).
+    pub reasoning_effort: String,
 }
 
 pub fn apply_runtime_preflight(
@@ -106,6 +108,33 @@ pub async fn prepare_runtime_execution_context(
     mode: &str,
 ) -> PreparedRuntimeContext {
     let lightweight_mode = is_lightweight_conversation(&parsed.prompt);
+
+    // Frame B1: classify difficulty and scale local effort. Runs off the async
+    // runtime because the gray-zone tiebreak may embed the prompt (CPU-bound).
+    let difficulty = {
+        let prompt = parsed.prompt.clone();
+        tokio::task::spawn_blocking(move || super::difficulty::classify(&prompt))
+            .await
+            .unwrap_or(super::difficulty::Difficulty::Normal)
+    };
+    parsed.reasoning_effort = difficulty.reasoning_effort().to_string();
+    // A Hard query (and no explicit caller override) gets the heavy budget so the
+    // local model has full tools/schema/memory + history headroom. Cloud stays a
+    // failover only — difficulty never routes off-node.
+    if !caller_overrode_budget
+        && !lightweight_mode
+        && let Some(mode) = difficulty.budget_mode()
+    {
+        parsed.context_budget = context_budget_for_mode(mode, lightweight_mode);
+    }
+    tracing::info!(
+        app = %parsed.app_name,
+        route_profile = %parsed.route_profile_id,
+        difficulty = %difficulty.as_str(),
+        budget = %parsed.context_budget.mode,
+        "Difficulty-routed query"
+    );
+
     let runtime_preflight = fetch_runtime_preflight(
         &parsed.app_name,
         &parsed.route_profile_id,
@@ -165,6 +194,11 @@ pub async fn prepare_chat_request(
     }
 
     if let Some(req) = &mut chat_req {
+        // Frame B1: apply the difficulty-derived reasoning effort unless the
+        // caller set one explicitly.
+        if req.reasoning_effort.is_none() {
+            req.reasoning_effort = Some(parsed.reasoning_effort.clone());
+        }
         apply_history_budget(req, &parsed.context_budget);
         compress_if_needed(req, engine, &parsed.context_budget).await;
     }
@@ -670,6 +704,8 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         expected_persona_path: route_profile.persona_path.to_string(),
         persona_drift,
         context_budget,
+        // Refined by difficulty classification in prepare_runtime_execution_context.
+        reasoning_effort: "medium".to_string(),
     }
 }
 
