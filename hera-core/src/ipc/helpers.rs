@@ -539,6 +539,86 @@ pub fn format_schema_for_prompt(
     output
 }
 
+// ─── Local embedding (in-process candle, local-llm builds only) ────────────
+
+/// Embed a single text to a vector using the in-process candle model. Returns
+/// None on CPU-only builds (no `local-llm`) or on any failure, so callers
+/// degrade gracefully to keyword recall.
+#[cfg(feature = "local-llm")]
+pub fn embed_text_local(text: &str) -> Option<Vec<f32>> {
+    let owned = vec![text.to_string()];
+    match crate::ai::embeddings::embed_texts(&owned) {
+        Ok(mut v) => v.pop(),
+        Err(e) => {
+            tracing::warn!("embed_text_local failed: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "local-llm"))]
+pub fn embed_text_local(_text: &str) -> Option<Vec<f32>> {
+    None
+}
+
+/// Fetch semantically relevant memories for (user_id, app_id, session_id) by
+/// embedding the query and asking Memento's semantic_recall to cosine-rerank the
+/// scope-filtered rows. Formats the top matches as a prompt fragment. Empty
+/// string on any failure (incl. non-local-llm builds where embedding is None).
+pub async fn fetch_semantic_memories(
+    user_id: &str,
+    app_id: &str,
+    session_id: &str,
+    query: &str,
+) -> String {
+    if user_id.is_empty() || query.trim().is_empty() {
+        return String::new();
+    }
+    let q = query.to_string();
+    let embedding = match tokio::task::spawn_blocking(move || embed_text_local(&q)).await {
+        Ok(Some(e)) => e,
+        _ => return String::new(),
+    };
+
+    let mut payload = serde_json::json!({
+        "user_id": user_id,
+        "query_embedding": embedding,
+        "limit": 4,
+        "min_score": 0.3,
+    });
+    if !app_id.is_empty() {
+        payload["app_id"] = serde_json::Value::String(app_id.to_string());
+    }
+    if !session_id.is_empty() {
+        payload["session_id"] = serde_json::Value::String(session_id.to_string());
+    }
+
+    let Some(resp) = call_memento("semantic_recall", payload).await else {
+        return String::new();
+    };
+    let Some(entries) = resp.get("entries").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut section = String::new();
+    for item in entries.iter().take(4) {
+        if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let snippet: String = trimmed.chars().take(240).collect();
+                section.push_str(&format!("- {}\n", snippet));
+            }
+        }
+    }
+    if section.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n# SEMANTICALLY RELEVANT MEMORIES (Memento cosine recall)\n{}",
+            section
+        )
+    }
+}
+
 // ─── Recursive scoped-memory wiring (Memento <-> Hera) ─────────────────────
 
 /// Derive a stable user_id for Memento scoped_memory from the identifiers Hera receives.
@@ -657,7 +737,7 @@ pub async fn save_chat_turn_event(
     if user_id.is_empty() || content.trim().is_empty() {
         return;
     }
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "user_id": user_id,
         "tenant_id": "default",
         "app_id": app_id,
@@ -669,6 +749,11 @@ pub async fn save_chat_turn_event(
         "tags": ["chat", role],
         "auto_derive": true,
     });
+    // Attach a semantic embedding so this turn is retrievable by meaning, not
+    // just keywords. No-op on CPU-only builds (embed_text_local returns None).
+    if let Some(embedding) = embed_text_local(&content) {
+        payload["embedding"] = serde_json::json!(embedding);
+    }
     if let Some(resp) = call_memento("save_scoped_memory", payload).await
         && let Some(err) = resp.get("error").and_then(|v| v.as_str())
     {

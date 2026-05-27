@@ -11,6 +11,7 @@ pub mod context;
 pub mod handler_audio;
 pub mod handler_dag;
 pub mod handler_delegation;
+pub mod handler_embed;
 pub mod handler_generate;
 pub mod handler_health;
 pub mod handler_lora;
@@ -147,6 +148,7 @@ async fn dispatch(
 ) -> HandlerOutcome {
     match request.action.as_str() {
         "execute_tool" => handler_tools::handle_execute_tool(request, state, stream).await,
+        "embed" => handler_embed::handle_embed(request, state, stream).await,
         "generate" => handler_generate::handle_generate(request, state, stream).await,
         "generate_stream" => handler_stream::handle_generate_stream(request, state, stream).await,
         "delegate_task" => handler_delegation::handle_delegate_task(request, state, stream).await,

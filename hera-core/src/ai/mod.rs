@@ -12,6 +12,8 @@ pub mod tool_executor;
 pub mod tools;
 
 #[cfg(feature = "local-llm")]
+pub mod embeddings;
+#[cfg(feature = "local-llm")]
 pub mod engine_faster_whisper;
 #[cfg(feature = "local-llm")]
 pub mod engine_flux;
