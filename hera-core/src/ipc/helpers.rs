@@ -538,3 +538,181 @@ pub fn format_schema_for_prompt(
     }
     output
 }
+
+// ─── Recursive scoped-memory wiring (Memento <-> Hera) ─────────────────────
+
+/// Derive a stable user_id for Memento scoped_memory from the identifiers Hera receives.
+/// Falls back: sender_name (canonicalized) -> "chat:<chat_id>" -> "anonymous:<session_id>".
+pub fn canonicalize_user_id(sender_name: &str, chat_id: &str, session_id: &str) -> String {
+    let sender = sender_name.trim();
+    if !sender.is_empty() {
+        let canonical: String = sender
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let trimmed = canonical.trim_matches('_').to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let chat = chat_id.trim();
+    if !chat.is_empty() {
+        return format!("chat:{}", chat);
+    }
+    let session = session_id.trim();
+    if !session.is_empty() {
+        return format!("anonymous:{}", session);
+    }
+    "anonymous".to_string()
+}
+
+fn format_recursive_context(ctx: &serde_json::Value) -> String {
+    let mut buf = String::new();
+    let mut push_list = |label: &str, list: Option<&serde_json::Value>, take: usize, max_chars: usize| {
+        let Some(items) = list.and_then(|v| v.as_array()) else { return; };
+        if items.is_empty() {
+            return;
+        }
+        let mut section = String::new();
+        for item in items.iter().take(take) {
+            if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    let snippet: String = trimmed.chars().take(max_chars).collect();
+                    section.push_str(&format!("- {}\n", snippet));
+                }
+            }
+        }
+        if !section.is_empty() {
+            buf.push_str(&format!("\n## {}\n{}", label, section));
+        }
+    };
+
+    push_list("Project context", ctx.get("project_summaries"), 3, 280);
+    push_list("Room context", ctx.get("room_summaries"), 3, 280);
+    push_list("Session context", ctx.get("session_summaries"), 3, 280);
+    push_list("Durable facts", ctx.get("durable_facts"), 3, 220);
+    push_list("Recent events", ctx.get("recent_events"), 3, 220);
+
+    if let Some(working) = ctx.get("working_context").and_then(|v| v.as_object()) {
+        let mut working_buf = String::new();
+        for key in ["summaries", "decisions", "preferences", "open_loops"] {
+            if let Some(entries) = working.get(key).and_then(|v| v.as_array()) {
+                for item in entries.iter().take(2) {
+                    if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                        let trimmed = content.trim();
+                        if !trimmed.is_empty() {
+                            let snippet: String = trimmed.chars().take(220).collect();
+                            working_buf.push_str(&format!("- [{}] {}\n", key, snippet));
+                        }
+                    }
+                }
+            }
+        }
+        if !working_buf.is_empty() {
+            buf.push_str(&format!("\n## Working context\n{}", working_buf));
+        }
+    }
+
+    if buf.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n# RECURSIVE CONTEXT (Memento scoped_memory)\n{}", buf)
+    }
+}
+
+/// Fetch recursive scoped-memory context for (user_id, app_id, session_id) and format it for
+/// prompt injection. Returns empty string on any error so the caller can concatenate safely.
+pub async fn fetch_recursive_context(user_id: &str, app_id: &str, session_id: &str) -> String {
+    if user_id.is_empty() {
+        return String::new();
+    }
+    let mut payload = serde_json::json!({ "user_id": user_id });
+    if !app_id.is_empty() {
+        payload["app_id"] = serde_json::Value::String(app_id.to_string());
+    }
+    if !session_id.is_empty() {
+        payload["session_id"] = serde_json::Value::String(session_id.to_string());
+    }
+    let Some(response) = call_memento("recall_recursive_context", payload).await else {
+        return String::new();
+    };
+    let Some(ctx) = response.get("recursive_context") else {
+        return String::new();
+    };
+    format_recursive_context(ctx)
+}
+
+/// Persist a single conversation turn as a scoped_memory event. Fire-and-forget — errors only
+/// log via tracing. Memento's auto_derive=true triggers session/room/project summary derivation
+/// once enough events accumulate, which subsequent calls to `fetch_recursive_context` surface.
+pub async fn save_chat_turn_event(
+    user_id: String,
+    app_id: String,
+    session_id: String,
+    role: String,
+    content: String,
+) {
+    if user_id.is_empty() || content.trim().is_empty() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "user_id": user_id,
+        "tenant_id": "default",
+        "app_id": app_id,
+        "session_id": session_id,
+        "scope": "personal",
+        "source": "hera_chat",
+        "memory_type": "event",
+        "content": content,
+        "tags": ["chat", role],
+        "auto_derive": true,
+    });
+    if let Some(resp) = call_memento("save_scoped_memory", payload).await
+        && let Some(err) = resp.get("error").and_then(|v| v.as_str())
+    {
+        tracing::warn!("save_chat_turn_event failed: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_user_id;
+
+    #[test]
+    fn canonicalize_prefers_sender_name() {
+        assert_eq!(
+            canonicalize_user_id("Paulo Vila", "chat-1", "sess-1"),
+            "paulo_vila"
+        );
+    }
+
+    #[test]
+    fn canonicalize_falls_back_to_chat_id_when_sender_blank() {
+        assert_eq!(
+            canonicalize_user_id("", "telegram_42", "sess-9"),
+            "chat:telegram_42"
+        );
+    }
+
+    #[test]
+    fn canonicalize_falls_back_to_anonymous_session() {
+        assert_eq!(canonicalize_user_id("", "", "abc-123"), "anonymous:abc-123");
+    }
+
+    #[test]
+    fn canonicalize_returns_anonymous_when_all_blank() {
+        assert_eq!(canonicalize_user_id("", "", ""), "anonymous");
+    }
+
+    #[test]
+    fn canonicalize_strips_non_alnum_from_sender() {
+        // Unicode alphanumerics (í, á, é) are preserved — sender_name keeps natural diacritics.
+        // Only spaces and ASCII punctuation collapse to underscores, with edge underscores trimmed.
+        assert_eq!(
+            canonicalize_user_id("María García-Pérez!", "", ""),
+            "maría_garcía_pérez"
+        );
+    }
+}

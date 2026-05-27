@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use super::helpers::{fetch_db_schema_context, fetch_runtime_preflight, fetch_semantic_memory};
+use super::helpers::{
+    canonicalize_user_id, fetch_db_schema_context, fetch_recursive_context,
+    fetch_runtime_preflight, fetch_semantic_memory,
+};
 use super::llm_audit::{LlmAuditEvent, build_event};
 use super::route_profiles::resolve_route_profile;
 use crate::ai::{ChatMessage, ChatRequest, ContentPart, LLMEngine, MessageContent};
@@ -30,6 +33,7 @@ pub struct PromptAssembly {
     pub memory_chars: usize,
     pub tool_schema_chars: usize,
     pub db_schema_chars: usize,
+    pub recursive_context_chars: usize,
 }
 
 pub struct RuntimeOutcomeArtifacts {
@@ -127,6 +131,8 @@ pub async fn prepare_runtime_execution_context(
         &parsed.page_url,
         &parsed.page_title,
         &parsed.page_context,
+        &parsed.session_id,
+        &parsed.chat_id,
     )
     .await;
 
@@ -681,6 +687,8 @@ pub async fn build_full_system_prompt(
     page_url: &str,
     page_title: &str,
     page_context: &str,
+    session_id: &str,
+    chat_id: &str,
 ) -> PromptAssembly {
     let memento_ctx = if budget.include_memory {
         clamp_chars(
@@ -690,11 +698,21 @@ pub async fn build_full_system_prompt(
     } else {
         String::new()
     };
+    let recursive_ctx = if budget.include_memory && !lightweight_mode {
+        let user_id = canonicalize_user_id(sender_name, chat_id, session_id);
+        clamp_chars(
+            fetch_recursive_context(&user_id, app_name, session_id).await,
+            budget.max_memory_chars,
+        )
+    } else {
+        String::new()
+    };
     let base_system_prompt = format!(
-        "{}{}",
+        "{}{}{}",
         std::fs::read_to_string(persona_path)
             .unwrap_or_else(|_| "You are an AI assistant.".to_string()),
-        memento_ctx
+        memento_ctx,
+        recursive_ctx
     );
 
     let agent_identity = std::path::Path::new(persona_path)
@@ -781,6 +799,7 @@ pub async fn build_full_system_prompt(
         memory_chars: memento_ctx.len(),
         tool_schema_chars: schemas.len(),
         db_schema_chars: db_schema_ctx.len(),
+        recursive_context_chars: recursive_ctx.len(),
     }
 }
 

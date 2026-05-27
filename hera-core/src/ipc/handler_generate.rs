@@ -5,8 +5,8 @@ use super::context::{
     prepare_runtime_execution_context, prepare_tool_result_followup_request,
 };
 use super::helpers::{
-    RuntimePromotionContext, infer_origin_from_model, record_observation_and_promote_runtime_hint,
-    record_runtime_observation,
+    RuntimePromotionContext, canonicalize_user_id, infer_origin_from_model,
+    record_observation_and_promote_runtime_hint, record_runtime_observation, save_chat_turn_event,
 };
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
@@ -385,6 +385,36 @@ pub async fn handle_generate(
                     },
                 )
                 .await;
+
+                if !lightweight_mode && parsed.context_budget.include_memory {
+                    let user_id = canonicalize_user_id(
+                        &parsed.sender_name,
+                        &parsed.chat_id,
+                        &parsed.session_id,
+                    );
+                    let app_id = parsed.app_name.clone();
+                    let session_id = parsed.session_id.clone();
+                    let user_content = parsed.prompt.clone();
+                    let assistant_content = result_text.clone();
+                    tokio::spawn(async move {
+                        save_chat_turn_event(
+                            user_id.clone(),
+                            app_id.clone(),
+                            session_id.clone(),
+                            "user".to_string(),
+                            user_content,
+                        )
+                        .await;
+                        save_chat_turn_event(
+                            user_id,
+                            app_id,
+                            session_id,
+                            "assistant".to_string(),
+                            assistant_content,
+                        )
+                        .await;
+                    });
+                }
 
                 return HandlerOutcome::Result {
                     result_text,

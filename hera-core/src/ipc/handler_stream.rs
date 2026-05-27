@@ -5,7 +5,8 @@ use super::context::{
     prepare_runtime_execution_context, prepare_tool_result_followup_request,
 };
 use super::helpers::{
-    RuntimePromotionContext, infer_origin_from_model, record_observation_and_promote_runtime_hint,
+    RuntimePromotionContext, canonicalize_user_id, infer_origin_from_model,
+    record_observation_and_promote_runtime_hint, save_chat_turn_event,
     record_runtime_observation,
 };
 use super::llm_audit::append_llm_audit_event;
@@ -353,6 +354,36 @@ pub async fn handle_generate_stream(
                     },
                 )
                 .await;
+
+                if !lightweight_mode && parsed.context_budget.include_memory {
+                    let user_id = canonicalize_user_id(
+                        &parsed.sender_name,
+                        &parsed.chat_id,
+                        &parsed.session_id,
+                    );
+                    let app_id = parsed.app_name.clone();
+                    let session_id = parsed.session_id.clone();
+                    let user_content = parsed.prompt.clone();
+                    let assistant_content = final_result_text.clone();
+                    tokio::spawn(async move {
+                        save_chat_turn_event(
+                            user_id.clone(),
+                            app_id.clone(),
+                            session_id.clone(),
+                            "user".to_string(),
+                            user_content,
+                        )
+                        .await;
+                        save_chat_turn_event(
+                            user_id,
+                            app_id,
+                            session_id,
+                            "assistant".to_string(),
+                            assistant_content,
+                        )
+                        .await;
+                    });
+                }
             }
             Err(e) => {
                 let err_msg = IpcResponse {
