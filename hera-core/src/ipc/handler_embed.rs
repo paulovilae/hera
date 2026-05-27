@@ -49,7 +49,7 @@ pub async fn handle_embed(
     HandlerOutcome::DirectResponse
 }
 
-#[cfg(feature = "local-llm")]
+#[cfg(feature = "embeddings")]
 async fn compute_embeddings(texts: Vec<String>) -> IpcResponse {
     // CPU-bound work: run off the async runtime.
     let result =
@@ -74,12 +74,12 @@ async fn compute_embeddings(texts: Vec<String>) -> IpcResponse {
     }
 }
 
-#[cfg(not(feature = "local-llm"))]
+#[cfg(not(feature = "embeddings"))]
 async fn compute_embeddings(_texts: Vec<String>) -> IpcResponse {
     IpcResponse {
         status: "error".to_string(),
         data: serde_json::json!({
-            "error": "embeddings unavailable: hera-core built without --features local-llm on this node"
+            "error": "embeddings unavailable: hera-core built without the `embeddings` feature on this node"
         }),
     }
 }

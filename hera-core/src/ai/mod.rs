@@ -11,7 +11,7 @@ pub mod router;
 pub mod tool_executor;
 pub mod tools;
 
-#[cfg(feature = "local-llm")]
+#[cfg(feature = "embeddings")]
 pub mod embeddings;
 #[cfg(feature = "local-llm")]
 pub mod engine_faster_whisper;

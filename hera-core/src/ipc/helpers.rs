@@ -544,7 +544,7 @@ pub fn format_schema_for_prompt(
 /// Embed a single text to a vector using the in-process candle model. Returns
 /// None on CPU-only builds (no `local-llm`) or on any failure, so callers
 /// degrade gracefully to keyword recall.
-#[cfg(feature = "local-llm")]
+#[cfg(feature = "embeddings")]
 pub fn embed_text_local(text: &str) -> Option<Vec<f32>> {
     let owned = vec![text.to_string()];
     match crate::ai::embeddings::embed_texts(&owned) {
@@ -556,7 +556,7 @@ pub fn embed_text_local(text: &str) -> Option<Vec<f32>> {
     }
 }
 
-#[cfg(not(feature = "local-llm"))]
+#[cfg(not(feature = "embeddings"))]
 pub fn embed_text_local(_text: &str) -> Option<Vec<f32>> {
     None
 }
