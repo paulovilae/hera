@@ -23,8 +23,24 @@ fn fold_accents_lower(s: &str) -> String {
         .collect()
 }
 
+// Strip a trailing Spanish plural suffix so a user typing "odontólogos" or
+// "doctores" still matches singular rows like "Odontólogo" or "Doctor".
+// Conservative: only strips if the remainder is ≥ 3 chars, so short words
+// ("mas", "los") are left alone.
+fn singularize_es(s: &str) -> &str {
+    if s.len() > 4 && s.ends_with("es") {
+        &s[..s.len() - 2]
+    } else if s.len() > 3 && s.ends_with('s') {
+        &s[..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 fn folded_like(column: &str, raw_input: &str) -> String {
-    let folded = fold_accents_lower(raw_input).replace('\'', "''");
+    let lowered = fold_accents_lower(raw_input);
+    let trimmed = singularize_es(&lowered);
+    let folded = trimmed.replace('\'', "''");
     format!(
         "lower(translate({column}, '{ACCENT_FROM}', '{ACCENT_TO}')) LIKE '%{folded}%'"
     )
