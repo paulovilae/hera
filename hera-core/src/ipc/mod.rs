@@ -7,8 +7,10 @@
 //!   - `DirectResponse`: the handler already wrote its own response to the socket
 //!   - `Result { ... }`: data for the dispatcher to format and send
 
+pub mod argus_client;
 pub mod context;
 pub mod difficulty;
+pub mod handler_argus;
 pub mod handler_audio;
 pub mod handler_dag;
 pub mod handler_delegation;
@@ -150,6 +152,9 @@ async fn dispatch(
     match request.action.as_str() {
         "execute_tool" => handler_tools::handle_execute_tool(request, state, stream).await,
         "embed" => handler_embed::handle_embed(request, state, stream).await,
+        "recommended_variant" => {
+            handler_argus::handle_recommended_variant(request, state, stream).await
+        }
         "generate" => handler_generate::handle_generate(request, state, stream).await,
         "generate_stream" => handler_stream::handle_generate_stream(request, state, stream).await,
         "delegate_task" => handler_delegation::handle_delegate_task(request, state, stream).await,
