@@ -2,6 +2,34 @@
 use crate::ai::tool_executor::{ToolCall, ToolResult};
 use crate::ai::tools::data::execute_memento_query;
 
+// Postgres `translate()` folds accents on the column side; both sides also get
+// `lower()` to be case-insensitive. Spanish dataset has rows like "Odontólogos"
+// while users type "odontologos" — without folding the ILIKE never matched.
+const ACCENT_FROM: &str = "ÁÀÄÂÃÉÈËÊÍÌÏÎÓÒÖÔÕÚÙÜÛÑÇáàäâãéèëêíìïîóòöôõúùüûñç";
+const ACCENT_TO: &str = "AAAAAEEEEIIIIOOOOOUUUUNCaaaaaeeeeiiiioooooouuuunc";
+
+fn fold_accents_lower(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'á' | 'à' | 'ä' | 'â' | 'ã' | 'Á' | 'À' | 'Ä' | 'Â' | 'Ã' => 'a',
+            'é' | 'è' | 'ë' | 'ê' | 'É' | 'È' | 'Ë' | 'Ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' | 'Í' | 'Ì' | 'Ï' | 'Î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' | 'õ' | 'Ó' | 'Ò' | 'Ö' | 'Ô' | 'Õ' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' | 'Ú' | 'Ù' | 'Ü' | 'Û' => 'u',
+            'ñ' | 'Ñ' => 'n',
+            'ç' | 'Ç' => 'c',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+fn folded_like(column: &str, raw_input: &str) -> String {
+    let folded = fold_accents_lower(raw_input).replace('\'', "''");
+    format!(
+        "lower(translate({column}, '{ACCENT_FROM}', '{ACCENT_TO}')) LIKE '%{folded}%'"
+    )
+}
+
 pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResult {
     let city = call
         .arguments
@@ -21,16 +49,13 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
 
     let mut conditions = vec!["p.status = 'Aprobado'".to_string()];
     if !city.is_empty() {
-        conditions.push(format!("p.city ILIKE '%{}%'", city.replace("'", "''")));
+        conditions.push(folded_like("p.city", city));
     }
     if !specialty.is_empty() {
-        conditions.push(format!(
-            "p.provider_type ILIKE '%{}%'",
-            specialty.replace("'", "''")
-        ));
+        conditions.push(folded_like("p.provider_type", specialty));
     }
     if !keyword.is_empty() {
-        conditions.push(format!("s.name ILIKE '%{}%'", keyword.replace("'", "''")));
+        conditions.push(folded_like("s.name", keyword));
     }
 
     let query = format!(
