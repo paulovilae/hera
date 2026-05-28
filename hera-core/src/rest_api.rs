@@ -492,6 +492,7 @@ fn anthropic_to_chat_request(payload: &AnthropicMessageRequest) -> Result<ChatRe
         tools: payload.tools.clone(),
         tool_choice: payload.tool_choice.clone(),
         reasoning_effort: None,
+        response_format: None,
     })
 }
 
@@ -535,6 +536,7 @@ fn anthropic_count_to_chat_request(payload: CountTokensRequest) -> Result<ChatRe
         tools: payload.tools,
         tool_choice: None,
         reasoning_effort: None,
+        response_format: None,
     })
 }
 
@@ -995,6 +997,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning_effort: None,
+            response_format: None,
         };
 
         let resp = crate::ai::ChatResponse {

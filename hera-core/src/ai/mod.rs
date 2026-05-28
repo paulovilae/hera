@@ -86,6 +86,15 @@ pub struct ChatRequest {
     pub tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Frame F (structured outputs): forward an OpenAI-style `response_format`
+    /// directive to the engine when the caller wants a strict JSON shape.
+    /// Accepted shapes:
+    ///   { "type": "json_object" }
+    ///   { "type": "json_schema", "json_schema": { "name": "...", "schema": {...}, "strict": true } }
+    /// llama.cpp (local omni) and OpenAI/compatible cloud endpoints both
+    /// honor this field; passing through keeps Hera engine-agnostic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

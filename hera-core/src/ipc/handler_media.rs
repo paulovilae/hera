@@ -188,6 +188,7 @@ pub async fn handle_vision_analysis(request: &IpcPayload, state: &IpcState) -> H
             tools: None,
             tool_choice: None,
             reasoning_effort: None,
+            response_format: None,
         };
 
         match vision.generate_content(chat_req).await {
@@ -262,6 +263,7 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
         tools: None,
         tool_choice: None,
         reasoning_effort: None,
+        response_format: None,
     };
 
     let enhanced = match state.engine.generate_content(chat_req).await {

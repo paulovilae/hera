@@ -124,6 +124,7 @@ To invoke a tool, you MUST output exactly this format:
             max_tokens: Some(512),
             tool_choice: None,
             reasoning_effort: None,
+            response_format: None,
             vision_model: None,
             tts_model: None,
             stt_model: None,
