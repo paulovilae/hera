@@ -57,6 +57,30 @@ fn stem_prefix_es(s: &str) -> &str {
     }
 }
 
+/// Map a free-form specialty input to one of the widget's canonical tab IDs.
+/// Tab IDs come from os-provider-map.js: Todos / Clínica / Especialista /
+/// Odontólogo / Laboratorio / Farmacia / Veterinaria. Everything that doesn't
+/// fit a category falls back to "Todos" so the user sees the full directory
+/// (the chat text already lists the specific matches).
+fn canonical_widget_category(raw: &str) -> &'static str {
+    let folded = fold_accents_lower(raw);
+    if folded.contains("odontolog") || folded.contains("dental") || folded.contains("dentist") {
+        "Odontólogo"
+    } else if folded.contains("farmac") || folded.contains("droguer") {
+        "Farmacia"
+    } else if folded.contains("veterinar") || folded.contains("mascot") {
+        "Veterinaria"
+    } else if folded.contains("laborator") {
+        "Laboratorio"
+    } else if folded.contains("clinic") || folded.contains("ips") || folded.contains("centro") {
+        "Clínica"
+    } else if folded.contains("especial") || folded.contains("medic") {
+        "Especialista"
+    } else {
+        "Todos"
+    }
+}
+
 fn folded_like(column: &str, raw_input: &str) -> String {
     let lowered = fold_accents_lower(raw_input);
     let singular = singularize_es(&lowered);
@@ -118,10 +142,13 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
     if result.success {
         let mut widget_attrs = String::new();
         if !specialty.is_empty() {
-            widget_attrs.push_str(&format!(
-                " category=\"{}\"",
-                specialty.replace("\"", "\\\"")
-            ));
+            // Map free-form input ("odontología", "odontólogos", "Odontologo") to
+            // one of the widget's canonical tab IDs. The tabs in
+            // Apps/OS-v3/views/public/os-provider-map.js are exact strings —
+            // anything else falls through to "Todos" and the LLM-generated text
+            // already covers the specifics.
+            let canonical = canonical_widget_category(specialty);
+            widget_attrs.push_str(&format!(" category=\"{}\"", canonical));
         }
         if !keyword.is_empty() {
             widget_attrs.push_str(&format!(" search=\"{}\"", keyword.replace("\"", "\\\"")));
