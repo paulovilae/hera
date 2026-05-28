@@ -34,6 +34,14 @@ pub struct PromptAssembly {
     pub tool_schema_chars: usize,
     pub db_schema_chars: usize,
     pub recursive_context_chars: usize,
+    /// Frame E (prompt caching): characters of the stable prefix (persona +
+    /// app-static context + schemas + directives) that engines can KV-cache or
+    /// providers can mark with cache_control across turns of the same session.
+    pub stable_prefix_chars: usize,
+    /// Frame E: characters of the dynamic suffix (per-turn memory: recursive +
+    /// semantic recall). Kept at the end of the prompt so KV cache hits stay
+    /// stable across turns even as memory grows.
+    pub dynamic_suffix_chars: usize,
 }
 
 pub struct RuntimeOutcomeArtifacts {
@@ -272,6 +280,8 @@ pub fn build_runtime_observation_payload(
         "tool_schema_chars": prompt_assembly.tool_schema_chars,
         "db_schema_chars": prompt_assembly.db_schema_chars,
         "memory_chars": prompt_assembly.memory_chars,
+        "stable_prefix_chars": prompt_assembly.stable_prefix_chars,
+        "dynamic_suffix_chars": prompt_assembly.dynamic_suffix_chars,
         "success": success,
         "origin": origin,
         "model": model,
@@ -750,14 +760,12 @@ pub async fn build_full_system_prompt(
     } else {
         (String::new(), String::new())
     };
-    let base_system_prompt = format!(
-        "{}{}{}{}",
-        std::fs::read_to_string(persona_path)
-            .unwrap_or_else(|_| "You are an AI assistant.".to_string()),
-        memento_ctx,
-        recursive_ctx,
-        semantic_ctx
-    );
+    // Frame E (prompt caching): persona + memento_ctx is the stable head of the
+    // prompt. Per-turn memory (recursive_ctx + semantic_ctx) is appended AT THE
+    // END so the KV cache / provider cache hits across turns.
+    let persona_text = std::fs::read_to_string(persona_path)
+        .unwrap_or_else(|_| "You are an AI assistant.".to_string());
+    let base_system_prompt = format!("{}{}", persona_text, memento_ctx);
 
     let agent_identity = std::path::Path::new(persona_path)
         .file_stem()
@@ -827,7 +835,18 @@ pub async fn build_full_system_prompt(
         )
     };
 
-    let system_prompt = format!(
+    // Frame E: build the prompt in two halves so engines can KV-cache the prefix.
+    //
+    //   stable_prefix = persona + app-static memento_ctx + tool/db schemas +
+    //                   think/json/language/runtime directives
+    //   dynamic_suffix = recursive_ctx (changes when new events accumulate) +
+    //                    semantic_ctx (changes per user query)
+    //
+    // Engines like llama.cpp reuse their KV cache for the common prefix; cloud
+    // providers with prompt caching (Anthropic cache_control, OpenAI automatic)
+    // can mark the boundary. Putting dynamic memory AT THE END keeps cache hits
+    // stable across turns even as memory grows.
+    let stable_prefix = format!(
         "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}",
         base_system_prompt,
         schemas,
@@ -837,13 +856,17 @@ pub async fn build_full_system_prompt(
         language_directive,
         runtime_context_directive
     );
+    let dynamic_suffix = format!("{}{}", recursive_ctx, semantic_ctx);
+    let system_prompt = format!("{}{}", stable_prefix, dynamic_suffix);
 
     PromptAssembly {
-        system_prompt,
         memory_chars: memento_ctx.len(),
         tool_schema_chars: schemas.len(),
         db_schema_chars: db_schema_ctx.len(),
         recursive_context_chars: recursive_ctx.len() + semantic_ctx.len(),
+        stable_prefix_chars: stable_prefix.len(),
+        dynamic_suffix_chars: dynamic_suffix.len(),
+        system_prompt,
     }
 }
 
