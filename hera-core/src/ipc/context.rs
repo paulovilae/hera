@@ -42,6 +42,11 @@ pub struct PromptAssembly {
     /// semantic recall). Kept at the end of the prompt so KV cache hits stay
     /// stable across turns even as memory grows.
     pub dynamic_suffix_chars: usize,
+    /// Phase 2 of the embedder flywheel: carries the `request_id` and the
+    /// recalled entries from `fetch_semantic_memories`. The handler that
+    /// generated the response uses this to compute cited_ids and report back
+    /// to Memento's `recall_feedback`. `None` when recall was skipped or empty.
+    pub recall_attribution: Option<super::helpers::RecallAttribution>,
 }
 
 pub struct RuntimeOutcomeArtifacts {
@@ -746,20 +751,20 @@ pub async fn build_full_system_prompt(
     } else {
         String::new()
     };
-    let (recursive_ctx, semantic_ctx) = if budget.include_memory && !lightweight_mode {
-        let user_id = canonicalize_user_id(sender_name, chat_id, session_id);
-        let recursive = clamp_chars(
-            fetch_recursive_context(&user_id, app_name, session_id).await,
-            budget.max_memory_chars,
-        );
-        let semantic = clamp_chars(
-            fetch_semantic_memories(&user_id, app_name, session_id, user_prompt).await,
-            budget.max_memory_chars,
-        );
-        (recursive, semantic)
-    } else {
-        (String::new(), String::new())
-    };
+    let (recursive_ctx, semantic_ctx, recall_attribution) =
+        if budget.include_memory && !lightweight_mode {
+            let user_id = canonicalize_user_id(sender_name, chat_id, session_id);
+            let recursive = clamp_chars(
+                fetch_recursive_context(&user_id, app_name, session_id).await,
+                budget.max_memory_chars,
+            );
+            let (semantic_raw, attribution) =
+                fetch_semantic_memories(&user_id, app_name, session_id, user_prompt).await;
+            let semantic = clamp_chars(semantic_raw, budget.max_memory_chars);
+            (recursive, semantic, attribution)
+        } else {
+            (String::new(), String::new(), None)
+        };
     // Frame E (prompt caching): persona + memento_ctx is the stable head of the
     // prompt. Per-turn memory (recursive_ctx + semantic_ctx) is appended AT THE
     // END so the KV cache / provider cache hits across turns.
@@ -867,6 +872,7 @@ pub async fn build_full_system_prompt(
         stable_prefix_chars: stable_prefix.len(),
         dynamic_suffix_chars: dynamic_suffix.len(),
         system_prompt,
+        recall_attribution,
     }
 }
 

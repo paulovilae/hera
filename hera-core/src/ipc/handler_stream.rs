@@ -6,8 +6,8 @@ use super::context::{
 };
 use super::helpers::{
     RuntimePromotionContext, canonicalize_user_id, infer_origin_from_model,
-    record_observation_and_promote_runtime_hint, save_chat_turn_event,
-    record_runtime_observation,
+    record_observation_and_promote_runtime_hint, record_runtime_observation,
+    report_recall_feedback, save_chat_turn_event,
 };
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
@@ -365,6 +365,7 @@ pub async fn handle_generate_stream(
                     let session_id = parsed.session_id.clone();
                     let user_content = parsed.prompt.clone();
                     let assistant_content = final_result_text.clone();
+                    let attribution = prompt_assembly.recall_attribution.clone();
                     tokio::spawn(async move {
                         save_chat_turn_event(
                             user_id.clone(),
@@ -379,9 +380,12 @@ pub async fn handle_generate_stream(
                             app_id,
                             session_id,
                             "assistant".to_string(),
-                            assistant_content,
+                            assistant_content.clone(),
                         )
                         .await;
+                        // Phase 2 flywheel: report which recalled ids the model cited
+                        // so Memento can build (positives, negatives) training data.
+                        report_recall_feedback(attribution.as_ref(), &assistant_content).await;
                     });
                 }
             }

@@ -561,28 +561,48 @@ pub fn embed_text_local(_text: &str) -> Option<Vec<f32>> {
     None
 }
 
+/// A memory entry returned by Memento's `semantic_recall`, captured for
+/// post-generation attribution (recall feedback flywheel).
+#[derive(Debug, Clone)]
+pub struct RecalledEntry {
+    pub id: i64,
+    pub content: String,
+}
+
+/// Attribution payload threaded from recall-time to post-generation. Holds the
+/// Memento-side `request_id` so the feedback insert lands on the right row, and
+/// the recalled entries so we can match them against the model's output to
+/// decide which were actually cited.
+#[derive(Debug, Clone, Default)]
+pub struct RecallAttribution {
+    pub request_id: String,
+    pub entries: Vec<RecalledEntry>,
+}
+
 /// Fetch semantically relevant memories for (user_id, app_id, session_id) by
 /// embedding the query and asking Memento's semantic_recall to cosine-rerank the
-/// scope-filtered rows. Formats the top matches as a prompt fragment. Empty
-/// string on any failure (incl. non-local-llm builds where embedding is None).
+/// scope-filtered rows. Returns the formatted prompt fragment plus an
+/// attribution payload (None when recall was skipped or failed) that downstream
+/// handlers use to report `recall_feedback` after generation.
 pub async fn fetch_semantic_memories(
     user_id: &str,
     app_id: &str,
     session_id: &str,
     query: &str,
-) -> String {
+) -> (String, Option<RecallAttribution>) {
     if user_id.is_empty() || query.trim().is_empty() {
-        return String::new();
+        return (String::new(), None);
     }
     let q = query.to_string();
     let embedding = match tokio::task::spawn_blocking(move || embed_text_local(&q)).await {
         Ok(Some(e)) => e,
-        _ => return String::new(),
+        _ => return (String::new(), None),
     };
 
     let mut payload = serde_json::json!({
         "user_id": user_id,
         "query_embedding": embedding,
+        "query_text": query,
         "limit": 4,
         "min_score": 0.3,
     });
@@ -594,29 +614,57 @@ pub async fn fetch_semantic_memories(
     }
 
     let Some(resp) = call_memento("semantic_recall", payload).await else {
-        return String::new();
+        return (String::new(), None);
     };
+    let request_id = resp
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let Some(entries) = resp.get("entries").and_then(|v| v.as_array()) else {
-        return String::new();
+        return (String::new(), None);
     };
+
     let mut section = String::new();
+    let mut captured: Vec<RecalledEntry> = Vec::new();
     for item in entries.iter().take(4) {
-        if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                let snippet: String = trimmed.chars().take(240).collect();
-                section.push_str(&format!("- {}\n", snippet));
-            }
+        let content = match item.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c.trim(),
+            None => continue,
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let snippet: String = content.chars().take(240).collect();
+        section.push_str(&format!("- {}\n", snippet));
+        // The id may arrive as i32 (scoped_memory.id is SERIAL); accept either width.
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as i64);
+        if id > 0 {
+            captured.push(RecalledEntry {
+                id,
+                content: content.to_string(),
+            });
         }
     }
     if section.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\n# SEMANTICALLY RELEVANT MEMORIES (Memento cosine recall)\n{}",
-            section
-        )
+        return (String::new(), None);
     }
+    let prompt_fragment = format!(
+        "\n\n# SEMANTICALLY RELEVANT MEMORIES (Memento cosine recall)\n{}",
+        section
+    );
+    let attribution = if !request_id.is_empty() && !captured.is_empty() {
+        Some(RecallAttribution {
+            request_id,
+            entries: captured,
+        })
+    } else {
+        None
+    };
+    (prompt_fragment, attribution)
 }
 
 // ─── Recursive scoped-memory wiring (Memento <-> Hera) ─────────────────────
@@ -761,9 +809,73 @@ pub async fn save_chat_turn_event(
     }
 }
 
+// ─── Recall feedback (Phase 2 of the embedder flywheel) ───────────────────
+
+/// Distinctive tokens of a text: lowercased, alphanumeric-only, length >= 5.
+/// We keep length >= 5 so common Spanish/English stopwords ("para", "this",
+/// "and") don't pollute the overlap signal.
+fn distinctive_tokens(text: &str) -> std::collections::HashSet<String> {
+    text.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|tok| tok.chars().count() >= 5)
+        .map(|tok| tok.to_string())
+        .collect()
+}
+
+/// Decide which recalled ids were cited by the model's response. Heuristic:
+/// for each recalled entry, count how many of its distinctive tokens (>=5
+/// chars, alphanumeric) appear in the response. An entry counts as cited if
+/// at least 2 distinctive tokens overlap (or 1 if the entry only has 1 such
+/// token).
+pub fn cited_ids_from_response(attribution: &RecallAttribution, response: &str) -> Vec<i64> {
+    let response_tokens = distinctive_tokens(response);
+    if response_tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut cited = Vec::new();
+    for entry in &attribution.entries {
+        let entry_tokens = distinctive_tokens(&entry.content);
+        if entry_tokens.is_empty() {
+            continue;
+        }
+        let overlap = entry_tokens.intersection(&response_tokens).count();
+        let needed = if entry_tokens.len() <= 1 { 1 } else { 2 };
+        if overlap >= needed {
+            cited.push(entry.id);
+        }
+    }
+    cited
+}
+
+/// Fire-and-forget: report which recalled ids were cited by the assistant's
+/// response. Joined on `request_id` with Memento's `recall_log`, this becomes
+/// (query, positives, negatives) training data for embedder reranker fine-tune.
+/// Silent on failure — telemetry must never break the chat path.
+pub async fn report_recall_feedback(
+    attribution: Option<&RecallAttribution>,
+    response_text: &str,
+) {
+    let Some(attribution) = attribution else {
+        return;
+    };
+    if attribution.request_id.is_empty() || attribution.entries.is_empty() {
+        return;
+    }
+    let cited = cited_ids_from_response(attribution, response_text);
+    let feedback_kind = if cited.is_empty() { "ignored" } else { "cited" };
+    let payload = serde_json::json!({
+        "request_id": attribution.request_id,
+        "cited_ids": cited,
+        "feedback_kind": feedback_kind,
+    });
+    let _ = call_memento("recall_feedback", payload).await;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::canonicalize_user_id;
+    use super::{canonicalize_user_id, cited_ids_from_response, RecallAttribution, RecalledEntry};
 
     #[test]
     fn canonicalize_prefers_sender_name() {
@@ -799,5 +911,46 @@ mod tests {
             canonicalize_user_id("María García-Pérez!", "", ""),
             "maría_garcía_pérez"
         );
+    }
+
+    #[test]
+    fn cited_ids_matches_only_entries_with_token_overlap() {
+        let attribution = RecallAttribution {
+            request_id: "req-1".into(),
+            entries: vec![
+                RecalledEntry {
+                    id: 11,
+                    content: "Contracts with margin above thirty percent flagged review.".into(),
+                },
+                RecalledEntry {
+                    id: 22,
+                    content: "User prefers concise summaries in lowercase letters.".into(),
+                },
+                RecalledEntry {
+                    id: 33,
+                    content: "Birthday is March twentieth.".into(),
+                },
+            ],
+        };
+        let response = "We should flag contracts with high margin and review them.";
+        let cited = cited_ids_from_response(&attribution, response);
+        // Entry 11 has "contracts", "margin", "review" overlap (>=2) -> cited.
+        // Entry 22 has zero distinctive overlap -> not cited.
+        // Entry 33 has zero overlap -> not cited.
+        assert_eq!(cited, vec![11]);
+    }
+
+    #[test]
+    fn cited_ids_empty_when_response_has_no_distinctive_tokens() {
+        let attribution = RecallAttribution {
+            request_id: "req-x".into(),
+            entries: vec![RecalledEntry {
+                id: 1,
+                content: "important domain fact about pricing".into(),
+            }],
+        };
+        // Response has only short stopwords (none >= 5 chars).
+        let cited = cited_ids_from_response(&attribution, "ok and yes");
+        assert!(cited.is_empty());
     }
 }
