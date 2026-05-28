@@ -97,14 +97,22 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
         .get("city")
         .and_then(|c| c.as_str())
         .unwrap_or("");
+    // Accept several aliases — the LLM sometimes invents arg names ("service",
+    // "type", "provider_type") that aren't in the schema. Without these aliases
+    // the value silently falls through to no filter and the tool returns the
+    // city's full directory, which confuses the LLM into hallucinated answers.
     let specialty = call
         .arguments
         .get("specialty")
+        .or_else(|| call.arguments.get("provider_type"))
+        .or_else(|| call.arguments.get("type"))
         .and_then(|s| s.as_str())
         .unwrap_or("");
     let keyword = call
         .arguments
         .get("service_keyword")
+        .or_else(|| call.arguments.get("service"))
+        .or_else(|| call.arguments.get("keyword"))
         .and_then(|k| k.as_str())
         .unwrap_or("");
 
