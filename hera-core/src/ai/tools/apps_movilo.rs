@@ -37,10 +37,31 @@ fn singularize_es(s: &str) -> &str {
     }
 }
 
+// Reduce to a common prefix stem so cross-nominal queries match. The LLM
+// often passes the *field* form ("odontología") while the DB stores the
+// *practitioner* form ("Odontólogo") and vice versa. Both share a 6-char
+// prefix ("odonto") that survives any Spanish derivation. Keep at least 6
+// chars when the input is long enough; leave shorter inputs untouched so
+// we don't over-match short keywords ("cali", "ips").
+fn stem_prefix_es(s: &str) -> &str {
+    const STEM_LEN: usize = 6;
+    if s.len() > STEM_LEN {
+        // Walk char boundaries to avoid slicing through a UTF-8 sequence —
+        // by this point the string is ASCII (post-fold), but defensive.
+        match s.char_indices().nth(STEM_LEN) {
+            Some((idx, _)) => &s[..idx],
+            None => s,
+        }
+    } else {
+        s
+    }
+}
+
 fn folded_like(column: &str, raw_input: &str) -> String {
     let lowered = fold_accents_lower(raw_input);
-    let trimmed = singularize_es(&lowered);
-    let folded = trimmed.replace('\'', "''");
+    let singular = singularize_es(&lowered);
+    let stemmed = stem_prefix_es(singular);
+    let folded = stemmed.replace('\'', "''");
     format!(
         "lower(translate({column}, '{ACCENT_FROM}', '{ACCENT_TO}')) LIKE '%{folded}%'"
     )

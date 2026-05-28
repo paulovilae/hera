@@ -393,11 +393,14 @@ pub fn maybe_build_negative_runtime_hint_promotion(
 /// Fetch live DB schema from Memento for injection into tool context.
 /// - SOUL (Ava) gets ALL app schemas via describe_all_apps
 /// - App-specific agents get only their app's schema via describe_app
+/// - Agents without memento_query access (e.g. memo) get NO schema — they use
+///   high-level pre-built tools and a raw SQL surface only confuses them.
 pub async fn fetch_db_schema_context(agent_identity: &str, app_name: &str) -> String {
     let app_slug = match agent_identity.to_lowercase().as_str() {
         "soul" | "ava" | "gemini_soul" => {
             return fetch_all_apps_schema().await;
         }
+        "memo" => return String::new(),
         "vetra" | "vetra_soul" => "vetra",
         "movilo" | "movilo_soul" => "movilo",
         "latinos" | "latinos_soul" => "latinos",
