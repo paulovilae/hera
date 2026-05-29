@@ -120,10 +120,16 @@ async fn main() {
     let secondary_local_url = std::env::var("HERA_SECONDARY_OMNI_URL").ok();
     let tertiary_local_url = std::env::var("HERA_TERTIARY_OMNI_URL").ok();
 
+    let primary_omni_explicit = std::env::var("HERA_PRIMARY_OMNI_URL").is_ok();
+
     let local_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = if capabilities
         .runtime_enabled(CapabilityId::LocalLlm)
+        || primary_omni_explicit
     {
-        info!("🧠 Initializing Sovereign Local LLM Engine (via Local Omni Node)...");
+        info!(
+            "🧠 Initializing Sovereign Local LLM Engine (via Local Omni Node @ {})...",
+            primary_local_url
+        );
         let local_omni = hera_core::ai::openai_compat::OpenAICompatEngine::new(
             primary_local_url.clone(),
             "".to_string(),
