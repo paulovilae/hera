@@ -17,7 +17,7 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
     RouteProfile {
         id: "cartera_widget",
         app: "cartera",
-        persona_path: "/home/paulo/Programs/apps/OS/Agents/chepito.md",
+        persona_path: "/home/paulo/Programs/apps/OS/Agents/hada_financiera.md",
         default_context_budget_mode: "lightweight",
         prefer_stream: true,
         target_p95_ms: 700,
@@ -26,7 +26,7 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
     RouteProfile {
         id: "cartera_admin_chat",
         app: "cartera",
-        persona_path: "/home/paulo/Programs/apps/OS/Agents/chepito.md",
+        persona_path: "/home/paulo/Programs/apps/OS/Agents/hada_financiera.md",
         default_context_budget_mode: "standard",
         prefer_stream: false,
         target_p95_ms: 2000,

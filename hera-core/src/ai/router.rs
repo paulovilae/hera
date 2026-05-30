@@ -21,7 +21,7 @@ pub struct RouterEngine {
 // response (`tag_response_engine`). That hardcoded Movilo's mascot onto every app's
 // output — Consulting briefs, dossiers and any artifact generated through Hera ended
 // with a blue-cat picture. The marker was also redundant: each bot's persona (memo.md,
-// chepito.md, ...) already instructs the model to emit its OWN signature/mascot, and
+// chigui.md, ...) already instructs the model to emit its OWN signature/mascot, and
 // Imaginclaw does not parse the marker. So per-app identity lives in the persona, not
 // the router. Removed: Memo is no longer forced everywhere; non-chat artifacts stay clean.
 
