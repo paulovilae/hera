@@ -422,21 +422,63 @@ impl Hera {
         Ok(truncated)
     }
 
+    /// Web search. Prefers a self-hosted SearXNG instance (sovereign, no API
+    /// key, multi-engine, not blocked by datacenter-IP anomaly detection).
+    /// Falls back to scraping DuckDuckGo Lite if SearXNG is unset/unreachable.
+    /// Configure via `HERA_SEARXNG_URL` (e.g. `http://10.100.0.2:8088`).
     pub async fn native_web_search(&self, query: &str) -> Result<String> {
+        if let Ok(base) = std::env::var("HERA_SEARXNG_URL") {
+            let base = base.trim_end_matches('/');
+            if !base.is_empty() {
+                match self.searxng_search(base, query).await {
+                    Ok(results) if !results.is_empty() => return Ok(results.join("\n---\n")),
+                    Ok(_) => eprintln!("[hera] SearXNG returned 0 results for '{}', falling back to DDG", query),
+                    Err(e) => eprintln!("[hera] SearXNG search failed ({}), falling back to DDG", e),
+                }
+            }
+        }
+        self.duckduckgo_scrape(query).await
+    }
+
+    async fn searxng_search(&self, base: &str, query: &str) -> Result<Vec<String>> {
+        let url = format!("{base}/search");
+        let res = self.http_client.get(&url)
+            .query(&[("q", query), ("format", "json")])
+            .header("User-Agent", "ImagineOS-Hera/1.0")
+            .send().await?;
+        if !res.status().is_success() {
+            return Err(anyhow!("SearXNG returned {}", res.status()));
+        }
+        let body: serde_json::Value = res.json().await?;
+        let mut out = Vec::new();
+        if let Some(items) = body.get("results").and_then(|v| v.as_array()) {
+            for item in items.iter().take(8) {
+                let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let link = item.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let snippet = item.get("content").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if !title.is_empty() && (!snippet.is_empty() || !link.is_empty()) {
+                    out.push(format!("Title: {title}\nURL: {link}\nSnippet: {snippet}\n"));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn duckduckgo_scrape(&self, query: &str) -> Result<String> {
         let url = "https://lite.duckduckgo.com/lite/";
         let params = [("q", query)];
-        
+
         let res = self.http_client.post(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
             .form(&params)
             .send().await?;
-            
+
         if !res.status().is_success() {
             return Err(anyhow!("Search failed: {}", res.status()));
         }
         let html_content = res.text().await?;
         let document = scraper::Html::parse_document(&html_content);
-        
+
         let link_selector = scraper::Selector::parse(".result-link").unwrap();
         let snippet_selector = scraper::Selector::parse(".result-snippet").unwrap();
 
@@ -449,7 +491,7 @@ impl Hera {
             let title = links[i].text().collect::<Vec<_>>().join(" ").trim().to_string();
             let url = links[i].value().attr("href").unwrap_or_default().to_string();
             let snippet = snippets[i].text().collect::<Vec<_>>().join(" ").trim().to_string();
-            
+
             if !title.is_empty() && !snippet.is_empty() {
                 results.push(format!("Title: {}\nURL: {}\nSnippet: {}\n", title, url, snippet));
             }
