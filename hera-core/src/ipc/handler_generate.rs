@@ -48,7 +48,13 @@ pub async fn handle_generate(
         parsed.prompt,
         fast_path_prompt
     );
-    if !fast_path_prompt.is_empty() {
+    // Tool paths are gated on the budget's allow_tools. A caller that asks for
+    // pure generation (allow_tools=false, e.g. dossier section/metadata/chart
+    // synthesis) must NOT have its request hijacked into a tool call — the
+    // fast-path intent detector and the schema-query planner below both fire
+    // proactively off the prompt content and would otherwise turn a "write me
+    // charts JSON" call into a query_memory/memento_vector_search execution.
+    if parsed.context_budget.allow_tools && !fast_path_prompt.is_empty() {
         if fast_path_prompt.trim_start().starts_with('/') {
             tracing::info!(
                 "🧭 [Hera IPC] Explicit command candidate received: {}",
@@ -102,7 +108,9 @@ pub async fn handle_generate(
     }
 
     let schema_plan_started_at = Instant::now();
-    if let Some(planned_call) = try_plan_schema_query(&state.engine, &parsed).await {
+    if parsed.context_budget.allow_tools
+        && let Some(planned_call) = try_plan_schema_query(&state.engine, &parsed).await
+    {
         let planner_latency_ms = schema_plan_started_at.elapsed().as_millis();
         let contextual_tool_call = contextualize_tool_call(&planned_call, &parsed);
         if crate::ai::tool_executor::permissions_allow_tool(
@@ -240,10 +248,19 @@ pub async fn handle_generate(
                         result_text = content.clone();
                     }
 
-                    // 6. Parse and execute output tool calls
-                    let mut parsed_calls = crate::ai::tool_executor::parse_tool_calls(&result_text);
+                    // 6. Parse and execute output tool calls — only when tools
+                    // are allowed. A pure-generation caller (allow_tools=false)
+                    // must get its text back verbatim, never routed through a
+                    // tool execution + second-pass that discards the answer.
+                    let mut parsed_calls = if parsed.context_budget.allow_tools {
+                        crate::ai::tool_executor::parse_tool_calls(&result_text)
+                    } else {
+                        Vec::new()
+                    };
 
-                    if let Some(tc_array) = &choice.message.tool_calls {
+                    if let (true, Some(tc_array)) =
+                        (parsed.context_budget.allow_tools, &choice.message.tool_calls)
+                    {
                         for tc in tc_array {
                             let mut extracted_name = None;
                             let mut extracted_args = None;
