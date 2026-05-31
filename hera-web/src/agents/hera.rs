@@ -422,20 +422,29 @@ impl Hera {
         Ok(truncated)
     }
 
-    /// Web search. Prefers a self-hosted SearXNG instance (sovereign, no API
+    /// Web search. Prefers self-hosted SearXNG instances (sovereign, no API
     /// key, multi-engine, not blocked by datacenter-IP anomaly detection).
-    /// Falls back to scraping DuckDuckGo Lite if SearXNG is unset/unreachable.
-    /// Configure via `HERA_SEARXNG_URL` (e.g. `http://10.100.0.2:8088`).
+    /// Falls back to scraping DuckDuckGo Lite if every SearXNG is unset/down.
+    ///
+    /// `HERA_SEARXNG_URL` may be a comma-separated list of bases tried in order
+    /// until one returns results (e.g. genesis primary, laptop failover:
+    /// `http://10.100.0.2:8088,http://100.121.94.69:8088`). The first instance
+    /// that yields non-empty results wins; instances that error or return zero
+    /// are skipped, and only if all are exhausted does it fall back to DDG.
     pub async fn native_web_search(&self, query: &str) -> Result<String> {
-        if let Ok(base) = std::env::var("HERA_SEARXNG_URL") {
-            let base = base.trim_end_matches('/');
-            if !base.is_empty() {
+        if let Ok(raw) = std::env::var("HERA_SEARXNG_URL") {
+            for base in raw.split(',') {
+                let base = base.trim().trim_end_matches('/');
+                if base.is_empty() {
+                    continue;
+                }
                 match self.searxng_search(base, query).await {
                     Ok(results) if !results.is_empty() => return Ok(results.join("\n---\n")),
-                    Ok(_) => eprintln!("[hera] SearXNG returned 0 results for '{}', falling back to DDG", query),
-                    Err(e) => eprintln!("[hera] SearXNG search failed ({}), falling back to DDG", e),
+                    Ok(_) => eprintln!("[hera] SearXNG {} returned 0 results for '{}', trying next", base, query),
+                    Err(e) => eprintln!("[hera] SearXNG {} failed ({}), trying next", base, e),
                 }
             }
+            eprintln!("[hera] all SearXNG instances exhausted for '{}', falling back to DDG", query);
         }
         self.duckduckgo_scrape(query).await
     }
