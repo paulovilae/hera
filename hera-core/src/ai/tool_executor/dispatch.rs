@@ -3,7 +3,8 @@
 use serde_json::Value;
 
 use crate::ai::tools::{
-    apps_latinos, apps_movilo, apps_vetra, data, infra_health, infra_smoke, platform, productivity,
+    apps_latinos, apps_movilo, apps_vetra, data, infra_health, infra_smoke, mission_control,
+    platform, productivity,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -120,6 +121,14 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
 
 async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
+        // Mission Control — Agente Q operates the Agile Cockpit (http_adapter).
+        "mc_board" => mission_control::execute_mc_board(call).await,
+        "mc_create_story" => mission_control::execute_mc_create_story(call).await,
+        "mc_move_story" => mission_control::execute_mc_move_story(call).await,
+        "mc_create_sprint" => mission_control::execute_mc_create_sprint(call).await,
+        "mc_close_sprint" => mission_control::execute_mc_close_sprint(call).await,
+        "mc_add_wishlist" => mission_control::execute_mc_add_wishlist(call).await,
+        "mc_set_objective" => mission_control::execute_mc_set_objective(call).await,
         "generate_image" | "hera_draw" => platform::execute_draw(call).await,
         "hera_search" => platform::execute_search(call).await,
         "hera_speak" => platform::execute_speak(call).await,
