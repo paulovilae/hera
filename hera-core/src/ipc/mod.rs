@@ -27,6 +27,7 @@ pub mod route_profiles;
 pub mod runtime_tools;
 pub mod types;
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -38,6 +39,10 @@ pub use types::{HandlerOutcome, IpcPayload, IpcResponse, IpcState};
 /// Maximum concurrent LLM requests — prevents thread-pile-up under burst load.
 const MAX_CONCURRENT_REQUESTS: usize = 12;
 
+/// Tope duro del buffer de lectura por conexión. Sin esto, un cliente que envía
+/// bytes sin cerrar un JSON válido hace crecer el buffer indefinidamente (OOM).
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
 /// Main IPC server loop — binds to Unix socket and dispatches to handlers.
 pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
     // Clean up stale socket
@@ -46,8 +51,13 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
     }
 
     let listener = UnixListener::bind(socket_path)?;
+    // Restringir el socket al usuario propietario (0600). /tmp es world-traversable;
+    // sin esto cualquier proceso/usuario local puede conectar y ejecutar acciones
+    // (execute_tool, generate con tools, run_code) = RCE local sin autenticar. El
+    // kernel aplica el permiso del inodo en connect(), igual que hace Memento.
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
     info!(
-        "🔗 Headless IPC Daemon bound to Unix socket: {}",
+        "🔗 Headless IPC Daemon bound to Unix socket: {} (mode 0600)",
         socket_path
     );
 
@@ -79,6 +89,23 @@ pub async fn serve(socket_path: &str, state: IpcState) -> std::io::Result<()> {
                         match stream.read(&mut chunk).await {
                             Ok(n) if n > 0 => {
                                 buffer.extend_from_slice(&chunk[..n]);
+                                if buffer.len() > MAX_REQUEST_BYTES {
+                                    error!(
+                                        "❌ IPC request excede el tope ({} bytes), abortando conexión",
+                                        MAX_REQUEST_BYTES
+                                    );
+                                    let err_msg = IpcResponse {
+                                        status: "error".to_string(),
+                                        data: serde_json::json!({
+                                            "error": "request too large"
+                                        }),
+                                    };
+                                    if let Ok(mut estr) = serde_json::to_string(&err_msg) {
+                                        estr.push('\n');
+                                        let _ = stream.write_all(estr.as_bytes()).await;
+                                    }
+                                    break;
+                                }
                                 match serde_json::from_slice::<IpcPayload>(&buffer) {
                                     Ok(request) => {
                                         info!("📥 Received IPC Action: {}", request.action);
