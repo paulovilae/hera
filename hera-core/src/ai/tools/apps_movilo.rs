@@ -74,11 +74,18 @@ fn canonical_widget_category(raw: &str) -> &'static str {
         "Laboratorio"
     } else if folded.contains("clinic") || folded.contains("ips") || folded.contains("centro") {
         "Clínica"
-    } else if folded.contains("especial") || folded.contains("medic") {
+    } else if folded.contains("especial") || folded.contains("medic") || !folded.trim().is_empty() {
         "Especialista"
     } else {
         "Todos"
     }
+}
+
+fn escape_attr(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn folded_like(column: &str, raw_input: &str) -> String {
@@ -86,9 +93,7 @@ fn folded_like(column: &str, raw_input: &str) -> String {
     let singular = singularize_es(&lowered);
     let stemmed = stem_prefix_es(singular);
     let folded = stemmed.replace('\'', "''");
-    format!(
-        "lower(translate({column}, '{ACCENT_FROM}', '{ACCENT_TO}')) LIKE '%{folded}%'"
-    )
+    format!("lower(translate({column}, '{ACCENT_FROM}', '{ACCENT_TO}')) LIKE '%{folded}%'")
 }
 
 pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResult {
@@ -144,33 +149,64 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
         }),
     };
 
-    let mut result = execute_memento_query(&memento_call).await;
+    let json_result = super::data::execute_memento_query_json(&memento_call).await;
 
-    // Instruct the AI to render the map component based on the search context
-    if result.success {
-        let mut widget_attrs = String::new();
-        if !specialty.is_empty() {
-            // Map free-form input ("odontología", "odontólogos", "Odontologo") to
-            // one of the widget's canonical tab IDs. The tabs in
-            // Apps/OS-v3/views/public/os-provider-map.js are exact strings —
-            // anything else falls through to "Todos" and the LLM-generated text
-            // already covers the specifics.
-            let canonical = canonical_widget_category(specialty);
-            widget_attrs.push_str(&format!(" category=\"{}\"", canonical));
-        }
-        if !keyword.is_empty() {
-            widget_attrs.push_str(&format!(" search=\"{}\"", keyword.replace("\"", "\\\"")));
-        } else if !city.is_empty() {
-            widget_attrs.push_str(&format!(" search=\"{}\"", city.replace("\"", "\\\"")));
-        }
+    match json_result {
+        Err(error) => ToolResult {
+            name: "movilo_search_providers".to_string(),
+            success: false,
+            output: format!("[[SYSTEM DIRECTIVE]]: The directory could not be queried right now. Tell the user: \"No pude consultar el directorio en este momento. Puedes buscarlo aquí: [Ver directorio](https://movilo.club/#providers)\". Do NOT invent a reason.\n\nError: {}", error),
+        },
+        Ok(res) => {
+            let count = res.get("count").and_then(|c| c.as_i64()).unwrap_or(0);
+            let rows = res.get("rows").cloned().unwrap_or(serde_json::json!([]));
+            let formatted = serde_json::to_string_pretty(&rows).unwrap_or_default();
 
-        result.output.push_str(&format!(
-            "\n\n[[SYSTEM DIRECTIVE]]: You MUST also embed an interactive map in your response so the user can visually locate these providers. To do this, simply include the following EXACT string somewhere in your text reply:\n\nWIDGET: <os-provider-map{}></os-provider-map>\n",
-            widget_attrs
-        ));
+            let mut widget_attrs = String::new();
+            if !specialty.is_empty() {
+                let canonical = canonical_widget_category(specialty);
+                widget_attrs.push_str(&format!(" category=\"{}\"", escape_attr(canonical)));
+            }
+            if !keyword.is_empty() {
+                widget_attrs.push_str(&format!(" search=\"{}\"", escape_attr(keyword)));
+            } else if !specialty.is_empty()
+                && !matches!(
+                    canonical_widget_category(specialty),
+                    "Clínica" | "Odontólogo" | "Laboratorio" | "Farmacia" | "Veterinaria"
+                )
+            {
+                widget_attrs.push_str(&format!(" search=\"{}\"", escape_attr(specialty)));
+            }
+
+            if count == 0 {
+                // Exact script from the persona: do NOT say "base de datos vacía" or any excuse.
+                let what = if !specialty.is_empty() { specialty } else if !keyword.is_empty() { keyword } else { "proveedores" };
+                let output = format!(
+                    "Database query returned 0 results from 'movilo'.\n\n[[SYSTEM DIRECTIVE]]: Zero results — the network exists and is online, there just was no match. You MUST say EXACTLY: \"No encontré {} en Cali ahora mismo. ¿Probamos con otra zona o especialidad? Puedes ver el directorio completo aquí: [Ver directorio](https://movilo.club/#providers)\". Do NOT say the database is empty, in maintenance, or unavailable. Then embed the map:\n\nWIDGET: <os-provider-map{}></os-provider-map>\n",
+                    what, widget_attrs
+                );
+                ToolResult {
+                    name: "movilo_search_providers".to_string(),
+                    success: true,
+                    output,
+                }
+            } else {
+                let mut output = format!(
+                    "Database query returned {} results from 'movilo':\n{}",
+                    count, formatted
+                );
+                output.push_str(&format!(
+                    "\n\n[[SYSTEM DIRECTIVE]]: You MUST also embed an interactive map in your response so the user can visually locate these providers. Include the following EXACT string somewhere in your text reply:\n\nWIDGET: <os-provider-map{}></os-provider-map>\n",
+                    widget_attrs
+                ));
+                ToolResult {
+                    name: "movilo_search_providers".to_string(),
+                    success: true,
+                    output,
+                }
+            }
+        }
     }
-
-    result
 }
 
 pub(crate) async fn execute_movilo_check_affiliation(call: &ToolCall) -> ToolResult {
@@ -263,5 +299,31 @@ pub(crate) async fn execute_movilo_validate_qr(call: &ToolCall) -> ToolResult {
             success: false,
             output: "QR Inválido o usuario no encontrado en la base de datos de Movilo.".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_widget_category, escape_attr};
+
+    #[test]
+    fn maps_specific_medical_specialties_to_specialist_tab() {
+        assert_eq!(canonical_widget_category("Dermatólogo"), "Especialista");
+        assert_eq!(canonical_widget_category("Cardiología"), "Especialista");
+    }
+
+    #[test]
+    fn preserves_explicit_non_specialist_categories() {
+        assert_eq!(canonical_widget_category("Odontólogos"), "Odontólogo");
+        assert_eq!(canonical_widget_category("Farmacia"), "Farmacia");
+        assert_eq!(canonical_widget_category("Veterinaria"), "Veterinaria");
+    }
+
+    #[test]
+    fn escapes_widget_attributes_as_html() {
+        assert_eq!(
+            escape_attr("Dermatólogo \"Norte\" & Cali"),
+            "Dermatólogo &quot;Norte&quot; &amp; Cali"
+        );
     }
 }
