@@ -77,7 +77,40 @@ fn is_forbidden_host(host: &str) -> bool {
     lowered.starts_with("fc") || lowered.starts_with("fd")
 }
 
-fn validate_outbound_url(url: &str) -> Result<reqwest::Url, String> {
+/// True si la IP es interna/no-ruteable (loopback, privada, link-local 169.254,
+/// CGNAT tailscale 100.64/10, ULA, multicast, etc.). Se valida la IP RESUELTA,
+/// no solo el hostname literal — así un dominio del atacante que resuelve a
+/// 169.254.169.254 (metadata de GCP) o a una IP privada queda bloqueado (SSRF
+/// por DNS rebinding).
+pub(crate) fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || o[0] == 0
+                // tailscale CGNAT 100.64.0.0/10 (malla interna)
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|v4| is_blocked_ip(&std::net::IpAddr::V4(v4)))
+                    .unwrap_or(false)
+        }
+    }
+}
+
+pub(crate) async fn validate_outbound_url(url: &str) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -97,6 +130,29 @@ fn validate_outbound_url(url: &str) -> Result<reqwest::Url, String> {
             "Outbound requests to private or loopback hosts are blocked: '{}'.",
             host
         ));
+    }
+
+    // Resolver el host y validar TODAS las IPs: cierra el bypass de DNS rebinding
+    // (un dominio publico que resuelve a una IP interna/metadata).
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS resolution failed for '{}': {}", host, e))?;
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if is_blocked_ip(&addr.ip()) {
+            return Err(format!(
+                "Blocked: '{}' resolves to a private/internal address ({}).",
+                host,
+                addr.ip()
+            ));
+        }
+    }
+    if !resolved_any {
+        return Err(format!("'{}' did not resolve to any IP address.", host));
     }
 
     Ok(parsed)
@@ -253,7 +309,7 @@ pub(crate) async fn execute_api_request(call: &ToolCall) -> ToolResult {
         };
     }
 
-    let parsed_url = match validate_outbound_url(url) {
+    let parsed_url = match validate_outbound_url(url).await {
         Ok(parsed) => parsed,
         Err(error) => {
             return ToolResult {

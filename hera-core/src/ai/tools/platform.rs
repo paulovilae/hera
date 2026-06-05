@@ -1172,22 +1172,14 @@ pub(crate) async fn execute_web_scraper(call: &ToolCall) -> ToolResult {
             };
         }
     };
-    let Some(host) = parsed_url.host_str() else {
+    // Validacion SSRF UNIFICADA con data.rs: valida esquema + host prohibido +
+    // resuelve el DNS y comprueba TODAS las IPs (cierra DNS rebinding a IP interna /
+    // metadata de GCP). Reemplaza el blocklist debil por-string anterior.
+    if let Err(error) = crate::ai::tools::data::validate_outbound_url(parsed_url.as_str()).await {
         return ToolResult {
             name: call.name.clone(),
             success: false,
-            output: "URL must include a hostname.".to_string(),
-        };
-    };
-    if matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("169.254.")
-    {
-        return ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: format!("Blocked scraping private or loopback host '{}'.", host),
+            output: error,
         };
     }
 
