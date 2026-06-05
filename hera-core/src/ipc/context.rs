@@ -140,6 +140,12 @@ pub async fn prepare_runtime_execution_context(
     {
         parsed.context_budget = context_budget_for_mode(mode, lightweight_mode);
     }
+    // Stateless bots (Memo/movilo) must not carry personal recursive memory between
+    // conversations — it poisons intent and bloats scoped_memory. This single switch
+    // gates both the recall and the save paths (both branch on include_memory).
+    if app_is_stateless(&parsed.app_name) {
+        parsed.context_budget.include_memory = false;
+    }
     tracing::info!(
         app = %parsed.app_name,
         route_profile = %parsed.route_profile_id,
@@ -465,6 +471,18 @@ pub(crate) fn latest_user_message_text(payload: &serde_json::Value) -> Option<St
             .then(|| message.get("content").and_then(extract_message_text))
             .flatten()
     })
+}
+
+/// Stateless directory/transaction bots that must NOT accumulate or re-inject
+/// personal recursive memory across conversations. Memo (movilo) is a public
+/// directory bot whose source of truth is the live DB (queried per turn via
+/// tools); persisting every chat turn and replaying it by user_id poisoned intent
+/// (an affiliation flow leaked into provider searches) and bloated scoped_memory
+/// to 12k rows. Forcing memory off for these apps gates BOTH the recall side
+/// (build_full_system_prompt) and the save side (handler_generate/handler_stream),
+/// since both branch on budget.include_memory.
+pub fn app_is_stateless(app_name: &str) -> bool {
+    matches!(app_name.trim().to_ascii_lowercase().as_str(), "movilo")
 }
 
 pub fn context_budget_for_mode(mode: &str, lightweight_mode: bool) -> ContextBudget {
