@@ -125,11 +125,22 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
     if !city.is_empty() {
         conditions.push(folded_like("p.city", city));
     }
-    if !specialty.is_empty() {
+    // El LLM a veces mete la especialidad en `service` y viceversa (p.ej.
+    // "cardiologo" llegó como service → filtraba s.name y daba 0 aunque existe
+    // el provider_type "Cardiología"). Si solo hay UN término, mátchealo contra
+    // provider_type O nombre de servicio. Con AMBOS, filtra preciso (tipo+servicio).
+    if !specialty.is_empty() && !keyword.is_empty() {
         conditions.push(folded_like("p.provider_type", specialty));
-    }
-    if !keyword.is_empty() {
         conditions.push(folded_like("s.name", keyword));
+    } else {
+        let term = if !specialty.is_empty() { specialty } else { keyword };
+        if !term.is_empty() {
+            conditions.push(format!(
+                "({} OR {})",
+                folded_like("p.provider_type", term),
+                folded_like("s.name", term)
+            ));
+        }
     }
 
     let query = format!(
@@ -204,6 +215,37 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
                     success: true,
                     output,
                 }
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_movilo_get_plans(_call: &ToolCall) -> ToolResult {
+    let query = "SELECT name, price_annual, price_monthly, discount_percentage, features \
+                 FROM movilo_plans WHERE is_active = true ORDER BY sort_order"
+        .to_string();
+    let memento_call = ToolCall {
+        name: "memento_query".to_string(),
+        arguments: serde_json::json!({ "app": "movilo", "query": query }),
+    };
+    match super::data::execute_memento_query_json(&memento_call).await {
+        Err(error) => ToolResult {
+            name: "movilo_get_plans".to_string(),
+            success: false,
+            output: format!(
+                "[[SYSTEM DIRECTIVE]]: No se pudieron consultar los planes. Di EXACTAMENTE: \"No pude consultar los planes en este momento. Puedes verlos y comprarlos aquí: [Comprar o Renovar Plan](https://movilo.club/buy)\". No inventes precios.\n\nError: {error}"
+            ),
+        },
+        Ok(res) => {
+            let rows = res.get("rows").cloned().unwrap_or(serde_json::json!([]));
+            let formatted = serde_json::to_string_pretty(&rows).unwrap_or_default();
+            let output = format!(
+                "Planes de Movilo (precios en COP):\n{formatted}\n\n[[SYSTEM DIRECTIVE]]: Preséntale al usuario los planes con su PRECIO ANUAL real (formatea en pesos, ej. $499.000 COP) y su % de descuento. Aclara que es PAGO ÚNICO ANUAL (no mensual). Para el plan Empresarial di que es a medida. Usa SOLO las cifras del resultado — nunca inventes. Cierra con el enlace [Comprar o Renovar Plan](https://movilo.club/buy)."
+            );
+            ToolResult {
+                name: "movilo_get_plans".to_string(),
+                success: true,
+                output,
             }
         }
     }

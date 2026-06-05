@@ -270,6 +270,7 @@ async fn dispatch_vetra_tool(call: &ToolCall) -> Option<ToolResult> {
 async fn dispatch_movilo_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
         "movilo_search_providers" => apps_movilo::execute_movilo_search_providers(call).await,
+        "movilo_get_plans" => apps_movilo::execute_movilo_get_plans(call).await,
         "movilo_check_affiliation" => apps_movilo::execute_movilo_check_affiliation(call).await,
         "movilo_validate_qr" => apps_movilo::execute_movilo_validate_qr(call).await,
         _ => return None,
