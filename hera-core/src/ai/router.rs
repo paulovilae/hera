@@ -340,11 +340,23 @@ fn with_explicit_endpoint(mut req: ChatRequest, endpoint: Option<String>) -> Cha
     req
 }
 
-fn cloud_fallback_allowed(req: &ChatRequest) -> bool {
-    if std::env::var("HERA_ALLOW_CLOUD_FALLBACK")
+/// Sovereign-first master switch for paid cloud inference.
+///
+/// Cloud is DENIED by default. It is only enabled when `HERA_ALLOW_CLOUD_FALLBACK`
+/// is explicitly set to a truthy value (`1` / `true` / `yes`). This is the opposite
+/// of an opt-out: an absent or empty var means "no cloud, no charges".
+///
+/// Background: a deploy without this var set silently billed ~$100 to OpenRouter
+/// because the previous logic defaulted to ALLOW (2026-06-09 incident).
+pub fn cloud_globally_enabled() -> bool {
+    std::env::var("HERA_ALLOW_CLOUD_FALLBACK")
         .ok()
-        .is_some_and(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "False"))
-    {
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "YES"))
+}
+
+fn cloud_fallback_allowed(req: &ChatRequest) -> bool {
+    // Sovereign-first: cloud stays off unless explicitly enabled.
+    if !cloud_globally_enabled() {
         return false;
     }
 

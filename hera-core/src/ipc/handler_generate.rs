@@ -366,7 +366,14 @@ pub async fn handle_generate(
                 // cloud, escalate once to the cloud failover. Sovereign-first:
                 // this only fires on demonstrated local-quality failure, and only
                 // replaces the answer if the escalation is actually better.
-                if tool_calls.is_none() && response_origin != "cloud" {
+                //
+                // Gated on the master cloud switch: with HERA_ALLOW_CLOUD_FALLBACK
+                // unset (the default) this never touches a paid provider — it was
+                // the missing gate behind the 2026-06-09 OpenRouter billing incident.
+                if tool_calls.is_none()
+                    && response_origin != "cloud"
+                    && crate::ai::router::cloud_globally_enabled()
+                {
                     let difficulty = super::difficulty::Difficulty::from_reasoning_effort(
                         &parsed.reasoning_effort,
                     );
