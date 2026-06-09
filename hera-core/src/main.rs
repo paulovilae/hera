@@ -153,23 +153,32 @@ async fn main() {
         Arc::new(DisabledEngine) as Arc<dyn hera_core::ai::LLMEngine + Send + Sync>
     };
 
-    // Mount OpenRouter Cloud Fallback Engine
-    let openrouter_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
-    let openrouter_model = std::env::var("OPENROUTER_DEFAULT_MODEL")
+    // Mount cloud fallback engine (failover ONLY; gated by HERA_ALLOW_CLOUD_FALLBACK).
+    // Endpoint / key / model are configurable so we can point at a FREE provider
+    // (Groq, Google AI Studio, Cerebras) instead of a paid one. Falls back to the
+    // legacy OPENROUTER_* vars for backward compatibility.
+    let cloud_key = std::env::var("HERA_CLOUD_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+        .unwrap_or_default();
+    let cloud_endpoint = std::env::var("HERA_CLOUD_ENDPOINT")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".to_string());
+    let cloud_model = std::env::var("HERA_CLOUD_DEFAULT_MODEL")
+        .or_else(|_| std::env::var("OPENROUTER_DEFAULT_MODEL"))
         .unwrap_or_else(|_| "nvidia/nemotron-3-nano-30b-a3b:free".to_string());
-    let cloud_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = if !openrouter_key
-        .is_empty()
+    let cloud_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> = if !cloud_key.is_empty()
     {
         info!(
-            "☁️ OpenRouter cloud fallback configured (default model: {})",
-            openrouter_model
+            "☁️ Cloud fallback configured: endpoint={} (model: {})",
+            cloud_endpoint, cloud_model
         );
         Arc::new(hera_core::ai::openai_compat::OpenAICompatEngine::new(
-            "https://openrouter.ai/api/v1/chat/completions".to_string(),
-            openrouter_key.clone(),
+            cloud_endpoint.clone(),
+            cloud_key.clone(),
         ))
     } else {
-        tracing::warn!("⚠️ No OPENROUTER_API_KEY set. Cloud fallback disabled.");
+        tracing::warn!("⚠️ No cloud API key set. Cloud fallback disabled.");
         struct NoCloudEngine;
         #[async_trait::async_trait]
         impl hera_core::ai::LLMEngine for NoCloudEngine {

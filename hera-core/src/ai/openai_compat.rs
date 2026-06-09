@@ -41,9 +41,12 @@ impl LLMEngine for OpenAICompatEngine {
             normalized_req.model = explicit_model.trim().to_string();
         }
 
-        if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
-            && active_endpoint.contains("openrouter.ai")
-            && let Ok(cloud_model) = std::env::var("OPENROUTER_DEFAULT_MODEL")
+        // Cloud failover: the local model name (e.g. "Qwen3.6-35B...gguf") is never
+        // valid at a cloud provider, so for any cloud-routed request force the
+        // configured cloud model. Works for Groq / Google / OpenRouter alike.
+        if normalized_req.provider.as_deref() == Some("cloud")
+            && let Ok(cloud_model) = std::env::var("HERA_CLOUD_DEFAULT_MODEL")
+                .or_else(|_| std::env::var("OPENROUTER_DEFAULT_MODEL"))
             && !cloud_model.trim().is_empty()
         {
             normalized_req.model = cloud_model.trim().to_string();
@@ -78,6 +81,12 @@ impl LLMEngine for OpenAICompatEngine {
             obj.remove("tts_model");
             obj.remove("stt_model");
             obj.remove("nsfw");
+            // Some cloud providers (e.g. Groq) return 400 on non-standard fields
+            // like `reasoning_effort` (llama.cpp locally just ignores it). Strip
+            // it for cloud-routed requests so the failover doesn't bounce.
+            if normalized_req.provider.as_deref() == Some("cloud") {
+                obj.remove("reasoning_effort");
+            }
         }
         tracing::debug!("Outbound Request Payload: {}", payload);
 
@@ -135,9 +144,12 @@ impl LLMEngine for OpenAICompatEngine {
             normalized_req.model = explicit_model.trim().to_string();
         }
 
-        if (normalized_req.model.is_empty() || normalized_req.model.starts_with("hera-"))
-            && active_endpoint.contains("openrouter.ai")
-            && let Ok(cloud_model) = std::env::var("OPENROUTER_DEFAULT_MODEL")
+        // Cloud failover: the local model name (e.g. "Qwen3.6-35B...gguf") is never
+        // valid at a cloud provider, so for any cloud-routed request force the
+        // configured cloud model. Works for Groq / Google / OpenRouter alike.
+        if normalized_req.provider.as_deref() == Some("cloud")
+            && let Ok(cloud_model) = std::env::var("HERA_CLOUD_DEFAULT_MODEL")
+                .or_else(|_| std::env::var("OPENROUTER_DEFAULT_MODEL"))
             && !cloud_model.trim().is_empty()
         {
             normalized_req.model = cloud_model.trim().to_string();
@@ -169,6 +181,12 @@ impl LLMEngine for OpenAICompatEngine {
             obj.remove("tts_model");
             obj.remove("stt_model");
             obj.remove("nsfw");
+            // Some cloud providers (e.g. Groq) return 400 on non-standard fields
+            // like `reasoning_effort` (llama.cpp locally just ignores it). Strip
+            // it for cloud-routed requests so the failover doesn't bounce.
+            if normalized_req.provider.as_deref() == Some("cloud") {
+                obj.remove("reasoning_effort");
+            }
         }
 
         let mut request_builder = self.client.post(&active_endpoint).json(&payload);
