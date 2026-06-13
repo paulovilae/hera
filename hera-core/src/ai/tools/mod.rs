@@ -13,3 +13,4 @@ pub mod infra_smoke;
 pub mod mission_control;
 pub mod platform;
 pub mod productivity;
+pub mod storage;

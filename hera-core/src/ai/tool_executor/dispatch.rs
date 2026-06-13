@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::ai::tools::{
     apps_latinos, apps_movilo, apps_vetra, data, geo, infra_health, infra_smoke, mission_control,
-    platform, productivity,
+    platform, productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -133,6 +133,9 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "hera_search" => platform::execute_search(call).await,
         "geocode" => geo::execute_geocode(call).await,
         "reverse_geocode" => geo::execute_reverse_geocode(call).await,
+        "storage_list" => storage::execute_storage_list(call).await,
+        "storage_get_url" => storage::execute_storage_get_url(call).await,
+        "storage_put" => storage::execute_storage_put(call).await,
         "hera_speak" => platform::execute_speak(call).await,
         "hera_video" => platform::execute_video(call).await,
         "hera_read_file" | "read_file" => platform::execute_read_file(call).await,
