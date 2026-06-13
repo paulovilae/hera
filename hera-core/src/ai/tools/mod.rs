@@ -7,6 +7,7 @@ pub mod apps_latinos;
 pub mod apps_movilo;
 pub mod apps_vetra;
 pub mod data;
+pub mod geo;
 pub mod infra_health;
 pub mod infra_smoke;
 pub mod mission_control;
