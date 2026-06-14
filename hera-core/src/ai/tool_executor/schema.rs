@@ -7,6 +7,9 @@ use serde_json::Value;
 struct ToolArtifact {
     schema: Value,
     consumers: Vec<String>,
+    /// `metadata.status == "skeleton_not_implemented"` — WIP tools that are
+    /// never offered to the model (and are exempt from the dispatch test).
+    is_skeleton: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,11 +40,21 @@ fn parse_tool_artifact(path: &Path) -> Option<ToolArtifact> {
         })
         .unwrap_or_else(|| vec!["all".to_string()]);
 
+    let is_skeleton = schema
+        .get("metadata")
+        .and_then(|metadata| metadata.get("status"))
+        .and_then(|value| value.as_str())
+        == Some("skeleton_not_implemented");
+
     if let Some(obj) = schema.as_object_mut() {
         obj.remove("metadata");
     }
 
-    Some(ToolArtifact { schema, consumers })
+    Some(ToolArtifact {
+        schema,
+        consumers,
+        is_skeleton,
+    })
 }
 
 fn collect_tool_schemas_from_dir(dir: &Path, tools: &mut Vec<Value>, agent_name: &str) {
@@ -62,6 +75,12 @@ fn collect_tool_schemas_from_dir(dir: &Path, tools: &mut Vec<Value>, agent_name:
             }
 
             match parse_tool_artifact(&entry_path) {
+                Some(artifact) if artifact.is_skeleton => {
+                    tracing::debug!(
+                        "Skipping skeleton_not_implemented tool: {:?}",
+                        entry_path
+                    );
+                }
                 Some(artifact) => {
                     let allowed = artifact
                         .consumers
@@ -270,6 +289,21 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
             | "desktop_click"
             | "desktop_type"
             | "edit_app_theme"
+            | "geocode"
+            | "reverse_geocode"
+            | "storage_list"
+            | "storage_get_url"
+            | "storage_put"
+            | "read_email"
+            | "read_notes"
+            | "list_calendar_events"
+            | "mc_board"
+            | "mc_create_story"
+            | "mc_move_story"
+            | "mc_create_sprint"
+            | "mc_close_sprint"
+            | "mc_add_wishlist"
+            | "mc_set_objective"
     )
 }
 
@@ -277,7 +311,12 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
 fn is_data_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "memento_query" | "api_request" | "git_manager" | "memento_vector_search"
+        "memento_query"
+            | "api_request"
+            | "git_manager"
+            | "memento_vector_search"
+            | "save_memory"
+            | "query_memory"
     )
 }
 
@@ -296,6 +335,7 @@ fn is_infra_tool_name(tool_name: &str) -> bool {
             | "verify_canonical_stack"
             | "review_all_apps_status"
             | "verify_app_health"
+            | "query_federation_state"
     )
 }
 
@@ -313,10 +353,27 @@ fn is_vetra_tool_name(tool_name: &str) -> bool {
 }
 
 #[cfg(test)]
+fn is_brand_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "add_topic"
+            | "list_pending_drafts"
+            | "approve_draft"
+            | "capture_post_metrics"
+            | "voice_profile_get"
+            | "voice_profile_update"
+            | "save_thesis_doc"
+    )
+}
+
+#[cfg(test)]
 fn is_movilo_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "movilo_search_providers" | "movilo_check_affiliation" | "movilo_validate_qr"
+        "movilo_search_providers"
+            | "movilo_get_plans"
+            | "movilo_check_affiliation"
+            | "movilo_validate_qr"
     )
 }
 
@@ -367,7 +424,8 @@ pub(crate) fn tool_has_runtime_dispatch(tool_name: &str, execution_kind: Option<
                 || is_latinos_tool_name(tool_name)
         }
         Some("http_adapter") => {
-            is_vetra_tool_name(tool_name)
+            is_brand_tool_name(tool_name)
+                || is_vetra_tool_name(tool_name)
                 || is_data_tool_name(tool_name)
                 || is_platform_tool_name(tool_name)
         }

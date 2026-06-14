@@ -3,8 +3,8 @@
 use serde_json::Value;
 
 use crate::ai::tools::{
-    apps_latinos, apps_movilo, apps_vetra, data, geo, infra_health, infra_smoke, mission_control,
-    platform, productivity, storage,
+    apps_latinos, apps_movilo, apps_vetra, brand_studio, data, geo, infra_health, infra_smoke,
+    mission_control, platform, productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -201,7 +201,9 @@ async fn dispatch_metadata_tool(call: &ToolCall) -> Option<ToolResult> {
             }
         }
         "http_adapter" => {
-            if let Some(result) = dispatch_vetra_tool(call).await {
+            if let Some(result) = dispatch_brand_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_vetra_tool(call).await {
                 Some(result)
             } else if let Some(result) = dispatch_data_tool(call).await {
                 Some(result)
@@ -254,6 +256,20 @@ async fn dispatch_infra_tool(call: &ToolCall) -> Option<ToolResult> {
         "verify_canonical_stack" => infra_smoke::execute_verify_canonical_stack(call).await,
         "review_all_apps_status" => infra_smoke::execute_review_all_apps_status(call).await,
         "verify_app_health" => infra_smoke::execute_verify_app_health(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_brand_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "add_topic" => brand_studio::execute_add_topic(call).await,
+        "list_pending_drafts" => brand_studio::execute_list_pending_drafts(call).await,
+        "approve_draft" => brand_studio::execute_approve_draft(call).await,
+        "capture_post_metrics" => brand_studio::execute_capture_post_metrics(call).await,
+        "voice_profile_get" => brand_studio::execute_voice_profile_get(call).await,
+        "voice_profile_update" => brand_studio::execute_voice_profile_update(call).await,
+        "save_thesis_doc" => brand_studio::execute_save_thesis_doc(call).await,
         _ => return None,
     };
     Some(result)
