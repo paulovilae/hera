@@ -325,6 +325,7 @@ fn is_infra_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "caddy_domain_manager"
+            | "provision_subdomain"
             | "system_status"
             | "diagnose_services"
             | "service_restart"

@@ -202,6 +202,88 @@ pub(crate) async fn execute_caddy_domain_manager(call: &ToolCall) -> ToolResult 
     }
 }
 
+pub(crate) async fn execute_provision_subdomain(call: &ToolCall) -> ToolResult {
+    let action = call
+        .arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let slug = call
+        .arguments
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let port = call.arguments.get("port").and_then(|v| v.as_i64());
+    let public = call.arguments.get("public").and_then(|v| v.as_bool()).unwrap_or(false);
+    let email = call.arguments.get("email").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let base = call.arguments.get("base").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+
+    let fail = |msg: &str| ToolResult {
+        name: call.name.clone(),
+        success: false,
+        output: msg.to_string(),
+    };
+    if !matches!(action, "up" | "down" | "status") {
+        return fail("action debe ser uno de: up, down, status.");
+    }
+    // slug seguro: solo letras/dígitos/guion (parámetro estructurado, nunca comando libre).
+    if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return fail("slug inválido: solo letras, dígitos o guion.");
+    }
+    if let Some(b) = base {
+        if !b.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            return fail("base inválida.");
+        }
+    }
+    if let Some(e) = email {
+        if !e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+            return fail("email (parte local) inválido.");
+        }
+    }
+    if action == "up" && port.is_none() {
+        return fail("port es requerido para action=up.");
+    }
+
+    let script = "/home/paulo/Programs/apps/OS/scripts/provision_subdomain.py";
+    let mut command = std::process::Command::new("python3");
+    command.arg(script).arg(action).arg("--slug").arg(slug);
+    if let Some(p) = port {
+        command.arg("--port").arg(p.to_string());
+    }
+    if let Some(b) = base {
+        command.arg("--base").arg(b);
+    }
+    if public {
+        command.arg("--public");
+    }
+    if let Some(e) = email {
+        command.arg("--email").arg(e);
+    }
+
+    match command.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if output.status.success() {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: if stdout.is_empty() { "Operación completada.".to_string() } else { stdout },
+                }
+            } else {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: if stderr.is_empty() { stdout } else { format!("{stdout}\n{stderr}") },
+                }
+            }
+        }
+        Err(error) => fail(&format!("No se pudo ejecutar provision_subdomain.py: {error}")),
+    }
+}
+
 pub(crate) async fn execute_diagnose_services(call: &ToolCall) -> ToolResult {
     let service_filter = call
         .arguments
