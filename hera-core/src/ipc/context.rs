@@ -745,6 +745,37 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
 /// Build the full system prompt (persona + memento + tool schemas + DB schemas + directives).
 ///
 /// This is the single DRY function replacing 3 copy-pasted blocks across generate/stream.
+/// Current date in America/Bogota (UTC-5), day granularity, dependency-free.
+/// Returns e.g. "Monday 2026-06-15". Day precision (not time) keeps it in the
+/// cache-friendly stable prefix: it only changes once per day, so the prompt
+/// cache still hits across turns within a day.
+fn current_bogota_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        - 5 * 3600; // America/Bogota, no DST
+    let days = secs.div_euclid(86_400);
+    // Weekday: 1970-01-01 (day 0) was Thursday → (days+4) mod 7, 0 = Sunday.
+    let wd = (days + 4).rem_euclid(7) as usize;
+    let names = [
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    ];
+    // Civil date from day count (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(m <= 2);
+    format!("{} {:04}-{:02}-{:02}", names[wd], y, m, d)
+}
+
 pub async fn build_full_system_prompt(
     persona_path: &str,
     app_name: &str,
@@ -823,6 +854,12 @@ pub async fn build_full_system_prompt(
     } else {
         "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be EXACTLY this format, with NO conversational text: <tool_call>{\"name\": \"function_name\", \"arguments\": {\"arg1\": \"val\"}}</tool_call>"
     };
+    // Every agent always knows the current date (LLMs have no clock). Day-grained
+    // so it stays in the cache-friendly stable prefix.
+    let date_directive = format!(
+        "\nCURRENT DATE: Today is {} in America/Bogota (UTC-5). Treat this as 'today'/'hoy' for any date, weekday, or day-count question; never guess or assume a different date.",
+        current_bogota_date()
+    );
     let language_directive = match language_hint {
         "es" => "\nLANGUAGE RULE: Respond in Spanish unless the user explicitly switches language.",
         "en" => "\nLANGUAGE RULE: Respond in English unless the user explicitly switches language.",
@@ -870,13 +907,14 @@ pub async fn build_full_system_prompt(
     // can mark the boundary. Putting dynamic memory AT THE END keeps cache hits
     // stable across turns even as memory grows.
     let stable_prefix = format!(
-        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}",
+        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}{}",
         base_system_prompt,
         schemas,
         db_schema_ctx,
         think_directive,
         json_directive,
         language_directive,
+        date_directive,
         runtime_context_directive
     );
     let dynamic_suffix = format!("{}{}", recursive_ctx, semantic_ctx);
