@@ -27,6 +27,12 @@ use std::sync::Arc;
 /// build → read error → fix → build) easily needs a dozen rounds.
 const DEFAULT_MAX_ITERS: usize = 25;
 
+/// How many times a repeated (no-progress) tool call earns a corrective nudge
+/// before the loop gives up. Closing immediately on the first repeat killed
+/// legitimate debugging (the model retries a near-miss edit); a nudge to change
+/// approach lets weak local models recover.
+const MAX_NOPROGRESS_NUDGES: usize = 2;
+
 /// Tools that mutate source. After one of these succeeds, the agent should
 /// verify before declaring the task done.
 const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
@@ -82,7 +88,7 @@ fn coding_temp() -> f32 {
         .ok()
         .and_then(|v| v.trim().parse::<f32>().ok())
         .filter(|t| (0.0..=2.0).contains(t))
-        .unwrap_or(0.1)
+        .unwrap_or(0.2)
 }
 
 fn max_iters() -> usize {
@@ -218,6 +224,7 @@ pub async fn run_agentic_loop(
     // subsequent green verification, and whether we've already nudged once.
     let mut edited_pending = false;
     let mut nudged = false;
+    let mut no_progress_nudges = 0usize;
 
     for iter in 0..max {
         let resp = match engine.generate_content(req.clone()).await {
@@ -307,28 +314,52 @@ pub async fn run_agentic_loop(
         let summary = execute_parsed_tool_calls(&calls, parsed, None).await;
         edited_pending = update_edited_pending(edited_pending, &summary.executed_results);
         executed_calls_json.extend(summary.executed_calls_json);
+        let outputs = summary.execution_outputs;
 
-        let is_last = iter + 1 >= max;
-        if is_last || no_progress {
-            // Closing pass: re-feed results once more, but forbid further tools,
-            // and ask for the final answer. This guarantees the user gets prose,
-            // never a dangling tool call.
-            append_tool_round(&mut req, &content, &summary.execution_outputs, true);
-            let stop_reason = if no_progress { "no_progress" } else { "max_iters" };
+        // Hard cap reached → final answer.
+        if iter + 1 >= max {
+            append_tool_round(&mut req, &content, &outputs, true);
             return close_with_final_answer(
-                engine,
-                req,
-                executed_calls_json,
-                last_model,
-                last_origin,
-                summary.execution_outputs,
-                iter + 1,
-                stop_reason,
+                engine, req, executed_calls_json, last_model, last_origin, outputs, iter + 1,
+                "max_iters",
             )
             .await;
         }
 
-        append_tool_round(&mut req, &content, &summary.execution_outputs, false);
+        if no_progress {
+            // The model repeated the same call with the same result. Instead of
+            // giving up, nudge it to change approach — weak local models often
+            // recover once told explicitly to stop repeating. Give up only after
+            // a few such nudges.
+            if no_progress_nudges < MAX_NOPROGRESS_NUDGES {
+                no_progress_nudges += 1;
+                tracing::info!(
+                    "🔁 [Hera Loop] no-progress recovery nudge {}/{} at iter {}",
+                    no_progress_nudges,
+                    MAX_NOPROGRESS_NUDGES,
+                    iter
+                );
+                req.messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Text(content),
+                });
+                req.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: MessageContent::Text(format!(
+                        "Tool execution results:{outputs}\n\nYou repeated the same tool call and got the same result — that is not progress. Do NOT repeat it. Re-read the file and the exact error, then try a DIFFERENT fix with different arguments. If an edit_file failed with 'old_string not found', read the file again with read_file and copy the exact text, including indentation, before editing."
+                    )),
+                });
+                continue;
+            }
+            append_tool_round(&mut req, &content, &outputs, true);
+            return close_with_final_answer(
+                engine, req, executed_calls_json, last_model, last_origin, outputs, iter + 1,
+                "no_progress",
+            )
+            .await;
+        }
+
+        append_tool_round(&mut req, &content, &outputs, false);
     }
 
     // Unreachable in practice (the loop returns on the last iteration), but keep
@@ -594,16 +625,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_closes_on_repeated_tool_call_no_progress() {
-        // The model emits the SAME tool call twice in a row → no-progress guard
-        // triggers a closing pass.
+    async fn loop_recovers_then_closes_on_persistent_no_progress() {
+        // The model emits the SAME tool call every round. The guard nudges it to
+        // change approach MAX_NOPROGRESS_NUDGES times before finally giving up —
+        // so it takes several identical rounds, not two, to reach the close.
         let same = "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"/x\"}}</tool_call>";
         let engine: Arc<dyn LLMEngine + Send + Sync> =
-            Arc::new(ScriptedEngine::new(vec![same, same, "Closing answer."]));
+            Arc::new(ScriptedEngine::new(vec![same, same, same, same, same]));
         let outcome = run_agentic_loop(&engine, base_request(), &test_parsed()).await;
         assert_eq!(outcome.stop_reason, "no_progress");
-        // The closing answer is the round-3 scripted response, proving two
-        // identical tool rounds fired before the no-progress guard forced a close.
-        assert!(outcome.result_text.contains("Closing"));
+        // Recovery nudges delayed the close past the first repeat.
+        assert!(outcome.iterations >= 2 + MAX_NOPROGRESS_NUDGES);
     }
 }
