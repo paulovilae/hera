@@ -3,8 +3,8 @@
 use serde_json::Value;
 
 use crate::ai::tools::{
-    apps_latinos, apps_movilo, apps_vetra, brand_studio, coding, data, geo, infra_health,
-    infra_smoke, mission_control, platform, productivity, storage,
+    apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding, data, geo,
+    infra_health, infra_smoke, mission_control, platform, productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -148,6 +148,9 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "edit_file" => coding::execute_edit_file(call).await,
         "grep_search" => coding::execute_grep_search(call).await,
         "glob_search" => coding::execute_glob_search(call).await,
+        "cargo_check" => build_feedback::execute_cargo_check(call).await,
+        "cargo_test" => build_feedback::execute_cargo_test(call).await,
+        "pytest" => build_feedback::execute_pytest(call).await,
         "generate_access_link" => platform::execute_generate_access_link(call).await,
         "spline_interact" => platform::execute_spline_interact(call).await,
         "desktop_click" => platform::execute_desktop_click(call).await,
