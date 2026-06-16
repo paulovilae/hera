@@ -7,6 +7,7 @@ pub mod apps_latinos;
 pub mod apps_movilo;
 pub mod apps_vetra;
 pub mod brand_studio;
+pub mod coding;
 pub mod data;
 pub mod geo;
 pub mod infra_health;

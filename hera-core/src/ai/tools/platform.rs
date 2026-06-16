@@ -14,7 +14,7 @@ const HOME_ROOT: &str = "/home/paulo";
 const TMP_ROOT: &str = "/tmp";
 const SMARTOS_ROUTER_URL: &str = "http://127.0.0.1:3000";
 
-fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<PathBuf, String> {
+pub(crate) fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<PathBuf, String> {
     let raw = Path::new(path);
     let candidate = if raw.exists() {
         std::fs::canonicalize(raw).map_err(|e| format!("Failed to resolve path: {}", e))?
