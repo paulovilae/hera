@@ -58,6 +58,21 @@ pub fn agentic_loop_enabled() -> bool {
     )
 }
 
+/// Whether the verify-before-done gate is active. Opt-in (`HERA_VERIFY_GATE`):
+/// an eval run on 2026-06-15 did not show it improving pass@1 (the signal was
+/// dominated by model run-to-run variance), so it stays off by default until a
+/// multi-run eval can prove it helps. See docs/AVA_CODING_AGENT_PLAN.md.
+fn verify_gate_enabled() -> bool {
+    matches!(
+        std::env::var("HERA_VERIFY_GATE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn max_iters() -> usize {
     std::env::var("HERA_AGENTIC_MAX_ITERS")
         .ok()
@@ -234,7 +249,7 @@ pub async fn run_agentic_loop(
             // run a verification before accepting the answer. This targets the
             // observed failure where the model declares "done" on code that
             // doesn't compile. Only fires once to avoid looping forever.
-            if edited_pending && !nudged {
+            if verify_gate_enabled() && edited_pending && !nudged {
                 nudged = true;
                 tracing::info!(
                     "🔁 [Hera Loop] verify-before-done gate fired at iter {} — nudging to verify edits",
