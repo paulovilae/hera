@@ -12,6 +12,9 @@ pub struct ToolExecutionSummary {
     pub executed_calls_json: Vec<serde_json::Value>,
     pub executed_tool_count: usize,
     pub has_media_call: bool,
+    /// (tool_name, success) per call this round — lets the agentic loop reason
+    /// about whether an edit was followed by a green verification.
+    pub executed_results: Vec<(String, bool)>,
 }
 
 pub enum FollowupStrategy<'a> {
@@ -79,6 +82,7 @@ pub async fn execute_parsed_tool_calls(
     let mut execution_outputs = String::new();
     let mut executed_calls_json = Vec::new();
     let mut executed_tool_count = 0usize;
+    let mut executed_results: Vec<(String, bool)> = Vec::new();
 
     for call in parsed_calls {
         if let Some(stream) = status_stream.as_deref_mut() {
@@ -96,6 +100,7 @@ pub async fn execute_parsed_tool_calls(
             let tool_res = crate::ai::tool_executor::execute_tool(&contextual_call).await;
             executed_tool_count += 1;
             execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
+            executed_results.push((contextual_call.name.clone(), tool_res.success));
             executed_calls_json.push(serde_json::json!({
                 "name": contextual_call.name,
                 "arguments": contextual_call.arguments
@@ -109,6 +114,7 @@ pub async fn execute_parsed_tool_calls(
                 "\n\nError: Not permitted to use tool '{}'",
                 call.name
             ));
+            executed_results.push((call.name.clone(), false));
         }
     }
 
@@ -124,6 +130,7 @@ pub async fn execute_parsed_tool_calls(
         executed_calls_json,
         executed_tool_count,
         has_media_call,
+        executed_results,
     }
 }
 

@@ -27,6 +27,12 @@ use std::sync::Arc;
 /// build → read error → fix → build) easily needs a dozen rounds.
 const DEFAULT_MAX_ITERS: usize = 25;
 
+/// Tools that mutate source. After one of these succeeds, the agent should
+/// verify before declaring the task done.
+const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
+/// Tools whose green result clears the "needs verification" flag.
+const VERIFY_TOOLS: &[&str] = &["cargo_check", "cargo_test", "pytest"];
+
 /// Outcome of a full agentic loop run.
 pub struct AgenticLoopOutcome {
     pub result_text: String,
@@ -105,6 +111,23 @@ fn extract_tool_calls(content: &str, structured: &Option<Vec<serde_json::Value>>
     calls
 }
 
+/// Update the "edited but not yet verified green" flag from a round's executed
+/// (tool_name, success) results, in order. A successful edit sets it; a green
+/// verification clears it; a failed/denied edit or a red verification leaves it.
+fn update_edited_pending(mut pending: bool, results: &[(String, bool)]) -> bool {
+    for (name, success) in results {
+        if !*success {
+            continue;
+        }
+        if EDIT_TOOLS.contains(&name.as_str()) {
+            pending = true;
+        } else if VERIFY_TOOLS.contains(&name.as_str()) {
+            pending = false;
+        }
+    }
+    pending
+}
+
 /// Stable signature of a round's tool calls, used to detect a model that is
 /// stuck repeating the same call without making progress.
 fn calls_signature(calls: &[ToolCall]) -> String {
@@ -162,6 +185,10 @@ pub async fn run_agentic_loop(
     let mut last_origin = "local".to_string();
     let mut last_text = String::new();
     let mut last_signature: Option<String> = None;
+    // Verify-before-done gate: track whether files were edited without a
+    // subsequent green verification, and whether we've already nudged once.
+    let mut edited_pending = false;
+    let mut nudged = false;
 
     for iter in 0..max {
         let resp = match engine.generate_content(req.clone()).await {
@@ -202,6 +229,30 @@ pub async fn run_agentic_loop(
 
         let calls = extract_tool_calls(&content, &choice.message.tool_calls);
         if calls.is_empty() {
+            // Verify-before-done gate: the model is trying to finish, but it
+            // edited files and never confirmed they build/pass. Nudge it once to
+            // run a verification before accepting the answer. This targets the
+            // observed failure where the model declares "done" on code that
+            // doesn't compile. Only fires once to avoid looping forever.
+            if edited_pending && !nudged {
+                nudged = true;
+                tracing::info!(
+                    "🔁 [Hera Loop] verify-before-done gate fired at iter {} — nudging to verify edits",
+                    iter
+                );
+                req.messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Text(content),
+                });
+                req.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: MessageContent::Text(
+                        "Before you finish: you edited files but have not confirmed the result builds and passes. Run the appropriate verification now (cargo_check or cargo_test for Rust; run the tests for other languages). If it reports errors, fix them and verify again. Only give your final answer once verification is green."
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
             // The model produced a plain answer — the task is done.
             return AgenticLoopOutcome {
                 result_text: content,
@@ -225,6 +276,7 @@ pub async fn run_agentic_loop(
         );
 
         let summary = execute_parsed_tool_calls(&calls, parsed, None).await;
+        edited_pending = update_edited_pending(edited_pending, &summary.executed_results);
         executed_calls_json.extend(summary.executed_calls_json);
 
         let is_last = iter + 1 >= max;
@@ -449,6 +501,24 @@ mod tests {
         let calls = extract_tool_calls("", &structured);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "grep_search");
+    }
+
+    #[test]
+    fn edited_pending_tracks_edit_then_verify() {
+        let edit = vec![("edit_file".to_string(), true)];
+        let green = vec![("cargo_check".to_string(), true)];
+        let red = vec![("cargo_check".to_string(), false)];
+        // a successful edit raises the flag
+        assert!(update_edited_pending(false, &edit));
+        // a green verify clears it
+        assert!(!update_edited_pending(true, &green));
+        // a red verify leaves it raised
+        assert!(update_edited_pending(true, &red));
+        // a denied/failed edit does not raise it
+        assert!(!update_edited_pending(false, &[("edit_file".to_string(), false)]));
+        // edit then green-verify in the same round ends clear
+        let both = vec![("edit_file".to_string(), true), ("cargo_check".to_string(), true)];
+        assert!(!update_edited_pending(false, &both));
     }
 
     #[test]
