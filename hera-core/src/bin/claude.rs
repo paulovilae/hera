@@ -17,6 +17,7 @@ struct Config {
     model: Option<String>,
     socket_path: String,
     permissions: Vec<String>,
+    session: Option<String>,
 }
 
 impl Default for Config {
@@ -30,6 +31,7 @@ impl Default for Config {
             model: None,
             socket_path: DEFAULT_SOCKET.to_string(),
             permissions: Vec::new(),
+            session: None,
         }
     }
 }
@@ -92,6 +94,9 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
                 config
                     .permissions
                     .push(iter.next().ok_or("missing value after --permission")?);
+            }
+            "--session" => {
+                config.session = Some(iter.next().ok_or("missing value after --session")?);
             }
             "--json" => {
                 config.json_mode = true;
@@ -210,8 +215,22 @@ async fn send_prompt(
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
     }
+    apply_session(&mut payload, config);
 
     send_request(config, payload).await
+}
+
+/// Attach a per-call session identity so memory does not bleed across runs
+/// (e.g. eval tasks): a unique session_id makes Hera derive a unique user_id,
+/// so Memento recall stays scoped to this single conversation.
+fn apply_session(payload: &mut Value, config: &Config) {
+    if let Some(session) = &config.session
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("session_id".to_string(), json!(session));
+        obj.insert("chat_id".to_string(), json!(session));
+        obj.insert("sender_name".to_string(), json!(session));
+    }
 }
 
 async fn send_messages(
@@ -239,6 +258,7 @@ async fn send_messages(
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
     }
+    apply_session(&mut payload, config);
 
     send_request(config, payload).await
 }
