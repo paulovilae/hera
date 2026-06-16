@@ -73,6 +73,18 @@ fn verify_gate_enabled() -> bool {
     )
 }
 
+/// Sampling temperature for the agentic (coding) path. Coding wants
+/// determinism, not creativity: the default generate path uses 0.7, which made
+/// eval results swing wildly. Low temperature both improves reliability on code
+/// and makes measurement reproducible. Override with `HERA_CODING_TEMP`.
+fn coding_temp() -> f32 {
+    std::env::var("HERA_CODING_TEMP")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|t| (0.0..=2.0).contains(t))
+        .unwrap_or(0.1)
+}
+
 fn max_iters() -> usize {
     std::env::var("HERA_AGENTIC_MAX_ITERS")
         .ok()
@@ -195,6 +207,8 @@ pub async fn run_agentic_loop(
 ) -> AgenticLoopOutcome {
     let max = max_iters();
     let mut req = base_request;
+    // Coding path: pin a low temperature for reliable, reproducible tool use.
+    req.temperature = Some(coding_temp());
     let mut executed_calls_json: Vec<serde_json::Value> = Vec::new();
     let mut last_model = String::new();
     let mut last_origin = "local".to_string();
