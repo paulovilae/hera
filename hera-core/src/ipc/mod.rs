@@ -7,6 +7,7 @@
 //!   - `DirectResponse`: the handler already wrote its own response to the socket
 //!   - `Result { ... }`: data for the dispatcher to format and send
 
+pub mod agentic_loop;
 pub mod argus_client;
 pub mod context;
 pub mod difficulty;

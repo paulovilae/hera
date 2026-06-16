@@ -225,6 +225,114 @@ pub async fn handle_generate(
             est_tokens,
             lightweight_mode
         );
+
+        // Fase 1 (docs/AVA_CODING_AGENT_PLAN.md): real multi-turn agentic loop.
+        // Behind HERA_AGENTIC_LOOP, and only for tool-enabled requests. Replaces
+        // the single-shot "execute 1 batch → format → done" path below with
+        // generate → execute tools → re-feed results → repeat. Reuses the exact
+        // same tool executors; the bots' current behaviour is unchanged when the
+        // flag is off. Fast-path + schema-planner above still short-circuit first.
+        if parsed.context_budget.allow_tools && super::agentic_loop::agentic_loop_enabled() {
+            let loop_outcome =
+                super::agentic_loop::run_agentic_loop(&state.engine, req, &parsed).await;
+            tracing::info!(
+                "🔁 [Hera IPC] Agentic loop finished: iterations={} stop_reason={} tools={}",
+                loop_outcome.iterations,
+                loop_outcome.stop_reason,
+                loop_outcome.executed_calls_json.len()
+            );
+            let result_text = loop_outcome.result_text;
+            let response_origin = loop_outcome.origin;
+            let response_model = loop_outcome.model;
+            let tool_calls = if loop_outcome.executed_calls_json.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Array(loop_outcome.executed_calls_json))
+            };
+
+            let duration_ms = started_at.elapsed().as_millis() as u64;
+            let outcome = build_runtime_outcome_artifacts(
+                "generate",
+                &parsed,
+                &prompt_assembly,
+                duration_ms,
+                None,
+                lightweight_mode,
+                &provider_requested,
+                &response_origin,
+                &response_model,
+                true,
+                tool_calls
+                    .as_ref()
+                    .and_then(|value| value.as_array().map(|items| items.len()))
+                    .unwrap_or(0),
+                result_text.len(),
+                est_tokens,
+                chat_req
+                    .as_ref()
+                    .map(|req| req.messages.len())
+                    .unwrap_or_default(),
+                None,
+            );
+            append_llm_audit_event(&outcome.audit_event);
+            record_observation_and_promote_runtime_hint(
+                outcome.observation_payload,
+                RuntimePromotionContext {
+                    preflight: runtime_preflight.clone(),
+                    mode: "generate",
+                    app_id: &parsed.app_name,
+                    route_profile: &parsed.route_profile_id,
+                    persona_path: &parsed.persona_path,
+                    session_id: &parsed.session_id,
+                    trace_id: &parsed.trace_id,
+                    chat_id: &parsed.chat_id,
+                    current_budget_mode: &parsed.context_budget.mode,
+                    persona_drift: parsed.persona_drift,
+                    success: true,
+                },
+            )
+            .await;
+
+            if !lightweight_mode && parsed.context_budget.include_memory {
+                let user_id = canonicalize_user_id(
+                    &parsed.sender_name,
+                    &parsed.chat_id,
+                    &parsed.session_id,
+                );
+                let app_id = parsed.app_name.clone();
+                let session_id = parsed.session_id.clone();
+                let user_content = parsed.prompt.clone();
+                let assistant_content = result_text.clone();
+                let attribution = prompt_assembly.recall_attribution.clone();
+                tokio::spawn(async move {
+                    save_chat_turn_event(
+                        user_id.clone(),
+                        app_id.clone(),
+                        session_id.clone(),
+                        "user".to_string(),
+                        user_content,
+                    )
+                    .await;
+                    save_chat_turn_event(
+                        user_id,
+                        app_id,
+                        session_id,
+                        "assistant".to_string(),
+                        assistant_content.clone(),
+                    )
+                    .await;
+                    report_recall_feedback(attribution.as_ref(), &assistant_content).await;
+                });
+            }
+
+            return HandlerOutcome::Result {
+                result_text,
+                origin: response_origin,
+                model: response_model,
+                tool_calls,
+            };
+        }
+
         match state.engine.generate_content(req).await {
             Ok(resp) => {
                 let mut response_model = resp.model.clone();
