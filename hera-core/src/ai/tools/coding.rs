@@ -37,6 +37,20 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> &'a str {
     call.arguments.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
+/// First non-empty string argument among several aliases. Different models emit
+/// different argument names for the same concept (e.g. Qwen3-Coder uses
+/// `file_path`/`content` for edits); accepting aliases keeps the tools usable
+/// across models without retraining the harness.
+fn arg_str_any<'a>(call: &'a ToolCall, keys: &[&str]) -> &'a str {
+    for key in keys {
+        let v = call.arguments.get(*key).and_then(|v| v.as_str()).unwrap_or("");
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    ""
+}
+
 fn ok(call: &ToolCall, output: String) -> ToolResult {
     ToolResult {
         name: call.name.clone(),
@@ -62,9 +76,13 @@ fn err(call: &ToolCall, output: impl Into<String>) -> ToolResult {
 /// is what makes it safe on large files where a whole-file rewrite would lose
 /// context.
 pub(crate) async fn execute_edit_file(call: &ToolCall) -> ToolResult {
-    let path = arg_str(call, "path");
-    let old_string = arg_str(call, "old_string");
-    let new_string = arg_str(call, "new_string");
+    // Accept argument aliases so different models' tool-call conventions work
+    // (e.g. Qwen3-Coder emits `file_path`/`content`; Claude-style emits
+    // `path`/`old_string`/`new_string`).
+    let path = arg_str_any(call, &["path", "file_path", "filename", "file"]);
+    let old_string = arg_str_any(call, &["old_string", "old_str", "old"]);
+    let new_string = arg_str_any(call, &["new_string", "new_str", "new"]);
+    let whole_content = arg_str_any(call, &["content", "new_content", "file_text", "text"]);
     let replace_all = call
         .arguments
         .get("replace_all")
@@ -74,10 +92,32 @@ pub(crate) async fn execute_edit_file(call: &ToolCall) -> ToolResult {
     if path.is_empty() {
         return err(call, "Missing 'path'.");
     }
+
+    // Whole-file mode: some models call edit_file with just a path + full new
+    // content (no old_string). Honor it as a full-file write so the edit isn't
+    // silently rejected.
     if old_string.is_empty() {
+        if !whole_content.is_empty() {
+            let resolved = match resolve_guarded_fs_path(path, true) {
+                Ok(p) => p,
+                Err(error) => return err(call, error),
+            };
+            if let Err(e) = std::fs::write(&resolved, whole_content) {
+                return err(call, format!("Failed to write file '{}': {}", resolved.display(), e));
+            }
+            info!("✏️ [Hera] edit_file (full content) {}", resolved.display());
+            return ok(
+                call,
+                format!(
+                    "Wrote full contents to '{}' ({} lines).",
+                    resolved.display(),
+                    whole_content.lines().count()
+                ),
+            );
+        }
         return err(
             call,
-            "Missing 'old_string'. To create a new file or replace its entire contents, use write_file instead.",
+            "Provide either 'old_string' (with 'new_string') for a surgical edit, or 'content' for a full-file write.",
         );
     }
     if old_string == new_string {
