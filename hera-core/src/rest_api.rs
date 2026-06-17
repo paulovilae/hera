@@ -158,7 +158,8 @@ pub async fn serve_rest_api(port: u16, ipc: IpcState) {
         .with_state(state)
         .layer(cors);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // Doble pila IPv4+IPv6: bind a [::] (net.ipv6.bindv6only=0 acepta IPv4-mapeado).
+    let addr = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(error) => {
