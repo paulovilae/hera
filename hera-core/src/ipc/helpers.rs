@@ -393,11 +393,14 @@ pub fn maybe_build_negative_runtime_hint_promotion(
 /// Fetch live DB schema from Memento for injection into tool context.
 /// - SOUL (Ava) gets ALL app schemas via describe_all_apps
 /// - App-specific agents get only their app's schema via describe_app
+/// - Agents without memento_query access (e.g. memo) get NO schema — they use
+///   high-level pre-built tools and a raw SQL surface only confuses them.
 pub async fn fetch_db_schema_context(agent_identity: &str, app_name: &str) -> String {
     let app_slug = match agent_identity.to_lowercase().as_str() {
         "soul" | "ava" | "gemini_soul" => {
             return fetch_all_apps_schema().await;
         }
+        "memo" => return String::new(),
         "vetra" | "vetra_soul" => "vetra",
         "movilo" | "movilo_soul" => "movilo",
         "latinos" | "latinos_soul" => "latinos",
@@ -537,4 +540,499 @@ pub fn format_schema_for_prompt(
         output.push_str(&format!("- {} ({})\n", table, col_names.join(", ")));
     }
     output
+}
+
+// ─── Local embedding (in-process candle, local-llm builds only) ────────────
+
+/// Embed a single text to a vector using the in-process candle model. Returns
+/// None on CPU-only builds (no `local-llm`) or on any failure, so callers
+/// degrade gracefully to keyword recall.
+#[cfg(feature = "embeddings")]
+pub fn embed_text_local(text: &str) -> Option<Vec<f32>> {
+    let owned = vec![text.to_string()];
+    match crate::ai::embeddings::embed_texts(&owned) {
+        Ok(mut v) => v.pop(),
+        Err(e) => {
+            tracing::warn!("embed_text_local failed: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+pub fn embed_text_local(_text: &str) -> Option<Vec<f32>> {
+    None
+}
+
+/// A memory entry returned by Memento's `semantic_recall`, captured for
+/// post-generation attribution (recall feedback flywheel).
+#[derive(Debug, Clone)]
+pub struct RecalledEntry {
+    pub id: i64,
+    pub content: String,
+}
+
+/// Attribution payload threaded from recall-time to post-generation. Holds the
+/// Memento-side `request_id` so the feedback insert lands on the right row, and
+/// the recalled entries so we can match them against the model's output to
+/// decide which were actually cited.
+#[derive(Debug, Clone, Default)]
+pub struct RecallAttribution {
+    pub request_id: String,
+    pub entries: Vec<RecalledEntry>,
+}
+
+/// Fetch semantically relevant memories for (user_id, app_id, session_id) by
+/// embedding the query and asking Memento's semantic_recall to cosine-rerank the
+/// scope-filtered rows. Returns the formatted prompt fragment plus an
+/// attribution payload (None when recall was skipped or failed) that downstream
+/// handlers use to report `recall_feedback` after generation.
+pub async fn fetch_semantic_memories(
+    user_id: &str,
+    app_id: &str,
+    session_id: &str,
+    query: &str,
+) -> (String, Option<RecallAttribution>) {
+    if user_id.is_empty() || query.trim().is_empty() {
+        return (String::new(), None);
+    }
+    let q = query.to_string();
+    let embedding = match tokio::task::spawn_blocking(move || embed_text_local(&q)).await {
+        Ok(Some(e)) => e,
+        _ => return (String::new(), None),
+    };
+
+    let mut payload = serde_json::json!({
+        "user_id": user_id,
+        "query_embedding": embedding,
+        "query_text": query,
+        "limit": 4,
+        "min_score": 0.3,
+    });
+    if !app_id.is_empty() {
+        payload["app_id"] = serde_json::Value::String(app_id.to_string());
+    }
+    if !session_id.is_empty() {
+        payload["session_id"] = serde_json::Value::String(session_id.to_string());
+    }
+
+    let Some(resp) = call_memento("semantic_recall", payload).await else {
+        return (String::new(), None);
+    };
+    let request_id = resp
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(entries) = resp.get("entries").and_then(|v| v.as_array()) else {
+        return (String::new(), None);
+    };
+
+    let mut section = String::new();
+    let mut captured: Vec<RecalledEntry> = Vec::new();
+    for item in entries.iter().take(4) {
+        let content = match item.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c.trim(),
+            None => continue,
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let snippet: String = content.chars().take(240).collect();
+        section.push_str(&format!("- {}\n", snippet));
+        // The id may arrive as i32 (scoped_memory.id is SERIAL); accept either width.
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as i64);
+        if id > 0 {
+            captured.push(RecalledEntry {
+                id,
+                content: content.to_string(),
+            });
+        }
+    }
+    if section.is_empty() {
+        return (String::new(), None);
+    }
+    let prompt_fragment = format!(
+        "\n\n# SEMANTICALLY RELEVANT MEMORIES (Memento cosine recall)\n{}",
+        section
+    );
+    let attribution = if !request_id.is_empty() && !captured.is_empty() {
+        Some(RecallAttribution {
+            request_id,
+            entries: captured,
+        })
+    } else {
+        None
+    };
+    (prompt_fragment, attribution)
+}
+
+// ─── Recursive scoped-memory wiring (Memento <-> Hera) ─────────────────────
+
+/// Derive a stable user_id for Memento scoped_memory from the identifiers Hera receives.
+/// Falls back: sender_name (canonicalized) -> "chat:<chat_id>" -> "anonymous:<session_id>".
+pub fn canonicalize_user_id(sender_name: &str, chat_id: &str, session_id: &str) -> String {
+    let sender = sender_name.trim();
+    if !sender.is_empty() {
+        let canonical: String = sender
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let trimmed = canonical.trim_matches('_').to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    let chat = chat_id.trim();
+    if !chat.is_empty() {
+        return format!("chat:{}", chat);
+    }
+    let session = session_id.trim();
+    if !session.is_empty() {
+        return format!("anonymous:{}", session);
+    }
+    "anonymous".to_string()
+}
+
+fn format_recursive_context(ctx: &serde_json::Value) -> String {
+    let mut buf = String::new();
+    let mut push_list = |label: &str, list: Option<&serde_json::Value>, take: usize, max_chars: usize| {
+        let Some(items) = list.and_then(|v| v.as_array()) else { return; };
+        if items.is_empty() {
+            return;
+        }
+        let mut section = String::new();
+        for item in items.iter().take(take) {
+            if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    let snippet: String = trimmed.chars().take(max_chars).collect();
+                    section.push_str(&format!("- {}\n", snippet));
+                }
+            }
+        }
+        if !section.is_empty() {
+            buf.push_str(&format!("\n## {}\n{}", label, section));
+        }
+    };
+
+    push_list("Project context", ctx.get("project_summaries"), 3, 280);
+    push_list("Room context", ctx.get("room_summaries"), 3, 280);
+    push_list("Session context", ctx.get("session_summaries"), 3, 280);
+    push_list("Durable facts", ctx.get("durable_facts"), 3, 220);
+    push_list("Recent events", ctx.get("recent_events"), 3, 220);
+
+    if let Some(working) = ctx.get("working_context").and_then(|v| v.as_object()) {
+        let mut working_buf = String::new();
+        for key in ["summaries", "decisions", "preferences", "open_loops"] {
+            if let Some(entries) = working.get(key).and_then(|v| v.as_array()) {
+                for item in entries.iter().take(2) {
+                    if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                        let trimmed = content.trim();
+                        if !trimmed.is_empty() {
+                            let snippet: String = trimmed.chars().take(220).collect();
+                            working_buf.push_str(&format!("- [{}] {}\n", key, snippet));
+                        }
+                    }
+                }
+            }
+        }
+        if !working_buf.is_empty() {
+            buf.push_str(&format!("\n## Working context\n{}", working_buf));
+        }
+    }
+
+    if buf.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n# RECURSIVE CONTEXT (Memento scoped_memory)\n{}", buf)
+    }
+}
+
+/// Fetch recursive scoped-memory context for (user_id, app_id, session_id) and format it for
+/// prompt injection. Returns empty string on any error so the caller can concatenate safely.
+pub async fn fetch_recursive_context(user_id: &str, app_id: &str, session_id: &str) -> String {
+    if user_id.is_empty() {
+        return String::new();
+    }
+    let mut payload = serde_json::json!({ "user_id": user_id });
+    if !app_id.is_empty() {
+        payload["app_id"] = serde_json::Value::String(app_id.to_string());
+    }
+    if !session_id.is_empty() {
+        payload["session_id"] = serde_json::Value::String(session_id.to_string());
+    }
+    let Some(response) = call_memento("recall_recursive_context", payload).await else {
+        return String::new();
+    };
+    let Some(ctx) = response.get("recursive_context") else {
+        return String::new();
+    };
+    format_recursive_context(ctx)
+}
+
+/// Fetch all pinned RAG documents for a scope (app_id + expert_id) and format
+/// them for injection into the stable prompt prefix. Pinned docs are the "always-on"
+/// knowledge base for the agent — editable via /rag/admin without redeploying.
+/// Returns empty string if no pinned docs exist or Memento is unavailable.
+pub async fn fetch_rag_pinned(app_id: &str, expert_id: &str) -> String {
+    if app_id.is_empty() && expert_id.is_empty() {
+        return String::new();
+    }
+    let mut payload = serde_json::json!({});
+    if !app_id.is_empty() {
+        payload["app_id"] = serde_json::Value::String(app_id.to_string());
+    }
+    if !expert_id.is_empty() {
+        payload["expert_id"] = serde_json::Value::String(expert_id.to_string());
+    }
+    let Some(resp) = call_memento("rag_pinned", payload).await else {
+        return String::new();
+    };
+    let Some(docs) = resp.get("documents").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if docs.is_empty() {
+        return String::new();
+    }
+    let mut sections = Vec::new();
+    let mut total_chars = 0usize;
+    const MAX_PINNED_CHARS: usize = 24_000;
+    for doc in docs {
+        let title = doc.get("title").and_then(|v| v.as_str()).unwrap_or("Document");
+        let text  = doc.get("full_text").and_then(|v| v.as_str()).unwrap_or("");
+        if text.is_empty() { continue; }
+        let remaining = MAX_PINNED_CHARS.saturating_sub(total_chars);
+        if remaining == 0 { break; }
+        let clipped: String = text.chars().take(remaining).collect();
+        total_chars += clipped.chars().count();
+        sections.push(format!("## {}\n{}", title, clipped));
+    }
+    if sections.is_empty() { return String::new(); }
+    format!("\n\n# KNOWLEDGE BASE (RAG pinned documents)\n{}", sections.join("\n\n---\n\n"))
+}
+
+/// Embed the user query and return the most relevant RAG chunk snippets for the scope.
+/// Injected into the dynamic_suffix (per-turn, like semantic_ctx). Returns empty
+/// string if the embed model is unavailable or no chunks score above Memento's threshold.
+pub async fn fetch_rag_context(app_id: &str, expert_id: &str, query: &str) -> String {
+    if query.trim().is_empty() || (app_id.is_empty() && expert_id.is_empty()) {
+        return String::new();
+    }
+    let q = query.to_string();
+    let embedding = match tokio::task::spawn_blocking(move || embed_text_local(&q)).await {
+        Ok(Some(e)) => e,
+        _ => return String::new(),
+    };
+    let mut payload = serde_json::json!({ "query_embedding": embedding, "k": 5 });
+    if !app_id.is_empty() {
+        payload["app_id"] = serde_json::Value::String(app_id.to_string());
+    }
+    if !expert_id.is_empty() {
+        payload["expert_id"] = serde_json::Value::String(expert_id.to_string());
+    }
+    let Some(resp) = call_memento("rag_search", payload).await else {
+        return String::new();
+    };
+    let Some(results) = resp.get("results").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if results.is_empty() { return String::new(); }
+    let mut section = String::new();
+    for hit in results.iter().take(5) {
+        let title   = hit.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let content = hit.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() { continue; }
+        let snippet: String = content.chars().take(400).collect();
+        section.push_str(&format!("- [{}] {}\n", title, snippet));
+    }
+    if section.is_empty() { return String::new(); }
+    format!("\n\n# RAG CONTEXT (relevant document chunks)\n{}", section)
+}
+
+/// Persist a single conversation turn as a scoped_memory event. Fire-and-forget — errors only
+/// log via tracing. Memento's auto_derive=true triggers session/room/project summary derivation
+/// once enough events accumulate, which subsequent calls to `fetch_recursive_context` surface.
+pub async fn save_chat_turn_event(
+    user_id: String,
+    app_id: String,
+    session_id: String,
+    role: String,
+    content: String,
+) {
+    if user_id.is_empty() || content.trim().is_empty() {
+        return;
+    }
+    let mut payload = serde_json::json!({
+        "user_id": user_id,
+        "tenant_id": "default",
+        "app_id": app_id,
+        "session_id": session_id,
+        "scope": "personal",
+        "source": "hera_chat",
+        "memory_type": "event",
+        "content": content,
+        "tags": ["chat", role],
+        "auto_derive": true,
+    });
+    // Attach a semantic embedding so this turn is retrievable by meaning, not
+    // just keywords. No-op on CPU-only builds (embed_text_local returns None).
+    if let Some(embedding) = embed_text_local(&content) {
+        payload["embedding"] = serde_json::json!(embedding);
+    }
+    if let Some(resp) = call_memento("save_scoped_memory", payload).await
+        && let Some(err) = resp.get("error").and_then(|v| v.as_str())
+    {
+        tracing::warn!("save_chat_turn_event failed: {}", err);
+    }
+}
+
+// ─── Recall feedback (Phase 2 of the embedder flywheel) ───────────────────
+
+/// Distinctive tokens of a text: lowercased, alphanumeric-only, length >= 5.
+/// We keep length >= 5 so common Spanish/English stopwords ("para", "this",
+/// "and") don't pollute the overlap signal.
+fn distinctive_tokens(text: &str) -> std::collections::HashSet<String> {
+    text.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|tok| tok.chars().count() >= 5)
+        .map(|tok| tok.to_string())
+        .collect()
+}
+
+/// Decide which recalled ids were cited by the model's response. Heuristic:
+/// for each recalled entry, count how many of its distinctive tokens (>=5
+/// chars, alphanumeric) appear in the response. An entry counts as cited if
+/// at least 2 distinctive tokens overlap (or 1 if the entry only has 1 such
+/// token).
+pub fn cited_ids_from_response(attribution: &RecallAttribution, response: &str) -> Vec<i64> {
+    let response_tokens = distinctive_tokens(response);
+    if response_tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut cited = Vec::new();
+    for entry in &attribution.entries {
+        let entry_tokens = distinctive_tokens(&entry.content);
+        if entry_tokens.is_empty() {
+            continue;
+        }
+        let overlap = entry_tokens.intersection(&response_tokens).count();
+        let needed = if entry_tokens.len() <= 1 { 1 } else { 2 };
+        if overlap >= needed {
+            cited.push(entry.id);
+        }
+    }
+    cited
+}
+
+/// Fire-and-forget: report which recalled ids were cited by the assistant's
+/// response. Joined on `request_id` with Memento's `recall_log`, this becomes
+/// (query, positives, negatives) training data for embedder reranker fine-tune.
+/// Silent on failure — telemetry must never break the chat path.
+pub async fn report_recall_feedback(
+    attribution: Option<&RecallAttribution>,
+    response_text: &str,
+) {
+    let Some(attribution) = attribution else {
+        return;
+    };
+    if attribution.request_id.is_empty() || attribution.entries.is_empty() {
+        return;
+    }
+    let cited = cited_ids_from_response(attribution, response_text);
+    let feedback_kind = if cited.is_empty() { "ignored" } else { "cited" };
+    let payload = serde_json::json!({
+        "request_id": attribution.request_id,
+        "cited_ids": cited,
+        "feedback_kind": feedback_kind,
+    });
+    let _ = call_memento("recall_feedback", payload).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonicalize_user_id, cited_ids_from_response, RecallAttribution, RecalledEntry};
+
+    #[test]
+    fn canonicalize_prefers_sender_name() {
+        assert_eq!(
+            canonicalize_user_id("Paulo Vila", "chat-1", "sess-1"),
+            "paulo_vila"
+        );
+    }
+
+    #[test]
+    fn canonicalize_falls_back_to_chat_id_when_sender_blank() {
+        assert_eq!(
+            canonicalize_user_id("", "telegram_42", "sess-9"),
+            "chat:telegram_42"
+        );
+    }
+
+    #[test]
+    fn canonicalize_falls_back_to_anonymous_session() {
+        assert_eq!(canonicalize_user_id("", "", "abc-123"), "anonymous:abc-123");
+    }
+
+    #[test]
+    fn canonicalize_returns_anonymous_when_all_blank() {
+        assert_eq!(canonicalize_user_id("", "", ""), "anonymous");
+    }
+
+    #[test]
+    fn canonicalize_strips_non_alnum_from_sender() {
+        // Unicode alphanumerics (í, á, é) are preserved — sender_name keeps natural diacritics.
+        // Only spaces and ASCII punctuation collapse to underscores, with edge underscores trimmed.
+        assert_eq!(
+            canonicalize_user_id("María García-Pérez!", "", ""),
+            "maría_garcía_pérez"
+        );
+    }
+
+    #[test]
+    fn cited_ids_matches_only_entries_with_token_overlap() {
+        let attribution = RecallAttribution {
+            request_id: "req-1".into(),
+            entries: vec![
+                RecalledEntry {
+                    id: 11,
+                    content: "Contracts with margin above thirty percent flagged review.".into(),
+                },
+                RecalledEntry {
+                    id: 22,
+                    content: "User prefers concise summaries in lowercase letters.".into(),
+                },
+                RecalledEntry {
+                    id: 33,
+                    content: "Birthday is March twentieth.".into(),
+                },
+            ],
+        };
+        let response = "We should flag contracts with high margin and review them.";
+        let cited = cited_ids_from_response(&attribution, response);
+        // Entry 11 has "contracts", "margin", "review" overlap (>=2) -> cited.
+        // Entry 22 has zero distinctive overlap -> not cited.
+        // Entry 33 has zero overlap -> not cited.
+        assert_eq!(cited, vec![11]);
+    }
+
+    #[test]
+    fn cited_ids_empty_when_response_has_no_distinctive_tokens() {
+        let attribution = RecallAttribution {
+            request_id: "req-x".into(),
+            entries: vec![RecalledEntry {
+                id: 1,
+                content: "important domain fact about pricing".into(),
+            }],
+        };
+        // Response has only short stopwords (none >= 5 chars).
+        let cited = cited_ids_from_response(&attribution, "ok and yes");
+        assert!(cited.is_empty());
+    }
 }

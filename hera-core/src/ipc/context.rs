@@ -5,7 +5,11 @@
 
 use std::sync::Arc;
 
-use super::helpers::{fetch_db_schema_context, fetch_runtime_preflight, fetch_semantic_memory};
+use super::helpers::{
+    canonicalize_user_id, fetch_db_schema_context, fetch_rag_context, fetch_rag_pinned,
+    fetch_recursive_context, fetch_runtime_preflight, fetch_semantic_memories,
+    fetch_semantic_memory,
+};
 use super::llm_audit::{LlmAuditEvent, build_event};
 use super::route_profiles::resolve_route_profile;
 use crate::ai::{ChatMessage, ChatRequest, ContentPart, LLMEngine, MessageContent};
@@ -30,6 +34,20 @@ pub struct PromptAssembly {
     pub memory_chars: usize,
     pub tool_schema_chars: usize,
     pub db_schema_chars: usize,
+    pub recursive_context_chars: usize,
+    /// Frame E (prompt caching): characters of the stable prefix (persona +
+    /// app-static context + schemas + directives) that engines can KV-cache or
+    /// providers can mark with cache_control across turns of the same session.
+    pub stable_prefix_chars: usize,
+    /// Frame E: characters of the dynamic suffix (per-turn memory: recursive +
+    /// semantic recall). Kept at the end of the prompt so KV cache hits stay
+    /// stable across turns even as memory grows.
+    pub dynamic_suffix_chars: usize,
+    /// Phase 2 of the embedder flywheel: carries the `request_id` and the
+    /// recalled entries from `fetch_semantic_memories`. The handler that
+    /// generated the response uses this to compute cited_ids and report back
+    /// to Memento's `recall_feedback`. `None` when recall was skipped or empty.
+    pub recall_attribution: Option<super::helpers::RecallAttribution>,
 }
 
 pub struct RuntimeOutcomeArtifacts {
@@ -64,6 +82,8 @@ pub struct ParsedPayload {
     pub expected_persona_path: String,
     pub persona_drift: bool,
     pub context_budget: ContextBudget,
+    /// reasoning_effort hint derived from query difficulty (low/medium/high).
+    pub reasoning_effort: String,
 }
 
 pub fn apply_runtime_preflight(
@@ -102,6 +122,39 @@ pub async fn prepare_runtime_execution_context(
     mode: &str,
 ) -> PreparedRuntimeContext {
     let lightweight_mode = is_lightweight_conversation(&parsed.prompt);
+
+    // Frame B1: classify difficulty and scale local effort. Runs off the async
+    // runtime because the gray-zone tiebreak may embed the prompt (CPU-bound).
+    let difficulty = {
+        let prompt = parsed.prompt.clone();
+        tokio::task::spawn_blocking(move || super::difficulty::classify(&prompt))
+            .await
+            .unwrap_or(super::difficulty::Difficulty::Normal)
+    };
+    parsed.reasoning_effort = difficulty.reasoning_effort().to_string();
+    // A Hard query (and no explicit caller override) gets the heavy budget so the
+    // local model has full tools/schema/memory + history headroom. Cloud stays a
+    // failover only — difficulty never routes off-node.
+    if !caller_overrode_budget
+        && !lightweight_mode
+        && let Some(mode) = difficulty.budget_mode()
+    {
+        parsed.context_budget = context_budget_for_mode(mode, lightweight_mode);
+    }
+    // Stateless bots (Memo/movilo) must not carry personal recursive memory between
+    // conversations — it poisons intent and bloats scoped_memory. This single switch
+    // gates both the recall and the save paths (both branch on include_memory).
+    if app_is_stateless(&parsed.app_name) {
+        parsed.context_budget.include_memory = false;
+    }
+    tracing::info!(
+        app = %parsed.app_name,
+        route_profile = %parsed.route_profile_id,
+        difficulty = %difficulty.as_str(),
+        budget = %parsed.context_budget.mode,
+        "Difficulty-routed query"
+    );
+
     let runtime_preflight = fetch_runtime_preflight(
         &parsed.app_name,
         &parsed.route_profile_id,
@@ -127,6 +180,9 @@ pub async fn prepare_runtime_execution_context(
         &parsed.page_url,
         &parsed.page_title,
         &parsed.page_context,
+        &parsed.session_id,
+        &parsed.chat_id,
+        &parsed.prompt,
     )
     .await;
 
@@ -158,6 +214,11 @@ pub async fn prepare_chat_request(
     }
 
     if let Some(req) = &mut chat_req {
+        // Frame B1: apply the difficulty-derived reasoning effort unless the
+        // caller set one explicitly.
+        if req.reasoning_effort.is_none() {
+            req.reasoning_effort = Some(parsed.reasoning_effort.clone());
+        }
         apply_history_budget(req, &parsed.context_budget);
         compress_if_needed(req, engine, &parsed.context_budget).await;
     }
@@ -231,6 +292,8 @@ pub fn build_runtime_observation_payload(
         "tool_schema_chars": prompt_assembly.tool_schema_chars,
         "db_schema_chars": prompt_assembly.db_schema_chars,
         "memory_chars": prompt_assembly.memory_chars,
+        "stable_prefix_chars": prompt_assembly.stable_prefix_chars,
+        "dynamic_suffix_chars": prompt_assembly.dynamic_suffix_chars,
         "success": success,
         "origin": origin,
         "model": model,
@@ -409,6 +472,18 @@ pub(crate) fn latest_user_message_text(payload: &serde_json::Value) -> Option<St
             .then(|| message.get("content").and_then(extract_message_text))
             .flatten()
     })
+}
+
+/// Stateless directory/transaction bots that must NOT accumulate or re-inject
+/// personal recursive memory across conversations. Memo (movilo) is a public
+/// directory bot whose source of truth is the live DB (queried per turn via
+/// tools); persisting every chat turn and replaying it by user_id poisoned intent
+/// (an affiliation flow leaked into provider searches) and bloated scoped_memory
+/// to 12k rows. Forcing memory off for these apps gates BOTH the recall side
+/// (build_full_system_prompt) and the save side (handler_generate/handler_stream),
+/// since both branch on budget.include_memory.
+pub fn app_is_stateless(app_name: &str) -> bool {
+    matches!(app_name.trim().to_ascii_lowercase().as_str(), "movilo")
 }
 
 pub fn context_budget_for_mode(mode: &str, lightweight_mode: bool) -> ContextBudget {
@@ -663,12 +738,45 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         expected_persona_path: route_profile.persona_path.to_string(),
         persona_drift,
         context_budget,
+        // Refined by difficulty classification in prepare_runtime_execution_context.
+        reasoning_effort: "medium".to_string(),
     }
 }
 
 /// Build the full system prompt (persona + memento + tool schemas + DB schemas + directives).
 ///
 /// This is the single DRY function replacing 3 copy-pasted blocks across generate/stream.
+/// Current date in America/Bogota (UTC-5), day granularity, dependency-free.
+/// Returns e.g. "Monday 2026-06-15". Day precision (not time) keeps it in the
+/// cache-friendly stable prefix: it only changes once per day, so the prompt
+/// cache still hits across turns within a day.
+fn current_bogota_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        - 5 * 3600; // America/Bogota, no DST
+    let days = secs.div_euclid(86_400);
+    // Weekday: 1970-01-01 (day 0) was Thursday → (days+4) mod 7, 0 = Sunday.
+    let wd = (days + 4).rem_euclid(7) as usize;
+    let names = [
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    ];
+    // Civil date from day count (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(m <= 2);
+    format!("{} {:04}-{:02}-{:02}", names[wd], y, m, d)
+}
+
 pub async fn build_full_system_prompt(
     persona_path: &str,
     app_name: &str,
@@ -681,6 +789,9 @@ pub async fn build_full_system_prompt(
     page_url: &str,
     page_title: &str,
     page_context: &str,
+    session_id: &str,
+    chat_id: &str,
+    user_prompt: &str,
 ) -> PromptAssembly {
     let memento_ctx = if budget.include_memory {
         clamp_chars(
@@ -690,12 +801,38 @@ pub async fn build_full_system_prompt(
     } else {
         String::new()
     };
-    let base_system_prompt = format!(
-        "{}{}",
-        std::fs::read_to_string(persona_path)
-            .unwrap_or_else(|_| "You are an AI assistant.".to_string()),
-        memento_ctx
-    );
+    let expert_id = std::path::Path::new(persona_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let (recursive_ctx, semantic_ctx, rag_pinned_ctx, rag_retrieved_ctx, recall_attribution) =
+        if budget.include_memory && !lightweight_mode {
+            let user_id = canonicalize_user_id(sender_name, chat_id, session_id);
+            let recursive = clamp_chars(
+                fetch_recursive_context(&user_id, app_name, session_id).await,
+                budget.max_memory_chars,
+            );
+            let (semantic_raw, attribution) =
+                fetch_semantic_memories(&user_id, app_name, session_id, user_prompt).await;
+            let semantic = clamp_chars(semantic_raw, budget.max_memory_chars);
+            let rag_pinned = clamp_chars(
+                fetch_rag_pinned(app_id, expert_id).await,
+                budget.max_memory_chars,
+            );
+            let rag_retrieved = clamp_chars(
+                fetch_rag_context(app_id, expert_id, user_prompt).await,
+                budget.max_memory_chars,
+            );
+            (recursive, semantic, rag_pinned, rag_retrieved, attribution)
+        } else {
+            (String::new(), String::new(), String::new(), String::new(), None)
+        };
+    // Frame E (prompt caching): persona + memento_ctx is the stable head of the
+    // prompt. Per-turn memory (recursive_ctx + semantic_ctx) is appended AT THE
+    // END so the KV cache / provider cache hits across turns.
+    let persona_text = std::fs::read_to_string(persona_path)
+        .unwrap_or_else(|_| "You are an AI assistant.".to_string());
+    let base_system_prompt = format!("{}{}", persona_text, memento_ctx);
 
     let agent_identity = std::path::Path::new(persona_path)
         .file_stem()
@@ -730,6 +867,12 @@ pub async fn build_full_system_prompt(
     } else {
         "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be EXACTLY this format, with NO conversational text: <tool_call>{\"name\": \"function_name\", \"arguments\": {\"arg1\": \"val\"}}</tool_call>"
     };
+    // Every agent always knows the current date (LLMs have no clock). Day-grained
+    // so it stays in the cache-friendly stable prefix.
+    let date_directive = format!(
+        "\nCURRENT DATE: Today is {} in America/Bogota (UTC-5). Treat this as 'today'/'hoy' for any date, weekday, or day-count question; never guess or assume a different date.",
+        current_bogota_date()
+    );
     let language_directive = match language_hint {
         "es" => "\nLANGUAGE RULE: Respond in Spanish unless the user explicitly switches language.",
         "en" => "\nLANGUAGE RULE: Respond in English unless the user explicitly switches language.",
@@ -765,22 +908,41 @@ pub async fn build_full_system_prompt(
         )
     };
 
-    let system_prompt = format!(
-        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}",
+    // Frame E: build the prompt in two halves so engines can KV-cache the prefix.
+    //
+    //   stable_prefix = persona + app-static memento_ctx + tool/db schemas +
+    //                   think/json/language/runtime directives
+    //   dynamic_suffix = recursive_ctx (changes when new events accumulate) +
+    //                    semantic_ctx (changes per user query)
+    //
+    // Engines like llama.cpp reuse their KV cache for the common prefix; cloud
+    // providers with prompt caching (Anthropic cache_control, OpenAI automatic)
+    // can mark the boundary. Putting dynamic memory AT THE END keeps cache hits
+    // stable across turns even as memory grows.
+    let stable_prefix = format!(
+        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}{}{}",
         base_system_prompt,
         schemas,
         db_schema_ctx,
         think_directive,
         json_directive,
         language_directive,
-        runtime_context_directive
+        date_directive,
+        runtime_context_directive,
+        rag_pinned_ctx
     );
+    let dynamic_suffix = format!("{}{}{}", recursive_ctx, semantic_ctx, rag_retrieved_ctx);
+    let system_prompt = format!("{}{}", stable_prefix, dynamic_suffix);
 
     PromptAssembly {
-        system_prompt,
         memory_chars: memento_ctx.len(),
         tool_schema_chars: schemas.len(),
         db_schema_chars: db_schema_ctx.len(),
+        recursive_context_chars: recursive_ctx.len() + semantic_ctx.len(),
+        stable_prefix_chars: stable_prefix.len(),
+        dynamic_suffix_chars: dynamic_suffix.len(),
+        system_prompt,
+        recall_attribution,
     }
 }
 
@@ -818,6 +980,7 @@ pub fn build_new_chat_request(prompt: &str, system_prompt: String) -> ChatReques
         tools: None,
         tool_choice: None,
         reasoning_effort: None,
+        response_format: None,
     }
 }
 
