@@ -71,7 +71,7 @@ impl FasterWhisperEngine {
 
 #[async_trait::async_trait]
 impl SpeechToTextEngine for FasterWhisperEngine {
-    async fn transcribe_audio(&self, wav_bytes: &[u8]) -> Result<String, InferenceError> {
+    async fn transcribe_audio(&self, wav_bytes: &[u8], lang: Option<&str>) -> Result<String, InferenceError> {
         let normalized_wav = normalize_audio_to_wav(wav_bytes).map_err(|err| {
             InferenceError::ExecutionFailed(format!("Audio normalization failed: {}", err))
         })?;
@@ -90,18 +90,39 @@ impl SpeechToTextEngine for FasterWhisperEngine {
             InferenceError::ExecutionFailed(format!("Failed to write temp audio file: {}", err))
         })?;
 
+        // Resolve effective language: per-request → env default → auto-detect.
+        let effective_lang = lang
+            .map(|l| l.trim().to_ascii_lowercase())
+            .filter(|l| !l.is_empty() && l != "auto" && l != "automatic")
+            .or_else(|| {
+                std::env::var("HERA_WHISPER_LANGUAGE")
+                    .ok()
+                    .map(|l| l.trim().to_ascii_lowercase())
+                    .filter(|l| !l.is_empty() && l != "auto")
+            });
+
+        if let Some(ref resolved) = effective_lang {
+            tracing::debug!(language = %resolved, "STT faster-whisper: using language");
+        }
+
+        let mut cmd_args: Vec<String> = vec![
+            self.script_path.to_string_lossy().into_owned(),
+            "--audio".to_string(),
+            input_path.to_string_lossy().into_owned(),
+            "--model".to_string(),
+            self.model.as_ref().clone(),
+            "--device".to_string(),
+            self.device.as_ref().clone(),
+            "--compute-type".to_string(),
+            self.compute_type.as_ref().clone(),
+        ];
+        if let Some(lang_str) = effective_lang {
+            cmd_args.push("--language".to_string());
+            cmd_args.push(lang_str);
+        }
+
         let output = Command::new(self.python_bin.as_ref())
-            .args([
-                self.script_path.to_string_lossy().as_ref(),
-                "--audio",
-                input_path.to_string_lossy().as_ref(),
-                "--model",
-                self.model.as_ref(),
-                "--device",
-                self.device.as_ref(),
-                "--compute-type",
-                self.compute_type.as_ref(),
-            ])
+            .args(&cmd_args)
             .output()
             .map_err(|err| {
                 InferenceError::ExecutionFailed(format!(

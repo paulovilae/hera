@@ -64,10 +64,23 @@ pub async fn handle_transcribe_audio(request: &IpcPayload, state: &IpcState) -> 
         }
     };
 
+    // Optional per-request language hint — e.g. "es", "en". When absent or "auto",
+    // the engine falls back to HERA_WHISPER_LANGUAGE / auto-detect.
+    let lang_hint: Option<String> = request
+        .payload
+        .get("language")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref lang) = lang_hint {
+        tracing::debug!(language = %lang, "STT: per-request language hint received");
+    }
+
     let result_text = if let Some(whisper) = &state.whisper_engine {
         use base64::{Engine as _, engine::general_purpose};
         match general_purpose::STANDARD.decode(b64) {
-            Ok(audio_bytes) => match whisper.transcribe_audio(&audio_bytes).await {
+            Ok(audio_bytes) => match whisper.transcribe_audio(&audio_bytes, lang_hint.as_deref()).await {
                 Ok(txt) => {
                     if txt.trim().is_empty() {
                         "I couldn't understand the audio clearly. Please try again.".to_string()

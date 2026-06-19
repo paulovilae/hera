@@ -191,7 +191,12 @@ pub trait LLMEngine {
 
 #[async_trait::async_trait]
 pub trait SpeechToTextEngine {
-    async fn transcribe_audio(&self, wav_bytes: &[u8])
+    /// Transcribe audio bytes to text.
+    ///
+    /// `lang` is an optional per-request language hint (e.g. `"es"`, `"en"`).
+    /// When `None`, each engine falls back to its configured default
+    /// (e.g. `HERA_WHISPER_LANGUAGE` env var, or auto-detection).
+    async fn transcribe_audio(&self, wav_bytes: &[u8], lang: Option<&str>)
     -> Result<String, crate::ai::InferenceError>;
 }
 
