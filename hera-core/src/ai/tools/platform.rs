@@ -666,6 +666,70 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
     }
 }
 
+pub(crate) async fn execute_animate_avatar(call: &ToolCall) -> ToolResult {
+    let text = match call
+        .arguments
+        .get("text")
+        .and_then(|t| t.as_str())
+    {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: "Missing 'text' parameter — provide the text the avatar should say."
+                    .to_string(),
+            };
+        }
+    };
+    let character = call
+        .arguments
+        .get("character")
+        .and_then(|c| c.as_str())
+        .unwrap_or("edu");
+    let face_url = call
+        .arguments
+        .get("face_url")
+        .and_then(|u| u.as_str());
+    let voice = call
+        .arguments
+        .get("voice")
+        .and_then(|v| v.as_str())
+        .unwrap_or("paddi");
+
+    let hera = hera_execution_agent();
+    match hera.animate_avatar(text, character, face_url, Some(voice)).await {
+        Ok(res) => {
+            let video_url = res
+                .get("video_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("(no URL)");
+            info!("🎬 [Hera] Avatar animation generated: {}", video_url);
+
+            let filename = video_url.split('/').next_back().unwrap_or(video_url);
+            let public_url = format!("https://imaginos.ai/outputs/{}", filename);
+            let response = format!(
+                "Avatar animation generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the video is delivered inline.",
+                public_url
+            );
+
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: response,
+            }
+        }
+        Err(e) => {
+            tracing::error!("🎬 [Hera] Avatar animation failed: {:?}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Avatar animation failed: {}", e),
+            }
+        }
+    }
+}
+
 pub(crate) async fn execute_search(call: &ToolCall) -> ToolResult {
     let query = call
         .arguments

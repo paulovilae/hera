@@ -384,6 +384,89 @@ impl Hera {
         Ok(serde_json::to_value(res)?)
     }
 
+    /// Animates a mascot or human face speaking the given text with lip-sync.
+    /// Uses the viseme backend (mascots) or wav2lip backend (human faces).
+    pub async fn animate_avatar(
+        &self,
+        text: &str,
+        character: &str,
+        face_url: Option<&str>,
+        voice: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let viseme_url = std::env::var("VISEME_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8014".to_string());
+        let wav2lip_url = std::env::var("WAV2LIP_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8012".to_string());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()?;
+
+        let video_bytes = if let Some(furl) = face_url {
+            // Human face path — download face image, base64-encode, call wav2lip
+            let face_resp = client
+                .get(furl)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| anyhow!("Failed to download face image: {}", e))?;
+            if !face_resp.status().is_success() {
+                return Err(anyhow!(
+                    "Face image download returned status {}",
+                    face_resp.status()
+                ));
+            }
+            let face_bytes = face_resp.bytes().await?;
+            let face_b64 = BASE64_STANDARD.encode(&face_bytes);
+
+            let mut body = json!({ "face_b64": face_b64, "text": text });
+            if let Some(v) = voice {
+                body.as_object_mut().unwrap().insert("voice".to_string(), json!(v));
+            }
+
+            let resp = client
+                .post(format!("{}/say", wav2lip_url))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("wav2lip /say request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("wav2lip /say returned status {}", resp.status()));
+            }
+            resp.bytes().await?
+        } else {
+            // Mascot path — call viseme backend
+            let mut body = json!({ "text": text, "character": character });
+            if let Some(v) = voice {
+                body.as_object_mut().unwrap().insert("voice".to_string(), json!(v));
+            }
+
+            let resp = client
+                .post(format!("{}/say", viseme_url))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("viseme /say request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("viseme /say returned status {}", resp.status()));
+            }
+            resp.bytes().await?
+        };
+
+        // Save mp4 to the shared outputs dir (same dir as generate_image PNGs)
+        let output_dir = generated_outputs_dir()?;
+        fs::create_dir_all(&output_dir)?;
+
+        let filename = format!("avatar_anim_{}.mp4", Uuid::new_v4());
+        let filepath = output_dir.join(&filename);
+        fs::write(&filepath, &video_bytes)?;
+
+        Ok(json!({
+            "status": "success",
+            "video_url": format!("/outputs/{}", filename)
+        }))
+    }
+
     pub async fn native_web_scrape(&self, url: &str) -> Result<String> {
         let res = self.http_client.get(url).send().await?;
         if !res.status().is_success() {

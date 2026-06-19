@@ -310,6 +310,7 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
             | "mc_close_sprint"
             | "mc_add_wishlist"
             | "mc_set_objective"
+            | "animate_avatar"
     )
 }
 
