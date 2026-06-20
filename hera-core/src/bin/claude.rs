@@ -84,6 +84,26 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
             "--app" => {
                 config.app = iter.next().ok_or("missing value after --app")?;
             }
+            "--coding" => {
+                // Operator coding agent: route to the `coding` profile (heavy +
+                // agentic loop + low deterministic temp) and grant the surgical
+                // coding tools. Operator-only by construction — this CLI runs on
+                // the node itself (SSH access = operator). The coding tools are
+                // Critical, so `unsafe_all` is required to grant them.
+                config.app = "coding".to_string();
+                for tool in [
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "grep_search",
+                    "glob_search",
+                    "cargo_check",
+                    "cargo_test",
+                    "unsafe_all",
+                ] {
+                    config.permissions.push(tool.to_string());
+                }
+            }
             "--model" => {
                 config.model = Some(iter.next().ok_or("missing value after --model")?);
             }
@@ -356,6 +376,8 @@ fn print_help() {
            -p, --prompt <text>       Run a one-shot prompt\n\
            --system <text>           Inject a system prompt\n\
            --app <name>              Hera app name for routing and policy\n\
+           --coding                  Operator coding agent (coding profile +\n\
+                                     agentic loop + surgical tools granted)\n\
            --model <name>            Override model hint\n\
            --socket <path>           Hera IPC socket path\n\
            --permission <name>       Allow a Hera tool (repeatable)\n\
