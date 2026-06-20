@@ -234,7 +234,7 @@ pub async fn handle_generate(
         // flag is off. Fast-path + schema-planner above still short-circuit first.
         if parsed.context_budget.allow_tools && super::agentic_loop::agentic_loop_enabled() {
             let loop_outcome =
-                super::agentic_loop::run_agentic_loop(&state.engine, req, &parsed).await;
+                super::agentic_loop::run_agentic_loop(&state.engine, req, &parsed, None).await;
             tracing::info!(
                 "🔁 [Hera IPC] Agentic loop finished: iterations={} stop_reason={} tools={}",
                 loop_outcome.iterations,

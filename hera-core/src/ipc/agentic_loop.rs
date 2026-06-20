@@ -21,6 +21,7 @@ use super::runtime_tools::execute_parsed_tool_calls;
 use crate::ai::tool_executor::ToolCall;
 use crate::ai::{ChatMessage, ChatRequest, LLMEngine, MessageContent};
 use std::sync::Arc;
+use tokio::net::UnixStream;
 
 /// Default hard cap on tool→observe→tool rounds. Override with
 /// `HERA_AGENTIC_MAX_ITERS`. Kept generous: a real coding task (read → edit →
@@ -107,6 +108,17 @@ fn is_coding_context(parsed: &ParsedPayload) -> bool {
         || route == "ava_coder"
         || app == "coding"
         || app.contains("coder")
+}
+
+/// Whether this is an interactive operator CLI surface (coding or ops) that
+/// should run the agentic loop on the STREAMING path with live tool_status.
+/// Streaming is a production hot path (widgets stream for fast token UX); gating
+/// the loop to these surfaces keeps the loop OUT of widget streaming so their
+/// behaviour is unchanged. Non-streaming `generate` still runs the loop globally.
+pub fn is_agentic_cli_surface(parsed: &ParsedPayload) -> bool {
+    let route = parsed.route_profile_id.to_ascii_lowercase();
+    let app = parsed.app_name.to_ascii_lowercase();
+    is_coding_context(parsed) || route == "ops" || app == "ops"
 }
 
 fn max_iters() -> usize {
@@ -244,6 +256,9 @@ pub async fn run_agentic_loop(
     engine: &Arc<dyn LLMEngine + Send + Sync>,
     base_request: ChatRequest,
     parsed: &ParsedPayload,
+    // When streaming (CLI coding/ops), a `tool_status` event is emitted per round
+    // so the operator sees the tools execute live. Non-streaming callers pass None.
+    mut status_stream: Option<&mut UnixStream>,
 ) -> AgenticLoopOutcome {
     let max = max_iters();
     let mut req = base_request;
@@ -356,7 +371,7 @@ pub async fn run_agentic_loop(
             if no_progress { " (repeat — closing)" } else { "" }
         );
 
-        let summary = execute_parsed_tool_calls(&calls, parsed, None).await;
+        let summary = execute_parsed_tool_calls(&calls, parsed, status_stream.as_deref_mut()).await;
         // A verification (cargo_check/cargo_test/pytest) that succeeded this round
         // means GREEN — the verify tools set success from the process exit code, so
         // a failing test reports success=false (see ai/tools/build_feedback.rs).
@@ -671,7 +686,7 @@ mod tests {
     async fn loop_returns_immediately_when_no_tool_call() {
         let engine: Arc<dyn LLMEngine + Send + Sync> =
             Arc::new(ScriptedEngine::new(vec!["Just an answer, no tools."]));
-        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed()).await;
+        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed(), None).await;
         assert_eq!(outcome.stop_reason, "done");
         assert_eq!(outcome.iterations, 1);
         assert!(outcome.executed_calls_json.is_empty());
@@ -686,7 +701,7 @@ mod tests {
             "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"/x\"}}</tool_call>",
             "All done: the file path was rejected, here is my conclusion.",
         ]));
-        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed()).await;
+        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed(), None).await;
         assert_eq!(outcome.stop_reason, "done");
         assert_eq!(outcome.iterations, 2);
         // Reaching the round-2 scripted answer ("conclusion") proves the loop
@@ -704,7 +719,7 @@ mod tests {
         let same = "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"/x\"}}</tool_call>";
         let engine: Arc<dyn LLMEngine + Send + Sync> =
             Arc::new(ScriptedEngine::new(vec![same, same, same, same, same]));
-        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed()).await;
+        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed(), None).await;
         assert_eq!(outcome.stop_reason, "no_progress");
         // Recovery nudges delayed the close past the first repeat.
         assert!(outcome.iterations >= 2 + MAX_NOPROGRESS_NUDGES);

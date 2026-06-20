@@ -316,9 +316,63 @@ async fn send_request(
     stream.write_all(&wire).await?;
     stream.shutdown().await?;
 
-    let mut buffer = String::new();
-    stream.read_to_string(&mut buffer).await?;
-    parse_response(&buffer, config.stream)
+    if config.stream {
+        // Live: read events line-by-line as they arrive so tool calls and text
+        // appear in real time (the agentic loop emits a tool_status per round).
+        stream_live(stream).await
+    } else {
+        let mut buffer = String::new();
+        stream.read_to_string(&mut buffer).await?;
+        parse_response(&buffer, false)
+    }
+}
+
+/// Render a streaming Hera response live: print chunk text as it arrives and
+/// show each tool call (`tool_status`) the moment the agent runs it. Operator
+/// rule: icons, never emojis — tool lines use a dim middot marker.
+async fn stream_live(stream: UnixStream) -> Result<IpcReply, Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(stream).lines();
+    let mut text = String::new();
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let msg: Value = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        match msg.get("status").and_then(Value::as_str).unwrap_or("") {
+            "tool_status" => {
+                if let Some(name) = msg.pointer("/data/name").and_then(Value::as_str) {
+                    // Dim line so tool activity is visible but secondary to text.
+                    println!("\x1b[2m  · {name}\x1b[0m");
+                    io::stdout().flush()?;
+                }
+            }
+            "chunk" => {
+                if let Some(chunk) = msg.pointer("/data/text").and_then(Value::as_str) {
+                    let cleaned = strip_think_prefix(chunk);
+                    print!("{cleaned}");
+                    io::stdout().flush()?;
+                    text.push_str(cleaned);
+                }
+            }
+            "error" => {
+                let error = msg
+                    .pointer("/data/error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown Hera IPC error");
+                return Err(error.to_string().into());
+            }
+            _ => {}
+        }
+    }
+    if !text.is_empty() {
+        println!();
+    }
+    Ok(IpcReply { text })
 }
 
 fn parse_response(response: &str, streamed: bool) -> Result<IpcReply, Box<dyn std::error::Error>> {

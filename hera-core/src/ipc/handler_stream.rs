@@ -158,6 +158,62 @@ pub async fn handle_generate_stream(
     )
     .await;
 
+    // Coding/ops CLI surface: run the multi-turn agentic loop on the STREAMING
+    // path, emitting a `tool_status` event per round so the operator sees the
+    // tools execute live (read_file → edit_file → cargo_test …). Gated to the
+    // coding/ops surfaces so widget streaming keeps its single-batch token-stream
+    // behaviour untouched. The final answer is sent as one chunk after the loop.
+    if super::agentic_loop::agentic_loop_enabled()
+        && parsed.context_budget.allow_tools
+        && super::agentic_loop::is_agentic_cli_surface(&parsed)
+    {
+        if let Some(req) = chat_req.clone() {
+            // stream_start
+            let mut s = serde_json::to_string(&IpcResponse {
+                status: "stream_start".to_string(),
+                data: serde_json::json!({}),
+            })
+            .unwrap_or_default();
+            s.push('\n');
+            let _ = stream.write_all(s.as_bytes()).await;
+
+            // Run the loop, threading the stream so each round emits tool_status.
+            let outcome = super::agentic_loop::run_agentic_loop(
+                &state.engine,
+                req,
+                &parsed,
+                Some(&mut *stream),
+            )
+            .await;
+            tracing::info!(
+                "🔁 [Hera Stream] Agentic loop finished: iterations={} stop_reason={} tools={}",
+                outcome.iterations,
+                outcome.stop_reason,
+                outcome.executed_calls_json.len()
+            );
+
+            // final answer as one chunk
+            let mut c = serde_json::to_string(&IpcResponse {
+                status: "chunk".to_string(),
+                data: serde_json::json!({ "text": outcome.result_text }),
+            })
+            .unwrap_or_default();
+            c.push('\n');
+            let _ = stream.write_all(c.as_bytes()).await;
+
+            // done
+            let mut d = serde_json::to_string(&IpcResponse {
+                status: "done".to_string(),
+                data: serde_json::json!({}),
+            })
+            .unwrap_or_default();
+            d.push('\n');
+            let _ = stream.write_all(d.as_bytes()).await;
+
+            return HandlerOutcome::DirectResponse;
+        }
+    }
+
     if let Some(req) = chat_req.clone() {
         let est_tokens = super::helpers::estimate_tokens(&req);
         tracing::info!(
