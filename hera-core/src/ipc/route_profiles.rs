@@ -87,6 +87,19 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
         target_first_token_ms: None,
     },
     RouteProfile {
+        id: "coding",
+        app: "coding",
+        persona_path: "/home/paulo/Programs/apps/OS/Agents/ava_coder.md",
+        // heavy = full tools + schema + memory; allow_tools=true so the agentic
+        // loop engages. This is the dedicated coding surface (CLI `claude`,
+        // ava_coder bot) that gets low deterministic temperature.
+        default_context_budget_mode: "heavy",
+        prefer_stream: false,
+        // Coding tasks run many tool rounds (read→edit→build→fix); generous SLO.
+        target_p95_ms: 120_000,
+        target_first_token_ms: None,
+    },
+    RouteProfile {
         id: "default",
         app: "",
         persona_path: DEFAULT_PERSONA,

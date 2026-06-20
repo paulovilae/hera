@@ -91,6 +91,20 @@ fn coding_temp() -> f32 {
         .unwrap_or(0.2)
 }
 
+/// Whether this request is a coding / agentic-build context (the `coding` route
+/// profile, an `ava_coder`-style agent, or a `coding` app) as opposed to a
+/// normal tool-using conversational bot. Only a coding context gets the low
+/// deterministic temperature; conversational bots keep their persona tone so
+/// enabling the loop platform-wide does not make the tutors/Memo/Vetra robotic.
+fn is_coding_context(parsed: &ParsedPayload) -> bool {
+    let route = parsed.route_profile_id.to_ascii_lowercase();
+    let app = parsed.app_name.to_ascii_lowercase();
+    route == "coding"
+        || route == "ava_coder"
+        || app == "coding"
+        || app.contains("coder")
+}
+
 fn max_iters() -> usize {
     std::env::var("HERA_AGENTIC_MAX_ITERS")
         .ok()
@@ -213,8 +227,15 @@ pub async fn run_agentic_loop(
 ) -> AgenticLoopOutcome {
     let max = max_iters();
     let mut req = base_request;
-    // Coding path: pin a low temperature for reliable, reproducible tool use.
-    req.temperature = Some(coding_temp());
+    // Temperature policy: the loop is now enabled platform-wide so that ANY
+    // tool-using bot gains iterative tool use + self-correction of failed
+    // queries. But the low deterministic temperature only helps coding — it
+    // dries out conversational personas (tutors, Memo, Vetra). So pin the low
+    // temp ONLY for a coding context; everyone else keeps their persona's
+    // temperature untouched. See docs/AVA_CODING_AGENT_PLAN.md.
+    if is_coding_context(parsed) {
+        req.temperature = Some(coding_temp());
+    }
     let mut executed_calls_json: Vec<serde_json::Value> = Vec::new();
     let mut last_model = String::new();
     let mut last_origin = "local".to_string();
