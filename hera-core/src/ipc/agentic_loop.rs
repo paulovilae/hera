@@ -36,8 +36,12 @@ const MAX_NOPROGRESS_NUDGES: usize = 2;
 /// Tools that mutate source. After one of these succeeds, the agent should
 /// verify before declaring the task done.
 const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
-/// Tools whose green result clears the "needs verification" flag.
+/// Tools whose green result clears the "needs verification" flag (compiles OK).
 const VERIFY_TOOLS: &[&str] = &["cargo_check", "cargo_test", "pytest"];
+/// Tools whose green result is a STRONG signal the task is actually done (tests
+/// pass, not merely compiles). Only these trigger the efficiency early-close, so
+/// "verified" never fires on `cargo_check` alone (compiles ≠ correct).
+const VERIFY_CLOSE_TOOLS: &[&str] = &["cargo_test", "pytest"];
 
 /// Outcome of a full agentic loop run.
 pub struct AgenticLoopOutcome {
@@ -48,7 +52,7 @@ pub struct AgenticLoopOutcome {
     pub executed_calls_json: Vec<serde_json::Value>,
     /// How many model turns were taken (1 = answered without any tool).
     pub iterations: usize,
-    /// "done" | "max_iters" | "no_progress" | "empty" | "error"
+    /// "done" | "verified" | "max_iters" | "no_progress" | "empty" | "error"
     pub stop_reason: &'static str,
 }
 
@@ -246,6 +250,10 @@ pub async fn run_agentic_loop(
     let mut edited_pending = false;
     let mut nudged = false;
     let mut no_progress_nudges = 0usize;
+    // Whether any edit has succeeded in this run. Used to close the loop once the
+    // work has been verified green, without firing on a model that merely runs a
+    // verification BEFORE editing (e.g. a project that already compiles).
+    let mut ever_edited = false;
 
     for iter in 0..max {
         let resp = match engine.generate_content(req.clone()).await {
@@ -333,6 +341,20 @@ pub async fn run_agentic_loop(
         );
 
         let summary = execute_parsed_tool_calls(&calls, parsed, None).await;
+        // A verification (cargo_check/cargo_test/pytest) that succeeded this round
+        // means GREEN — the verify tools set success from the process exit code, so
+        // a failing test reports success=false (see ai/tools/build_feedback.rs).
+        let round_edited = summary
+            .executed_results
+            .iter()
+            .any(|(name, ok)| *ok && EDIT_TOOLS.contains(&name.as_str()));
+        let round_verified_green = summary
+            .executed_results
+            .iter()
+            .any(|(name, ok)| *ok && VERIFY_CLOSE_TOOLS.contains(&name.as_str()));
+        if round_edited {
+            ever_edited = true;
+        }
         edited_pending = update_edited_pending(edited_pending, &summary.executed_results);
         executed_calls_json.extend(summary.executed_calls_json);
         let outputs = summary.execution_outputs;
@@ -343,6 +365,26 @@ pub async fn run_agentic_loop(
             return close_with_final_answer(
                 engine, req, executed_calls_json, last_model, last_origin, outputs, iter + 1,
                 "max_iters",
+            )
+            .await;
+        }
+
+        // Efficiency close: once we have edited something and a verification just
+        // ran green with no edit left unverified, the task is in a confirmed-good
+        // state — stop instead of letting the model re-run the same verification.
+        // Observed without this: 7 redundant cargo_test calls after the fix was
+        // already green (11 iters / 190s for a one-line fix). Guarded by
+        // `ever_edited` so a pre-edit verification (a project that already builds)
+        // does not close the loop before the real work happens.
+        if ever_edited && round_verified_green && !edited_pending {
+            tracing::info!(
+                "🔁 [Hera Loop] verified-green close at iter {} (edited + green + nothing pending)",
+                iter
+            );
+            append_tool_round(&mut req, &content, &outputs, true);
+            return close_with_final_answer(
+                engine, req, executed_calls_json, last_model, last_origin, outputs, iter + 1,
+                "verified",
             )
             .await;
         }
