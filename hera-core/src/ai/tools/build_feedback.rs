@@ -44,8 +44,17 @@ fn timeout_secs(call: &ToolCall) -> u64 {
 }
 
 fn workdir(call: &ToolCall) -> Result<std::path::PathBuf, String> {
+    // Require an explicit path. Defaulting to "." used to silently run cargo in
+    // Hera's own cwd (the whole OS monorepo) — wrong project, huge build, and the
+    // observed cause of red cargo_test rounds when the model omitted `path`. An
+    // actionable error is re-injected into the agentic loop so the model corrects
+    // in one round instead of thrashing.
     let p = arg_str(call, "path");
-    let p = if p.is_empty() { "." } else { p };
+    if p.trim().is_empty() {
+        return Err("missing 'path': pass the ABSOLUTE path to the project directory \
+                    (the folder containing Cargo.toml), e.g. \"/tmp/ava_eval2\"."
+            .to_string());
+    }
     let resolved = resolve_guarded_fs_path(p, true)?;
     if !resolved.is_dir() {
         return Err(format!("'{}' is not a directory.", resolved.display()));
