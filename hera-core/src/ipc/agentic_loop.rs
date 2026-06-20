@@ -179,6 +179,22 @@ fn update_edited_pending(mut pending: bool, results: &[(String, bool)]) -> bool 
     pending
 }
 
+/// Whether a round's results include a successful source edit.
+fn round_did_edit(results: &[(String, bool)]) -> bool {
+    results
+        .iter()
+        .any(|(name, ok)| *ok && EDIT_TOOLS.contains(&name.as_str()))
+}
+
+/// Whether a round's results include a green TEST run (cargo_test/pytest) — the
+/// strong signal used for the efficiency early-close. Deliberately excludes
+/// `cargo_check`: compiling is not the same as tests passing.
+fn round_passed_tests(results: &[(String, bool)]) -> bool {
+    results
+        .iter()
+        .any(|(name, ok)| *ok && VERIFY_CLOSE_TOOLS.contains(&name.as_str()))
+}
+
 /// Stable signature of a round's tool calls, used to detect a model that is
 /// stuck repeating the same call without making progress.
 fn calls_signature(calls: &[ToolCall]) -> String {
@@ -344,15 +360,8 @@ pub async fn run_agentic_loop(
         // A verification (cargo_check/cargo_test/pytest) that succeeded this round
         // means GREEN — the verify tools set success from the process exit code, so
         // a failing test reports success=false (see ai/tools/build_feedback.rs).
-        let round_edited = summary
-            .executed_results
-            .iter()
-            .any(|(name, ok)| *ok && EDIT_TOOLS.contains(&name.as_str()));
-        let round_verified_green = summary
-            .executed_results
-            .iter()
-            .any(|(name, ok)| *ok && VERIFY_CLOSE_TOOLS.contains(&name.as_str()));
-        if round_edited {
+        let round_verified_green = round_passed_tests(&summary.executed_results);
+        if round_did_edit(&summary.executed_results) {
             ever_edited = true;
         }
         edited_pending = update_edited_pending(edited_pending, &summary.executed_results);
@@ -699,5 +708,56 @@ mod tests {
         assert_eq!(outcome.stop_reason, "no_progress");
         // Recovery nudges delayed the close past the first repeat.
         assert!(outcome.iterations >= 2 + MAX_NOPROGRESS_NUDGES);
+    }
+
+    // --- Efficiency early-close decision logic (stop_reason = "verified") ---
+    // The full loop can't produce a GREEN tool result hermetically (the unit test
+    // runs with empty permissions, so every tool is denied — see test_parsed).
+    // These tests pin the pure decision predicates the close is built from, which
+    // is where the regression risk lives. End-to-end behaviour is covered by the
+    // live eval in docs/AVA_CODING_AGENT_PLAN.md.
+
+    #[test]
+    fn round_did_edit_detects_only_successful_edits() {
+        assert!(round_did_edit(&[("edit_file".to_string(), true)]));
+        assert!(round_did_edit(&[("write_file".to_string(), true)]));
+        // A failed/denied edit is not an edit.
+        assert!(!round_did_edit(&[("edit_file".to_string(), false)]));
+        // A verification is not an edit.
+        assert!(!round_did_edit(&[("cargo_test".to_string(), true)]));
+        assert!(!round_did_edit(&[]));
+    }
+
+    #[test]
+    fn round_passed_tests_requires_green_test_not_check() {
+        // A green test run is the strong signal that closes the loop.
+        assert!(round_passed_tests(&[("cargo_test".to_string(), true)]));
+        assert!(round_passed_tests(&[("pytest".to_string(), true)]));
+        // cargo_check green is NOT sufficient: compiling is not tests passing.
+        // This is the guard for the correctness refinement — "verified" must mean
+        // tests pass, never merely that the code compiles.
+        assert!(!round_passed_tests(&[("cargo_check".to_string(), true)]));
+        // A red test does not close.
+        assert!(!round_passed_tests(&[("cargo_test".to_string(), false)]));
+        assert!(!round_passed_tests(&[]));
+    }
+
+    #[test]
+    fn edited_pending_tracks_edit_then_green_verification() {
+        // Reading a file does not mark work pending.
+        assert!(!update_edited_pending(false, &[("read_file".to_string(), true)]));
+        // A successful edit marks work pending verification.
+        assert!(update_edited_pending(false, &[("edit_file".to_string(), true)]));
+        // A green cargo_check clears the pending flag (it compiles).
+        assert!(!update_edited_pending(true, &[("cargo_check".to_string(), true)]));
+        // A green cargo_test also clears it.
+        assert!(!update_edited_pending(true, &[("cargo_test".to_string(), true)]));
+        // A failed verification leaves the pending flag set.
+        assert!(update_edited_pending(true, &[("cargo_test".to_string(), false)]));
+        // Edit then green check in the same round, in order: set then cleared.
+        assert!(!update_edited_pending(
+            false,
+            &[("edit_file".to_string(), true), ("cargo_check".to_string(), true)]
+        ));
     }
 }
