@@ -104,6 +104,20 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
                     config.permissions.push(tool.to_string());
                 }
             }
+            "--ops" => {
+                // Operator OPS copilot: route to the `ops` profile (heavy +
+                // agentic loop) and grant read/diagnose tools via `all`. NOTE:
+                // `all` covers Low/High-risk tools (read_pm2_logs,
+                // diagnose_services, review_all_apps_status, verify_app_health,
+                // system_status, read_os_logs, memento_query, ...) but NOT
+                // Critical ones like `service_restart` — those need `unsafe_all`.
+                // So by default the copilot DIAGNOSES and PROPOSES fixes; it does
+                // not autonomously restart production services. Operator-only by
+                // construction (runs on the node, SSH = operator). For an action
+                // session, add `--permission service_restart --permission unsafe_all`.
+                config.app = "ops".to_string();
+                config.permissions.push("all".to_string());
+            }
             "--model" => {
                 config.model = Some(iter.next().ok_or("missing value after --model")?);
             }
@@ -378,6 +392,8 @@ fn print_help() {
            --app <name>              Hera app name for routing and policy\n\
            --coding                  Operator coding agent (coding profile +\n\
                                      agentic loop + surgical tools granted)\n\
+           --ops                     Operator OPS copilot (read/diagnose tools +\n\
+                                     agentic loop; destructive actions opt-in)\n\
            --model <name>            Override model hint\n\
            --socket <path>           Hera IPC socket path\n\
            --permission <name>       Allow a Hera tool (repeatable)\n\

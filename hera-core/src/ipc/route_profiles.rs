@@ -87,6 +87,18 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
         target_first_token_ms: None,
     },
     RouteProfile {
+        id: "ops",
+        app: "ops",
+        persona_path: "/home/paulo/Programs/apps/OS/Agents/ava_ops.md",
+        // heavy = full tools + schema + memory; allow_tools=true so the agentic
+        // loop engages (diagnose → read logs → propose/verify). Operator OPS
+        // copilot surface (CLI `claude --ops`).
+        default_context_budget_mode: "heavy",
+        prefer_stream: false,
+        target_p95_ms: 120_000,
+        target_first_token_ms: None,
+    },
+    RouteProfile {
         id: "coding",
         app: "coding",
         persona_path: "/home/paulo/Programs/apps/OS/Agents/ava_coder.md",
