@@ -149,6 +149,7 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "edit_file" => coding::execute_edit_file(call).await,
         "grep_search" => coding::execute_grep_search(call).await,
         "glob_search" => coding::execute_glob_search(call).await,
+        "bash_exec" => coding::execute_bash_exec(call).await,
         "cargo_check" => build_feedback::execute_cargo_check(call).await,
         "cargo_test" => build_feedback::execute_cargo_test(call).await,
         "cargo_build_release" => build_feedback::execute_cargo_build_release(call).await,

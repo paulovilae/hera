@@ -15,7 +15,8 @@ pub(crate) fn tool_risk_level(tool_name: &str) -> ToolRiskLevel {
 
     match tool_name {
         "run_code" | "write_file" | "update_soul" | "service_restart" | "api_request"
-        | "git_manager" | "desktop_click" | "desktop_type" | "generate_access_link" => ToolRiskLevel::Critical,
+        | "git_manager" | "desktop_click" | "desktop_type" | "generate_access_link"
+        | "bash_exec" => ToolRiskLevel::Critical,
         "read_file"
         | "web_scraper"
         | "spawn_parallel_agents"
