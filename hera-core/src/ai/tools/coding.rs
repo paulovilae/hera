@@ -404,22 +404,57 @@ fn glob_to_regex(pattern: &str) -> Result<regex::Regex, String> {
 }
 
 // ---------------------------------------------------------------------------
-// bash_exec
+// bash_exec helpers
 // ---------------------------------------------------------------------------
 
-/// Execute an arbitrary bash command and return stdout + stderr + exit code.
-///
-/// This closes the capability gap vs the prior OpenClaw agent runtime: the model
-/// can now run `git log`, `pm2 status`, `systemctl`, migrations, custom scripts —
-/// anything a developer would type in a terminal.
-///
-/// Risk: Critical. Requires explicit `bash_exec` permission grant or `unsafe_all`.
-/// `allowed_callers` in `Tools/global/dev/bash_exec.json` restricts to `ava_coder`
-/// and `coding` contexts.
-pub(crate) async fn execute_bash_exec(call: &ToolCall) -> ToolResult {
+async fn run_bash(command: &str, timeout_secs: u64) -> Result<(i32, String, String), String> {
     use std::process::Stdio;
     use std::time::Duration;
 
+    let child = tokio::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn bash: {e}"))?;
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let code = out.status.code().unwrap_or(-1);
+            Ok((code, stdout, stderr))
+        }
+        Ok(Err(e)) => Err(format!("Command wait failed: {e}")),
+        Err(_) => Err(format!("Command timed out after {timeout_secs}s.")),
+    }
+}
+
+fn cap_output(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("...(truncated {} chars)...\n{}", s.len(), &s[s.len() - max..])
+    } else {
+        s.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bash_exec
+// ---------------------------------------------------------------------------
+
+/// Execute a bash command with optional post-check and auto-revert.
+///
+/// Parameters:
+/// - `command` (required): the bash command to run
+/// - `timeout_seconds` (optional, default 30, max 300)
+/// - `post_check` (optional): a verification command run after the main one
+/// - `revert_cmd` (optional): a rollback command run if `post_check` exits non-zero
+/// - `revert_on_failure` (optional bool, default false): flag to trigger revert
+///
+/// Risk: Critical. Requires explicit `bash_exec` grant or `unsafe_all`.
+pub(crate) async fn execute_bash_exec(call: &ToolCall) -> ToolResult {
     let command = arg_str_any(call, &["command", "cmd", "bash", "script"]);
     if command.trim().is_empty() {
         return err(call, "bash_exec requires a non-empty 'command' argument.");
@@ -431,48 +466,75 @@ pub(crate) async fn execute_bash_exec(call: &ToolCall) -> ToolResult {
         .unwrap_or(30)
         .clamp(1, 300);
 
+    let post_check = call.arguments
+        .get("post_check")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let revert_cmd = call.arguments
+        .get("revert_cmd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let revert_on_failure = call.arguments
+        .get("revert_on_failure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     info!("🐚 [Hera] bash_exec ({}s): {}", timeout_secs, &command[..command.len().min(120)]);
 
-    let child = match tokio::process::Command::new("/bin/bash")
-        .arg("-c")
-        .arg(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return err(call, format!("Failed to spawn bash: {e}")),
+    const MAX_OUT: usize = 8_000;
+    const MAX_ERR: usize = 2_000;
+
+    let (main_exit, main_stdout, main_stderr) = match run_bash(&command, timeout_secs).await {
+        Ok(r) => r,
+        Err(e) => return err(call, e),
     };
 
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let code = out.status.code().unwrap_or(-1);
-            // Cap output to avoid flooding the model context window
-            const MAX_OUT: usize = 8_000;
-            const MAX_ERR: usize = 2_000;
-            let stdout_out = if stdout.len() > MAX_OUT {
-                format!("...(truncated {} chars total)...\n{}", stdout.len(), &stdout[stdout.len() - MAX_OUT..])
-            } else {
-                stdout.to_string()
-            };
-            let stderr_out = if stderr.len() > MAX_ERR {
-                format!("...(truncated)...\n{}", &stderr[stderr.len() - MAX_ERR..])
-            } else {
-                stderr.to_string()
-            };
-            let output = format!(
-                "exit_code: {code}\nstdout:\n{stdout_out}\nstderr:\n{stderr_out}"
-            )
-            .trim()
-            .to_string();
-            ok(call, output)
+    let mut output = format!(
+        "exit_code: {main_exit}\nstdout:\n{}\nstderr:\n{}",
+        cap_output(&main_stdout, MAX_OUT),
+        cap_output(&main_stderr, MAX_ERR),
+    );
+
+    if !post_check.trim().is_empty() {
+        info!("🔍 [Hera] bash_exec post_check: {}", &post_check[..post_check.len().min(80)]);
+
+        match run_bash(&post_check, timeout_secs.min(60)).await {
+            Ok((check_exit, check_stdout, check_stderr)) => {
+                output.push_str(&format!(
+                    "\n\n=== POST CHECK ===\nexit_code: {check_exit}\nstdout:\n{}\nstderr:\n{}",
+                    cap_output(&check_stdout, MAX_OUT / 2),
+                    cap_output(&check_stderr, MAX_ERR / 2),
+                ));
+
+                if check_exit != 0 && (revert_on_failure || !revert_cmd.trim().is_empty()) {
+                    if revert_cmd.trim().is_empty() {
+                        output.push_str(
+                            "\n\n=== REVERT ===\n[skipped — post_check failed but no revert_cmd provided]",
+                        );
+                    } else {
+                        info!("⏪ [Hera] bash_exec reverting: {}", &revert_cmd[..revert_cmd.len().min(80)]);
+                        match run_bash(&revert_cmd, timeout_secs.min(60)).await {
+                            Ok((rv_exit, rv_stdout, rv_stderr)) => {
+                                output.push_str(&format!(
+                                    "\n\n=== REVERT ===\nexit_code: {rv_exit}\nstdout:\n{}\nstderr:\n{}",
+                                    cap_output(&rv_stdout, MAX_OUT / 2),
+                                    cap_output(&rv_stderr, MAX_ERR / 2),
+                                ));
+                            }
+                            Err(e) => output.push_str(&format!("\n\n=== REVERT FAILED ===\n{e}")),
+                        }
+                    }
+                }
+            }
+            Err(e) => output.push_str(&format!("\n\n=== POST CHECK ERROR ===\n{e}")),
         }
-        Ok(Err(e)) => err(call, format!("Command wait failed: {e}")),
-        Err(_) => err(call, format!("bash_exec timed out after {timeout_secs}s.")),
     }
+
+    ok(call, output.trim().to_string())
 }
 
 #[cfg(test)]
