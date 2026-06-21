@@ -3,7 +3,8 @@
 use serde_json::Value;
 
 use crate::ai::tools::{
-    apps_latinos, apps_movilo, apps_vetra, data, infra_health, infra_smoke, platform, productivity,
+    apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding, data, geo,
+    infra_health, infra_smoke, mission_control, platform, productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -120,8 +121,22 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
 
 async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
+        // Mission Control — Agente Q operates the Agile Cockpit (http_adapter).
+        "mc_board" => mission_control::execute_mc_board(call).await,
+        "mc_create_story" => mission_control::execute_mc_create_story(call).await,
+        "mc_move_story" => mission_control::execute_mc_move_story(call).await,
+        "mc_create_sprint" => mission_control::execute_mc_create_sprint(call).await,
+        "mc_close_sprint" => mission_control::execute_mc_close_sprint(call).await,
+        "mc_add_wishlist" => mission_control::execute_mc_add_wishlist(call).await,
+        "mc_set_objective" => mission_control::execute_mc_set_objective(call).await,
         "generate_image" | "hera_draw" => platform::execute_draw(call).await,
+        "animate_avatar" => platform::execute_animate_avatar(call).await,
         "hera_search" => platform::execute_search(call).await,
+        "geocode" => geo::execute_geocode(call).await,
+        "reverse_geocode" => geo::execute_reverse_geocode(call).await,
+        "storage_list" => storage::execute_storage_list(call).await,
+        "storage_get_url" => storage::execute_storage_get_url(call).await,
+        "storage_put" => storage::execute_storage_put(call).await,
         "hera_speak" => platform::execute_speak(call).await,
         "hera_video" => platform::execute_video(call).await,
         "hera_read_file" | "read_file" => platform::execute_read_file(call).await,
@@ -131,6 +146,13 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "run_code" => platform::execute_run_code(call).await,
         "web_scraper" => platform::execute_web_scraper(call).await,
         "write_file" => platform::execute_write_file(call).await,
+        "edit_file" => coding::execute_edit_file(call).await,
+        "grep_search" => coding::execute_grep_search(call).await,
+        "glob_search" => coding::execute_glob_search(call).await,
+        "cargo_check" => build_feedback::execute_cargo_check(call).await,
+        "cargo_test" => build_feedback::execute_cargo_test(call).await,
+        "cargo_build_release" => build_feedback::execute_cargo_build_release(call).await,
+        "pytest" => build_feedback::execute_pytest(call).await,
         "generate_access_link" => platform::execute_generate_access_link(call).await,
         "spline_interact" => platform::execute_spline_interact(call).await,
         "desktop_click" => platform::execute_desktop_click(call).await,
@@ -187,7 +209,9 @@ async fn dispatch_metadata_tool(call: &ToolCall) -> Option<ToolResult> {
             }
         }
         "http_adapter" => {
-            if let Some(result) = dispatch_vetra_tool(call).await {
+            if let Some(result) = dispatch_brand_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_vetra_tool(call).await {
                 Some(result)
             } else if let Some(result) = dispatch_data_tool(call).await {
                 Some(result)
@@ -229,6 +253,7 @@ async fn dispatch_metadata_raw_json_tool(call: &ToolCall) -> Option<Result<Value
 async fn dispatch_infra_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
         "caddy_domain_manager" => infra_health::execute_caddy_domain_manager(call).await,
+        "provision_subdomain" => infra_health::execute_provision_subdomain(call).await,
         "query_federation_state" => infra_health::execute_query_federation_state(call).await,
         "system_status" => infra_health::execute_system_status(call).await,
         "diagnose_services" => infra_health::execute_diagnose_services(call).await,
@@ -240,6 +265,20 @@ async fn dispatch_infra_tool(call: &ToolCall) -> Option<ToolResult> {
         "verify_canonical_stack" => infra_smoke::execute_verify_canonical_stack(call).await,
         "review_all_apps_status" => infra_smoke::execute_review_all_apps_status(call).await,
         "verify_app_health" => infra_smoke::execute_verify_app_health(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_brand_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "add_topic" => brand_studio::execute_add_topic(call).await,
+        "list_pending_drafts" => brand_studio::execute_list_pending_drafts(call).await,
+        "approve_draft" => brand_studio::execute_approve_draft(call).await,
+        "capture_post_metrics" => brand_studio::execute_capture_post_metrics(call).await,
+        "voice_profile_get" => brand_studio::execute_voice_profile_get(call).await,
+        "voice_profile_update" => brand_studio::execute_voice_profile_update(call).await,
+        "save_thesis_doc" => brand_studio::execute_save_thesis_doc(call).await,
         _ => return None,
     };
     Some(result)
@@ -261,6 +300,7 @@ async fn dispatch_vetra_tool(call: &ToolCall) -> Option<ToolResult> {
 async fn dispatch_movilo_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
         "movilo_search_providers" => apps_movilo::execute_movilo_search_providers(call).await,
+        "movilo_get_plans" => apps_movilo::execute_movilo_get_plans(call).await,
         "movilo_check_affiliation" => apps_movilo::execute_movilo_check_affiliation(call).await,
         "movilo_validate_qr" => apps_movilo::execute_movilo_validate_qr(call).await,
         _ => return None,
@@ -271,6 +311,7 @@ async fn dispatch_movilo_tool(call: &ToolCall) -> Option<ToolResult> {
 async fn dispatch_latinos_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
         "list_bots" => apps_latinos::execute_list_bots(call).await,
+        "list_markets" => apps_latinos::execute_list_markets(call).await,
         "get_bot_status" => apps_latinos::execute_get_bot_status(call).await,
         "market_research" | "analyze_market_research" => {
             apps_latinos::execute_market_research(call).await
