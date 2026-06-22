@@ -463,3 +463,49 @@ mod tests {
         assert_eq!(summary.as_deref(), Some("1 failed, 2 passed in 0.05s"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// cargo build --release
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn execute_cargo_build_release(call: &ToolCall) -> ToolResult {
+    let dir = match workdir(call) {
+        Ok(d) => d,
+        Err(e) => return err(call, e),
+    };
+    let timeout_s = call
+        .arguments
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300);
+    let bin = call
+        .arguments
+        .get("bin")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let mut args = vec!["build", "--release", "--color=never"];
+    let bin_arg;
+    if let Some(ref b) = bin {
+        bin_arg = format!("--bin={}", b);
+        args.push(&bin_arg);
+    }
+
+    let (success, _stdout, stderr) = match run_cmd(&dir, "cargo", &args, timeout_s).await {
+        Ok(r) => r,
+        Err(e) => return err(call, e),
+    };
+
+    if success {
+        let binary_hint = bin
+            .as_deref()
+            .map(|b| format!(" Binary: {}/target/release/{}", dir.display(), b))
+            .unwrap_or_default();
+        ok(call, true, format!("cargo build --release OK in '{}'.{}", dir.display(), binary_hint))
+    } else {
+        ok(call, false, format!(
+            "cargo build --release FAILED in '{}'.\nstderr (tail):\n{}",
+            dir.display(), tail(&stderr)
+        ))
+    }
+}

@@ -6,8 +6,9 @@
 use std::sync::Arc;
 
 use super::helpers::{
-    canonicalize_user_id, fetch_db_schema_context, fetch_recursive_context, fetch_runtime_preflight,
-    fetch_semantic_memories, fetch_semantic_memory,
+    canonicalize_user_id, fetch_db_schema_context, fetch_rag_context, fetch_rag_pinned,
+    fetch_recursive_context, fetch_runtime_preflight, fetch_semantic_memories,
+    fetch_semantic_memory,
 };
 use super::llm_audit::{LlmAuditEvent, build_event};
 use super::route_profiles::resolve_route_profile;
@@ -140,6 +141,19 @@ pub async fn prepare_runtime_execution_context(
     {
         parsed.context_budget = context_budget_for_mode(mode, lightweight_mode);
     }
+    // Coding / ava_coder route: floor reasoning_effort at "medium". The difficulty
+    // classifier may rate "run git log" as Trivial → "low", but that same turn may
+    // drive a commit or a file edit — the cost of under-thinking is higher than for
+    // a conversational bot. Hard queries still escalate to "high" as usual.
+    {
+        let route = parsed.route_profile_id.as_str();
+        let app = parsed.app_name.as_str();
+        let is_coding = route == "coding" || route == "ava_coder"
+            || app == "coding" || app.contains("coder");
+        if is_coding && parsed.reasoning_effort == "low" {
+            parsed.reasoning_effort = "medium".to_string();
+        }
+    }
     // Stateless bots (Memo/movilo) must not carry personal recursive memory between
     // conversations — it poisons intent and bloats scoped_memory. This single switch
     // gates both the recall and the save paths (both branch on include_memory).
@@ -210,6 +224,29 @@ pub async fn prepare_chat_request(
         }
     } else if let Some(req) = &mut chat_req {
         inject_system_prompt(req, prompt_assembly.system_prompt.clone());
+        // Some clients (the os-hera-ipc-kit widgets — Lia/Colombialifecare, Paddi/Anglo)
+        // send the CURRENT question in `prompt` and only the PRIOR turns in `messages`
+        // (the trailing turn is usually the assistant greeting). Without folding `prompt`
+        // back in, the conversation reaches the model with a system prompt + history but
+        // NO user query — Qwen's chat template then raises "No user query found in
+        // messages" and the whole turn fails (the widget waits out its fallback timer and
+        // shows canned text, which reads as "the agent is slow"). Append the prompt as the
+        // user turn unless the caller already placed the question as the last user message.
+        if !prompt.is_empty() {
+            let last_non_system_is_user = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role != "system")
+                .map(|m| m.role == "user")
+                .unwrap_or(false);
+            if !last_non_system_is_user {
+                req.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: MessageContent::Text(prompt.to_string()),
+                });
+            }
+        }
     }
 
     if let Some(req) = &mut chat_req {
@@ -800,7 +837,11 @@ pub async fn build_full_system_prompt(
     } else {
         String::new()
     };
-    let (recursive_ctx, semantic_ctx, recall_attribution) =
+    let expert_id = std::path::Path::new(persona_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let (recursive_ctx, semantic_ctx, rag_pinned_ctx, rag_retrieved_ctx, recall_attribution) =
         if budget.include_memory && !lightweight_mode {
             let user_id = canonicalize_user_id(sender_name, chat_id, session_id);
             let recursive = clamp_chars(
@@ -810,9 +851,17 @@ pub async fn build_full_system_prompt(
             let (semantic_raw, attribution) =
                 fetch_semantic_memories(&user_id, app_name, session_id, user_prompt).await;
             let semantic = clamp_chars(semantic_raw, budget.max_memory_chars);
-            (recursive, semantic, attribution)
+            let rag_pinned = clamp_chars(
+                fetch_rag_pinned(app_id, expert_id).await,
+                budget.max_memory_chars,
+            );
+            let rag_retrieved = clamp_chars(
+                fetch_rag_context(app_id, expert_id, user_prompt).await,
+                budget.max_memory_chars,
+            );
+            (recursive, semantic, rag_pinned, rag_retrieved, attribution)
         } else {
-            (String::new(), String::new(), None)
+            (String::new(), String::new(), String::new(), String::new(), None)
         };
     // Frame E (prompt caching): persona + memento_ctx is the stable head of the
     // prompt. Per-turn memory (recursive_ctx + semantic_ctx) is appended AT THE
@@ -907,7 +956,7 @@ pub async fn build_full_system_prompt(
     // can mark the boundary. Putting dynamic memory AT THE END keeps cache hits
     // stable across turns even as memory grows.
     let stable_prefix = format!(
-        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}{}",
+        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}{}{}",
         base_system_prompt,
         schemas,
         db_schema_ctx,
@@ -915,9 +964,10 @@ pub async fn build_full_system_prompt(
         json_directive,
         language_directive,
         date_directive,
-        runtime_context_directive
+        runtime_context_directive,
+        rag_pinned_ctx
     );
-    let dynamic_suffix = format!("{}{}", recursive_ctx, semantic_ctx);
+    let dynamic_suffix = format!("{}{}{}", recursive_ctx, semantic_ctx, rag_retrieved_ctx);
     let system_prompt = format!("{}{}", stable_prefix, dynamic_suffix);
 
     PromptAssembly {

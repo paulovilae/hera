@@ -775,6 +775,85 @@ pub async fn fetch_recursive_context(user_id: &str, app_id: &str, session_id: &s
     format_recursive_context(ctx)
 }
 
+/// Fetch all pinned RAG documents for a scope (app_id + expert_id) and format
+/// them for injection into the stable prompt prefix. Pinned docs are the "always-on"
+/// knowledge base for the agent — editable via /rag/admin without redeploying.
+/// Returns empty string if no pinned docs exist or Memento is unavailable.
+pub async fn fetch_rag_pinned(app_id: &str, expert_id: &str) -> String {
+    if app_id.is_empty() && expert_id.is_empty() {
+        return String::new();
+    }
+    let mut payload = serde_json::json!({});
+    if !app_id.is_empty() {
+        payload["app_id"] = serde_json::Value::String(app_id.to_string());
+    }
+    if !expert_id.is_empty() {
+        payload["expert_id"] = serde_json::Value::String(expert_id.to_string());
+    }
+    let Some(resp) = call_memento("rag_pinned", payload).await else {
+        return String::new();
+    };
+    let Some(docs) = resp.get("documents").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if docs.is_empty() {
+        return String::new();
+    }
+    let mut sections = Vec::new();
+    let mut total_chars = 0usize;
+    const MAX_PINNED_CHARS: usize = 24_000;
+    for doc in docs {
+        let title = doc.get("title").and_then(|v| v.as_str()).unwrap_or("Document");
+        let text  = doc.get("full_text").and_then(|v| v.as_str()).unwrap_or("");
+        if text.is_empty() { continue; }
+        let remaining = MAX_PINNED_CHARS.saturating_sub(total_chars);
+        if remaining == 0 { break; }
+        let clipped: String = text.chars().take(remaining).collect();
+        total_chars += clipped.chars().count();
+        sections.push(format!("## {}\n{}", title, clipped));
+    }
+    if sections.is_empty() { return String::new(); }
+    format!("\n\n# KNOWLEDGE BASE (RAG pinned documents)\n{}", sections.join("\n\n---\n\n"))
+}
+
+/// Embed the user query and return the most relevant RAG chunk snippets for the scope.
+/// Injected into the dynamic_suffix (per-turn, like semantic_ctx). Returns empty
+/// string if the embed model is unavailable or no chunks score above Memento's threshold.
+pub async fn fetch_rag_context(app_id: &str, expert_id: &str, query: &str) -> String {
+    if query.trim().is_empty() || (app_id.is_empty() && expert_id.is_empty()) {
+        return String::new();
+    }
+    let q = query.to_string();
+    let embedding = match tokio::task::spawn_blocking(move || embed_text_local(&q)).await {
+        Ok(Some(e)) => e,
+        _ => return String::new(),
+    };
+    let mut payload = serde_json::json!({ "query_embedding": embedding, "k": 5 });
+    if !app_id.is_empty() {
+        payload["app_id"] = serde_json::Value::String(app_id.to_string());
+    }
+    if !expert_id.is_empty() {
+        payload["expert_id"] = serde_json::Value::String(expert_id.to_string());
+    }
+    let Some(resp) = call_memento("rag_search", payload).await else {
+        return String::new();
+    };
+    let Some(results) = resp.get("results").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if results.is_empty() { return String::new(); }
+    let mut section = String::new();
+    for hit in results.iter().take(5) {
+        let title   = hit.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let content = hit.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() { continue; }
+        let snippet: String = content.chars().take(400).collect();
+        section.push_str(&format!("- [{}] {}\n", title, snippet));
+    }
+    if section.is_empty() { return String::new(); }
+    format!("\n\n# RAG CONTEXT (relevant document chunks)\n{}", section)
+}
+
 /// Persist a single conversation turn as a scoped_memory event. Fire-and-forget — errors only
 /// log via tracing. Memento's auto_derive=true triggers session/room/project summary derivation
 /// once enough events accumulate, which subsequent calls to `fetch_recursive_context` surface.
