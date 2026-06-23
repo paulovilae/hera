@@ -96,6 +96,48 @@ fn folded_like(column: &str, raw_input: &str) -> String {
     format!("lower(translate({column}, '{ACCENT_FROM}', '{ACCENT_TO}')) LIKE '%{folded}%'")
 }
 
+/// Render provider rows as a short, user-facing Spanish list.
+///
+/// The tool output is consumed by a weak local model on a streaming route
+/// (`movilo_widget` is `prefer_stream`), which frequently echoes the tool result
+/// verbatim. So the output MUST already be presentable: no raw JSON, no SQL, no
+/// internal `[[SYSTEM DIRECTIVE]]` framing — whatever the model echoes has to be
+/// clean. Dedups by company so the LEFT JOIN on services doesn't repeat a
+/// provider once per service row.
+fn format_provider_list(rows: &[serde_json::Value]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    for row in rows {
+        let name = row
+            .get("company_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() || !seen.insert(name.to_string()) {
+            continue;
+        }
+        let ptype = row
+            .get("provider_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let phone = row
+            .get("phone")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let mut parts = vec![format!("**{name}**")];
+        if !ptype.is_empty() {
+            parts.push(ptype.to_string());
+        }
+        if !phone.is_empty() {
+            parts.push(format!("Tel: {phone}"));
+        }
+        lines.push(format!("- {}", parts.join(" — ")));
+    }
+    lines.join("\n")
+}
+
 pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResult {
     let city = call
         .arguments
@@ -163,15 +205,25 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
     let json_result = super::data::execute_memento_query_json(&memento_call).await;
 
     match json_result {
-        Err(error) => ToolResult {
-            name: "movilo_search_providers".to_string(),
-            success: false,
-            output: format!("[[SYSTEM DIRECTIVE]]: The directory could not be queried right now. Tell the user: \"No pude consultar el directorio en este momento. Puedes buscarlo aquí: [Ver directorio](https://movilo.club/#providers)\". Do NOT invent a reason.\n\nError: {}", error),
-        },
+        Err(error) => {
+            // Keep the real error in the logs, never in the user-facing channel:
+            // the tool output is the only path to the user and a weak model echoes
+            // it verbatim, so it must be clean (the persona forbids leaking SQL /
+            // internals). See format_provider_list for the streaming rationale.
+            tracing::warn!("movilo_search_providers query failed: {error}");
+            ToolResult {
+                name: "movilo_search_providers".to_string(),
+                success: false,
+                output: "No pude consultar el directorio en este momento. Puedes buscarlo aquí: [Ver todo el directorio](https://movilo.club/#providers)".to_string(),
+            }
+        }
         Ok(res) => {
             let count = res.get("count").and_then(|c| c.as_i64()).unwrap_or(0);
-            let rows = res.get("rows").cloned().unwrap_or(serde_json::json!([]));
-            let formatted = serde_json::to_string_pretty(&rows).unwrap_or_default();
+            let rows = res
+                .get("rows")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
 
             let mut widget_attrs = String::new();
             if !specialty.is_empty() {
@@ -188,13 +240,21 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
             {
                 widget_attrs.push_str(&format!(" search=\"{}\"", escape_attr(specialty)));
             }
+            // The <os-provider-map> tag is the interactive map the persona is told
+            // to keep verbatim at the end of the reply. The output below is already
+            // user-presentable end-to-end: no JSON, no SQL, no directive framing.
+            let widget = format!("<os-provider-map{widget_attrs}></os-provider-map>");
 
             if count == 0 {
-                // Exact script from the persona: do NOT say "base de datos vacía" or any excuse.
-                let what = if !specialty.is_empty() { specialty } else if !keyword.is_empty() { keyword } else { "proveedores" };
+                let what = if !specialty.is_empty() {
+                    specialty
+                } else if !keyword.is_empty() {
+                    keyword
+                } else {
+                    "prestadores"
+                };
                 let output = format!(
-                    "Database query returned 0 results from 'movilo'.\n\n[[SYSTEM DIRECTIVE]]: Zero results — the network exists and is online, there just was no match. You MUST say EXACTLY: \"No encontré {} en Cali ahora mismo. ¿Probamos con otra zona o especialidad? Puedes ver el directorio completo aquí: [Ver directorio](https://movilo.club/#providers)\". Do NOT say the database is empty, in maintenance, or unavailable. Then embed the map:\n\nWIDGET: <os-provider-map{}></os-provider-map>\n",
-                    what, widget_attrs
+                    "No encontré {what} en Cali ahora mismo. ¿Probamos con otra zona o especialidad? También puedes ver el directorio completo aquí: [Ver todo el directorio](https://movilo.club/#providers)\n\n{widget}"
                 );
                 ToolResult {
                     name: "movilo_search_providers".to_string(),
@@ -202,14 +262,10 @@ pub(crate) async fn execute_movilo_search_providers(call: &ToolCall) -> ToolResu
                     output,
                 }
             } else {
-                let mut output = format!(
-                    "Database query returned {} results from 'movilo':\n{}",
-                    count, formatted
+                let list = format_provider_list(&rows);
+                let output = format!(
+                    "Estos son los prestadores de la red Movilo que coinciden con tu búsqueda:\n\n{list}\n\n{widget}"
                 );
-                output.push_str(&format!(
-                    "\n\n[[SYSTEM DIRECTIVE]]: You MUST also embed an interactive map in your response so the user can visually locate these providers. Include the following EXACT string somewhere in your text reply:\n\nWIDGET: <os-provider-map{}></os-provider-map>\n",
-                    widget_attrs
-                ));
                 ToolResult {
                     name: "movilo_search_providers".to_string(),
                     success: true,
