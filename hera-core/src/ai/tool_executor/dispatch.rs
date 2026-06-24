@@ -130,6 +130,7 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "mc_add_wishlist" => mission_control::execute_mc_add_wishlist(call).await,
         "mc_set_objective" => mission_control::execute_mc_set_objective(call).await,
         "generate_image" | "hera_draw" => platform::execute_draw(call).await,
+        "review_image" | "describe_image" => platform::execute_review_image(call).await,
         "animate_avatar" => platform::execute_animate_avatar(call).await,
         "hera_search" => platform::execute_search(call).await,
         "geocode" => geo::execute_geocode(call).await,

@@ -231,12 +231,16 @@ async fn main() {
     let orchestrator_engine: Arc<dyn hera_core::ai::LLMEngine + Send + Sync> =
         Arc::clone(&router_engine);
 
-    // Mount Native Vision Engine (Unified Omni)
+    // Mount Native Vision Engine (sovereign VLM). The text omni (:8080) has no
+    // mmproj and rejects images, so vision points at the dedicated vision-review
+    // server (Qwen2.5-VL @ :8083) by default. Override with HERA_VISION_URL.
+    let vision_url = std::env::var("HERA_VISION_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8083/v1/chat/completions".to_string());
     let vision_engine: Option<Arc<dyn hera_core::ai::LLMEngine + Send + Sync>> = {
-        info!("👁️ Native Vision Engine (Unified Local Omni) mounted via local network.");
+        info!("👁️ Native Vision Engine mounted @ {}", vision_url);
         Some(Arc::new(
             hera_core::ai::openai_compat::OpenAICompatEngine::new(
-                primary_local_url.clone(),
+                vision_url,
                 "".to_string(),
             ),
         ))
