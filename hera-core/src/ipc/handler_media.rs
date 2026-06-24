@@ -93,10 +93,13 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
         // Fallback to sd.cpp REST API (endpoint configurable via HERA_DRAW_URL)
         let draw_endpoint = format!("{}/v1/images/generations", draw_url());
         let client = reqwest::Client::new();
+        // sd.cpp (OpenAI-compat) lee "size" ("WxH"), NO width/height sueltos: sin "size" usa
+        // 512x512 por defecto e ignora las dimensiones pedidas (banners/wide salían cuadrados).
         let payload = serde_json::json!({
             "prompt": prompt,
             "width": width,
             "height": height,
+            "size": format!("{width}x{height}"),
             "response_format": "b64_json"
         });
         match client
