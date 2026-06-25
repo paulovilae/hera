@@ -23,5 +23,5 @@ export CUDA_VISIBLE_DEVICES="${GPU_TARGET}"
     --listen-ip "${LISTEN_IP}" \
     --steps 8 \
     --cfg-scale 1.0 \
-    --lora-model-dir /home/paulo/models/image-stack/zimage-loras \
+    --lora-model-dir /home/paulo/models/image-stack/loras \
     --fa
