@@ -10,6 +10,12 @@ fn draw_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string())
 }
 
+/// Display name of the active image backend, reported to callers so UIs never
+/// hardcode the engine. Set HERA_DRAW_MODEL when you swap the draw model.
+fn draw_model() -> String {
+    std::env::var("HERA_DRAW_MODEL").unwrap_or_else(|_| "Z-Image Turbo".to_string())
+}
+
 /// Handle the "generate_image" action — FLUX/sd.cpp image generation with auto-LoRA.
 #[cfg_attr(not(feature = "local-llm"), allow(unused_variables))]
 pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> HandlerOutcome {
@@ -132,8 +138,8 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
 
     HandlerOutcome::Result {
         result_text,
-        origin: "unknown".to_string(),
-        model: String::new(),
+        origin: "sd.cpp".to_string(),
+        model: draw_model(),
         tool_calls: None,
     }
 }
