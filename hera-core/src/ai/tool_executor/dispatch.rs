@@ -233,6 +233,7 @@ async fn dispatch_data_tool(call: &ToolCall) -> Option<ToolResult> {
         "memento_vector_search" => data::execute_memento_vector_search(call).await,
         "save_memory" => productivity::execute_save_memory(call).await,
         "query_memory" => productivity::execute_query_memory(call).await,
+        "document_to_text" => productivity::execute_document_to_text(call).await,
         _ => return None,
     };
     Some(result)

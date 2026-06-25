@@ -34,6 +34,56 @@ async fn memento_send(action: &str, payload: Value) -> Result<Value, String> {
     serde_json::from_slice(&buf).map_err(|e| format!("Memento parse error: {}", e))
 }
 
+// ─── document_to_text ──────────────────────────────────────────────────────
+// Conversor de documentos: Hera EXPONE el tool, pero el trabajo lo hace Memento (dueño de la
+// ingesta de conocimiento). REGLA DE PLATAFORMA: se manda la UBICACIÓN, no el archivo. Reenvía a la
+// acción IPC `extract_text {path}` de Memento y devuelve el texto extraído.
+
+pub(crate) async fn execute_document_to_text(call: &ToolCall) -> ToolResult {
+    let path = match call.arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+        _ => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: "Missing 'path' argument".to_string(),
+            }
+        }
+    };
+
+    match memento_send("extract_text", serde_json::json!({ "path": path })).await {
+        Ok(resp) => {
+            if let Some(e) = resp.get("error").and_then(|v| v.as_str()) {
+                return ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("extract_text: {e}"),
+                };
+            }
+            let text = resp.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let source_type = resp.get("source_type").and_then(|v| v.as_str()).unwrap_or("text");
+            if text.is_empty() {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: "El documento no tiene texto extraíble (¿escaneado o vacío?).".to_string(),
+                }
+            } else {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: format!("[{source_type}]\n{text}"),
+                }
+            }
+        }
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Memento no disponible: {e}"),
+        },
+    }
+}
+
 // ─── save_memory ─────────────────────────────────────────────────────────
 
 pub(crate) async fn execute_save_memory(call: &ToolCall) -> ToolResult {
