@@ -955,6 +955,39 @@ pub async fn report_recall_feedback(
     let _ = call_memento("recall_feedback", payload).await;
 }
 
+/// Fire-and-forget: records a usage event in Memento after each generate call.
+/// Fails silently — never blocks or panics the generate path.
+pub fn spawn_log_usage(
+    app_id: String,
+    user_id: String,
+    session_id: String,
+    route_profile: String,
+    model: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+    is_cloud: bool,
+    latency_ms: u64,
+) {
+    tokio::spawn(async move {
+        let payload = serde_json::json!({
+            "app_id": app_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "route_profile": route_profile,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "is_cloud": is_cloud,
+            "latency_ms": latency_ms
+        });
+        if call_memento("hera_log_usage", payload).await.is_none() {
+            tracing::debug!("[Hera Usage] log_usage failed or timed out (best-effort)");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{canonicalize_user_id, cited_ids_from_response, RecallAttribution, RecalledEntry};

@@ -7,7 +7,7 @@ use super::context::{
 use super::helpers::{
     RuntimePromotionContext, canonicalize_user_id, infer_origin_from_model,
     record_observation_and_promote_runtime_hint, record_runtime_observation, report_recall_feedback,
-    save_chat_turn_event,
+    save_chat_turn_event, spawn_log_usage,
 };
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
@@ -325,6 +325,21 @@ pub async fn handle_generate(
                 });
             }
 
+            // Path A — usage logging (best-effort, fire-and-forget).
+            // Agentic loop does not expose per-turn token counts yet; use 0.
+            spawn_log_usage(
+                parsed.app_name.clone(),
+                canonicalize_user_id(&parsed.sender_name, &parsed.chat_id, &parsed.session_id),
+                parsed.session_id.clone(),
+                parsed.route_profile_id.clone(),
+                response_model.clone(),
+                0,
+                0,
+                0,
+                response_origin.contains("cloud"),
+                duration_ms,
+            );
+
             return HandlerOutcome::Result {
                 result_text,
                 origin: response_origin,
@@ -335,6 +350,8 @@ pub async fn handle_generate(
 
         match state.engine.generate_content(req).await {
             Ok(resp) => {
+                // Capture usage tokens before resp is consumed by choices access.
+                let resp_usage = resp.usage.clone();
                 let mut response_model = resp.model.clone();
                 let mut response_origin = infer_origin_from_model(&resp.model).to_string();
                 let origin_emoji = match response_origin.as_str() {
@@ -586,6 +603,30 @@ pub async fn handle_generate(
                         // so Memento can build (positives, negatives) training data.
                         report_recall_feedback(attribution.as_ref(), &assistant_content).await;
                     });
+                }
+
+                // Path B — usage logging (best-effort, fire-and-forget).
+                {
+                    let prompt_tokens = resp_usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
+                    let completion_tokens =
+                        resp_usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+                    let total_tokens = resp_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+                    spawn_log_usage(
+                        parsed.app_name.clone(),
+                        canonicalize_user_id(
+                            &parsed.sender_name,
+                            &parsed.chat_id,
+                            &parsed.session_id,
+                        ),
+                        parsed.session_id.clone(),
+                        parsed.route_profile_id.clone(),
+                        response_model.clone(),
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        response_origin.contains("cloud"),
+                        duration_ms,
+                    );
                 }
 
                 return HandlerOutcome::Result {
