@@ -310,6 +310,132 @@ fn format_memory_results(call: &ToolCall, res: Value) -> ToolResult {
     }
 }
 
+// ─── recall_session_context ───────────────────────────────────────────────
+
+pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResult {
+    let app_id = call
+        .arguments
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ava")
+        .to_string();
+
+    let session_id = call
+        .arguments
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let focus = call
+        .arguments
+        .get("focus")
+        .and_then(|v| v.as_str())
+        .unwrap_or("full")
+        .to_string();
+
+    let mut payload = serde_json::json!({
+        "user_id": "paulo",
+        "app_id": app_id
+    });
+    if let Some(sid) = session_id {
+        payload["session_id"] = Value::String(sid);
+    }
+
+    info!(
+        "[Productivity] recall_session_context app='{}' focus='{}'",
+        app_id, focus
+    );
+
+    match memento_send("recall_recursive_context", payload).await {
+        Ok(res) => {
+            let mut parts: Vec<String> = Vec::new();
+
+            // Durable facts — highest signal, always shown
+            if let Some(facts) = res.get("durable_facts").and_then(|v| v.as_array()) {
+                if !facts.is_empty() {
+                    let lines: Vec<String> = facts
+                        .iter()
+                        .filter_map(|f| {
+                            let content = f.get("content").and_then(|v| v.as_str())?;
+                            let title = f
+                                .get("entry_title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            Some(if title.is_empty() {
+                                format!("• {}", content)
+                            } else {
+                                format!("• [{}] {}", title, content)
+                            })
+                        })
+                        .collect();
+                    parts.push(format!("## Durable facts\n{}", lines.join("\n")));
+                }
+            }
+
+            // Recent events — shown for "full" and "recent"
+            if focus != "decisions" {
+                if let Some(events) = res.get("recent_events").and_then(|v| v.as_array()) {
+                    let shown: Vec<String> = events
+                        .iter()
+                        .take(8)
+                        .filter_map(|e| {
+                            let content = e.get("content").and_then(|v| v.as_str())?;
+                            let ts = e
+                                .get("timestamp")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            Some(format!("• {} ({})", &content[..content.len().min(120)], &ts[..ts.len().min(10)]))
+                        })
+                        .collect();
+                    if !shown.is_empty() {
+                        parts.push(format!("## Recent events\n{}", shown.join("\n")));
+                    }
+                }
+            }
+
+            // Session/project summaries — only for "full"
+            if focus == "full" {
+                for key in &["project_summaries", "room_summaries", "session_summaries"] {
+                    if let Some(summaries) = res.get(key).and_then(|v| v.as_array()) {
+                        if let Some(latest) = summaries.last() {
+                            if let Some(content) = latest.get("content").and_then(|v| v.as_str()) {
+                                let label = key.replace('_', " ");
+                                parts.push(format!(
+                                    "## {}\n{}",
+                                    label,
+                                    &content[..content.len().min(400)]
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if parts.is_empty() {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: format!("No prior context found for app='{}'.", app_id),
+                }
+            } else {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: parts.join("\n\n"),
+                }
+            }
+        }
+        Err(e) => {
+            warn!("recall_session_context failed: {}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Memento recall failed: {}", e),
+            }
+        }
+    }
+}
+
 // ─── read_email ───────────────────────────────────────────────────────────
 
 pub(crate) async fn execute_read_email(call: &ToolCall) -> ToolResult {
