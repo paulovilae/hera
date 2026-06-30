@@ -163,6 +163,8 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "read_email" => productivity::execute_read_email(call).await,
         "list_calendar_events" => productivity::execute_list_calendar_events(call).await,
         "read_notes" => productivity::execute_read_notes(call).await,
+        "list_image_loras" => platform::execute_list_image_loras(call).await,
+        "corporate_research" => platform::execute_corporate_research(call).await,
         _ => return None,
     };
     Some(result)

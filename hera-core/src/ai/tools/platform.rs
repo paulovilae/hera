@@ -921,6 +921,309 @@ pub(crate) async fn execute_generate_access_link(call: &ToolCall) -> ToolResult 
     }
 }
 
+// ── list_image_loras ──────────────────────────────────────────────────────────
+// Reads available LoRAs from the local triggers.json + lora_weights.json files,
+// or from the sd.cpp /sdapi/v1/loras endpoint if the image server is reachable.
+// Falls back gracefully to the file-based list; always returns something useful.
+pub(crate) async fn execute_list_image_loras(call: &ToolCall) -> ToolResult {
+    let loras_dir = std::env::var("HERA_LORAS_DIR")
+        .unwrap_or_else(|_| "/home/paulo/models/image-stack/loras".to_string());
+
+    let triggers_path = format!("{}/triggers.json", loras_dir);
+    let weights_path = format!("{}/lora_weights.json", loras_dir);
+
+    // Try loading triggers.json (lora_name -> [keyword, ...])
+    let triggers: std::collections::HashMap<String, Vec<String>> =
+        std::fs::read_to_string(&triggers_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+
+    let weights: std::collections::HashMap<String, f32> =
+        std::fs::read_to_string(&weights_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+
+    if !triggers.is_empty() {
+        // Build list from local files
+        let mut lines: Vec<String> = triggers
+            .iter()
+            .map(|(name, keywords)| {
+                let weight = weights.get(name).copied().unwrap_or(0.7);
+                let trigger_str = keywords.join(", ");
+                format!("- **{}** (weight: {:.2}) — triggers: {}", name, weight, trigger_str)
+            })
+            .collect();
+        lines.sort();
+
+        info!("[Hera] list_image_loras: {} LoRAs from local files", lines.len());
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!(
+                "Available LoRAs ({} total):\n{}\n\nTo use a LoRA explicitly: `<lora:name:weight>` in your prompt.",
+                lines.len(),
+                lines.join("\n")
+            ),
+        };
+    }
+
+    // No local files — try sd.cpp REST endpoint
+    let draw_base = std::env::var("HERA_DRAW_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string());
+    let endpoint = format!("{}/sdapi/v1/loras", draw_base);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    match client.get(&endpoint).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    let entries = json.as_array().cloned().unwrap_or_default();
+                    let lines: Vec<String> = entries
+                        .iter()
+                        .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+                        .map(|name| format!("- **{}**", name))
+                        .collect();
+                    ToolResult {
+                        name: call.name.clone(),
+                        success: true,
+                        output: format!("Available LoRAs ({} total):\n{}", lines.len(), lines.join("\n")),
+                    }
+                }
+                Err(_) => ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: "Image server responded but returned invalid JSON for /sdapi/v1/loras".to_string(),
+                },
+            }
+        }
+        _ => {
+            // Hardcoded baseline when nothing else is available
+            let baseline = vec![
+                "- **flux-schnell-q4** (weight: 1.00) — triggers: fast, quick draft, sketch",
+                "- **realistic_vision** (weight: 0.70) — triggers: realistic, photo, portrait, photography",
+            ];
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "LoRA list unavailable (image server offline, no local triggers.json). Known baseline LoRAs:\n{}",
+                    baseline.join("\n")
+                ),
+            }
+        }
+    }
+}
+
+// ── corporate_research ────────────────────────────────────────────────────────
+// Multi-phase corporate dossier tool:
+//   1. Four parallel web searches (profile, market, competitors, ESG).
+//   2. Assembles a raw research dossier from the results.
+//   3. Synthesizes a structured McKinsey-style JSON report via Hera IPC.
+pub(crate) async fn execute_corporate_research(call: &ToolCall) -> ToolResult {
+    let entity = match call.arguments.get("entity").and_then(|v| v.as_str()) {
+        Some(e) if !e.trim().is_empty() => e.trim().to_string(),
+        _ => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: "Missing required argument: 'entity' (company name to research)".to_string(),
+            };
+        }
+    };
+
+    let depth = call
+        .arguments
+        .get("depth")
+        .and_then(|v| v.as_str())
+        .unwrap_or("standard");
+
+    let lang = call
+        .arguments
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("es");
+
+    // Build search queries based on depth and language
+    let queries: Vec<String> = if lang == "en" {
+        vec![
+            format!("{} company profile history founder products services", entity),
+            format!("{} industry market size growth trends", entity),
+            format!("{} main competitors market share competitive advantage", entity),
+            format!("{} ESG sustainability governance shareholders ownership structure", entity),
+        ]
+    } else {
+        vec![
+            format!("{} empresa perfil corporativo historia fundador productos servicios", entity),
+            format!("{} industria mercado tamaño crecimiento tendencias", entity),
+            format!("{} competidores principales cuota mercado rivales ventaja competitiva", entity),
+            format!("{} ESG sostenibilidad gobernanza accionistas estructura propiedad", entity),
+        ]
+    };
+
+    // Limit queries for 'quick' depth
+    let active_queries: Vec<&String> = match depth {
+        "quick" => queries.iter().take(2).collect(),
+        _ => queries.iter().collect(),
+    };
+
+    info!(
+        "[Hera] corporate_research: researching '{}' ({} queries, lang={})",
+        entity,
+        active_queries.len(),
+        lang
+    );
+
+    // Execute searches in parallel via native_web_search
+    let hera = hera_execution_agent();
+    let search_futures: Vec<_> = active_queries
+        .iter()
+        .map(|q| hera.native_web_search(q))
+        .collect();
+
+    let search_results = futures_util::future::join_all(search_futures).await;
+
+    // Assemble raw dossier from successful searches
+    let mut dossier_parts: Vec<String> = Vec::new();
+    let query_labels = ["PERFIL / PROFILE", "MERCADO / MARKET", "COMPETIDORES / COMPETITORS", "ESG / GOBERNANZA"];
+
+    for (i, result) in search_results.into_iter().enumerate() {
+        let label = query_labels.get(i).copied().unwrap_or("RESEARCH");
+        match result {
+            Ok(content) if !content.trim().is_empty() => {
+                dossier_parts.push(format!("## {}\n{}", label, content.trim()));
+            }
+            Ok(_) => {
+                dossier_parts.push(format!("## {}\n(No results found)", label));
+            }
+            Err(e) => {
+                dossier_parts.push(format!("## {}\n(Search error: {})", label, e));
+            }
+        }
+    }
+
+    if dossier_parts.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("All web searches failed for '{}'. Check hera_search availability.", entity),
+        };
+    }
+
+    let raw_dossier = dossier_parts.join("\n\n");
+
+    // LLM synthesis via Hera IPC — returns structured JSON report
+    let system_prompt = if lang == "en" {
+        format!(
+            "You are a Senior McKinsey strategic consultant. Based ONLY on the research dossier provided, \
+             generate a structured corporate profile for '{}' in JSON format with these keys: \
+             company_overview, industry_context, consulting_kpis (market_share_percent, year_over_year_growth, \
+             employee_count, revenue_estimate, geographic_reach), swot (strengths, weaknesses, opportunities, \
+             threats as arrays), competitors (array of {{name, advantage, risk}}), \
+             catalysts_and_news (recent_headlines array, executive_summary), history_background, \
+             ownership_structure, esg_outlook, investment_scores (growth, operations, leadership, market as 1-10 integers). \
+             DO NOT invent data. If a field is unknown, use null or an empty array.",
+            entity
+        )
+    } else {
+        format!(
+            "Eres un consultor estratégico Senior de McKinsey. Basándote ÚNICAMENTE en el dossier de investigación, \
+             genera un perfil corporativo estructurado en JSON para '{}' con estas claves: \
+             company_overview, industry_context, consulting_kpis (market_share_percent, year_over_year_growth, \
+             employee_count, revenue_estimate, geographic_reach), swot (strengths, weaknesses, opportunities, \
+             threats como arrays), competitors (array de {{name, advantage, risk}}), \
+             catalysts_and_news (recent_headlines array, executive_summary), history_background, \
+             ownership_structure, esg_outlook, investment_scores (growth, operations, leadership, market enteros 1-10). \
+             NO inventes datos. Si un campo es desconocido, usa null o array vacío.",
+            entity
+        )
+    };
+
+    let user_prompt = format!(
+        "Empresa a investigar: {}\n\nDOSSIER DE INVESTIGACIÓN:\n{}",
+        entity, raw_dossier
+    );
+
+    let mut stream = match UnixStream::connect(HERA_SOCKET).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Return raw dossier if IPC is unavailable
+            return ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Research dossier for '{entity}' (synthesis unavailable — Hera IPC error: {e}):\n\n{raw_dossier}"
+                ),
+            };
+        }
+    };
+
+    let ipc_request = json!({
+        "action": "generate",
+        "payload": {
+            "app": "hera",
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ],
+            "temperature": 0.15,
+            "max_tokens": 4096,
+            "permissions": [],
+            "response_format": { "type": "json_object" }
+        }
+    });
+
+    let payload = format!("{}\n", ipc_request);
+    if let Err(e) = stream.write_all(payload.as_bytes()).await {
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Research dossier for '{entity}' (synthesis write error: {e}):\n\n{raw_dossier}"),
+        };
+    }
+    if let Err(e) = stream.shutdown().await {
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Research dossier for '{entity}' (synthesis shutdown error: {e}):\n\n{raw_dossier}"),
+        };
+    }
+
+    let mut response = String::new();
+    if let Err(e) = stream.read_to_string(&mut response).await {
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Research dossier for '{entity}' (synthesis read error: {e}):\n\n{raw_dossier}"),
+        };
+    }
+
+    match parse_ipc_result(&response) {
+        Ok(synthesized) => {
+            info!("[Hera] corporate_research: synthesis complete for '{}'", entity);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: synthesized,
+            }
+        }
+        Err(e) => {
+            // Synthesis failed — return the raw dossier so the call is still useful
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Research dossier for '{entity}' (synthesis error: {e}):\n\n{raw_dossier}"
+                ),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ai::tool_executor::parse_tool_calls;
