@@ -1,0 +1,282 @@
+//! Media tool executors: draw, animate_avatar, speak, video, review_image.
+use crate::ai::tool_executor::{ToolCall, ToolResult};
+use super::hera_execution_agent;
+use tracing::info;
+
+pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("A beautiful digital artwork");
+    let width = call
+        .arguments
+        .get("width")
+        .and_then(|w| w.as_u64())
+        .map(|w| w as u32);
+    let height = call
+        .arguments
+        .get("height")
+        .and_then(|h| h.as_u64())
+        .map(|h| h as u32);
+
+    let hera = hera_execution_agent();
+    match hera
+        .generate_image(
+            prompt, None, width, height, None, None, None, None, None, None, None,
+        )
+        .await
+    {
+        Ok(res) => {
+            let image_url = res
+                .get("image_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("(no URL)");
+            info!("🎨 [Hera] Image generated: {}", image_url);
+
+            // Build a public URL that candle-core serves at /outputs/{filename}
+            // The filename is the last segment of image_url (e.g., "/outputs/hera_drawn_UUID.png")
+            let filename = image_url.split('/').next_back().unwrap_or(image_url);
+            let public_url = format!("https://imaginos.ai/outputs/{}", filename);
+            let response = format!(
+                "Image generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the image is delivered inline.",
+                public_url
+            );
+
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: response,
+            }
+        }
+        Err(e) => {
+            tracing::error!("🎨 [Hera] Image generation failed: {:?}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Image generation failed: {}", e),
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_animate_avatar(call: &ToolCall) -> ToolResult {
+    let text = match call
+        .arguments
+        .get("text")
+        .and_then(|t| t.as_str())
+    {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: "Missing 'text' parameter — provide the text the avatar should say."
+                    .to_string(),
+            };
+        }
+    };
+    let character = call
+        .arguments
+        .get("character")
+        .and_then(|c| c.as_str())
+        .unwrap_or("edu");
+    let face_url = call
+        .arguments
+        .get("face_url")
+        .and_then(|u| u.as_str());
+    let voice = call
+        .arguments
+        .get("voice")
+        .and_then(|v| v.as_str())
+        .unwrap_or("paddi");
+
+    let hera = hera_execution_agent();
+    match hera.animate_avatar(text, character, face_url, Some(voice)).await {
+        Ok(res) => {
+            let video_url = res
+                .get("video_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("(no URL)");
+            info!("🎬 [Hera] Avatar animation generated: {}", video_url);
+
+            let filename = video_url.split('/').next_back().unwrap_or(video_url);
+            let public_url = format!("https://imaginos.ai/outputs/{}", filename);
+            let response = format!(
+                "Avatar animation generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the video is delivered inline.",
+                public_url
+            );
+
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: response,
+            }
+        }
+        Err(e) => {
+            tracing::error!("🎬 [Hera] Avatar animation failed: {:?}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Avatar animation failed: {}", e),
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_speak(call: &ToolCall) -> ToolResult {
+    let text = call
+        .arguments
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    let voice = call.arguments.get("voice").and_then(|v| v.as_str());
+
+    let hera = hera_execution_agent();
+    match hera.synthesize_speech(text, voice).await {
+        Ok(result) => {
+            info!("🔊 [Hera] Speech synthesized");
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Speech generated successfully: {}",
+                    serde_json::to_string(&result).unwrap_or_default()
+                ),
+            }
+        }
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("TTS failed: {}", e),
+        },
+    }
+}
+
+pub(crate) async fn execute_video(call: &ToolCall) -> ToolResult {
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("A smooth cinematic video");
+
+    let hera = hera_execution_agent();
+    match hera.synthesize_video(prompt).await {
+        Ok(result) => {
+            info!("🎬 [Hera] Video generated");
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Video generated successfully: {}",
+                    serde_json::to_string(&result).unwrap_or_default()
+                ),
+            }
+        }
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Video generation failed: {}", e),
+        },
+    }
+}
+
+/// Sovereign image understanding — sends an image to the local VLM (Qwen2.5-VL @
+/// HERA_VISION_URL, default :8083) and returns its answer. Used to describe or QA
+/// images (e.g. detect headless people / deformed hands in generated covers).
+/// `image` may be an http(s) URL or a local file path. `question` is optional.
+pub(crate) async fn execute_review_image(call: &ToolCall) -> ToolResult {
+    use base64::Engine as _;
+
+    let fail = |msg: String| ToolResult {
+        name: call.name.clone(),
+        success: false,
+        output: msg,
+    };
+
+    let image = call
+        .arguments
+        .get("image")
+        .or_else(|| call.arguments.get("image_url"))
+        .or_else(|| call.arguments.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if image.is_empty() {
+        return fail("Missing 'image' (an http(s) URL or a local file path).".to_string());
+    }
+    let question = call
+        .arguments
+        .get("question")
+        .or_else(|| call.arguments.get("prompt"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(
+            "Describe this image briefly. Then, if it has obvious generation defects \
+             (a person with a missing/cut-off head or face, deformed or extra hands/limbs, \
+             melted faces, garbled text), add a final line 'DEFECT: <what>'. Otherwise add 'OK'.",
+        );
+
+    // Load the image bytes (remote URL or local path) and build a data URL.
+    let bytes: Vec<u8> = if image.starts_with("http://") || image.starts_with("https://") {
+        match reqwest::Client::new().get(&image).send().await {
+            Ok(r) => match r.bytes().await {
+                Ok(b) => b.to_vec(),
+                Err(e) => return fail(format!("could not read image body: {e}")),
+            },
+            Err(e) => return fail(format!("could not fetch image: {e}")),
+        }
+    } else {
+        match tokio::fs::read(&image).await {
+            Ok(b) => b,
+            Err(e) => return fail(format!("could not read file '{image}': {e}")),
+        }
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let data_url = format!("data:image/png;base64,{b64}");
+
+    let vision_url = std::env::var("HERA_VISION_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8083/v1/chat/completions".to_string());
+    let payload = serde_json::json!({
+        "model": "vision",
+        "max_tokens": 200,
+        "temperature": 0.0,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": question}
+            ]
+        }]
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return fail(format!("client build failed: {e}")),
+    };
+    match client.post(&vision_url).json(&payload).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(j) => {
+                let text = j["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if text.is_empty() {
+                    return fail("vision model returned an empty response".to_string());
+                }
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: text,
+                }
+            }
+            Err(e) => fail(format!("could not parse vision response: {e}")),
+        },
+        Err(e) => fail(format!("vision request failed (is vision-review up @ {vision_url}?): {e}")),
+    }
+}

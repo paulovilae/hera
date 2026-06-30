@@ -24,7 +24,6 @@ base64 = "0.22.1"
 rand = "0.9"
 ta = "0.5.0"
 chrono = "0.4.44"
-lopdf = "0.39.0"
 hera-web = { path = "../hera-web", optional = true }
 hera-docs = { path = "../hera-docs", optional = true }
 hera-vector = { path = "../hera-vector", optional = true }
