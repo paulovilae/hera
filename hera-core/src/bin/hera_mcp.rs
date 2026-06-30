@@ -38,9 +38,10 @@ struct GenerateTextParams {
 struct ExecuteToolParams {
     #[schemars(description = "Exact Hera tool name")]
     name: String,
-    #[schemars(description = "JSON arguments object to pass to the tool")]
+    // HashMap forces schemars to emit type:object so MCP clients serialize correctly.
+    #[schemars(description = "Arguments to pass to the tool (key-value pairs)")]
     #[serde(default)]
-    arguments: serde_json::Value,
+    arguments: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -147,7 +148,7 @@ impl HeraMcp {
     async fn execute_tool(&self, Parameters(params): Parameters<ExecuteToolParams>) -> String {
         let call = ToolCall {
             name: params.name,
-            arguments: params.arguments,
+            arguments: serde_json::Value::Object(params.arguments.into_iter().collect()),
         };
         let result = execute_tool(&call).await;
         result.output
