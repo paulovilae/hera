@@ -303,36 +303,114 @@ fn normalized_agreement_blocks(content: &str) -> Vec<String> {
     blocks
 }
 
+fn shared_secret() -> Option<String> {
+    let path = std::env::var("OS_AUTH_SHARED_SECRET_FILE").unwrap_or_else(|_| {
+        "/home/paulo/.config/imagineos/secrets/os-auth-shared-secret".to_string()
+    });
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
 pub(crate) async fn execute_dispatch_email(call: &ToolCall) -> ToolResult {
     let recipient = call
         .arguments
         .get("recipient")
         .and_then(|c| c.as_str())
-        .unwrap_or("unknown");
+        .unwrap_or("");
     let subject = call
         .arguments
         .get("subject")
         .and_then(|c| c.as_str())
         .unwrap_or("");
-    let attachment = call
+    let body = call
         .arguments
-        .get("attachment_path")
+        .get("body")
         .and_then(|c| c.as_str())
-        .unwrap_or("None");
+        .unwrap_or("");
 
-    // Simulate sending email via local sendmail or SMTP (For OS-v3 Demo mode)
+    if recipient.is_empty() || subject.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing required fields: recipient and subject are required".to_string(),
+        };
+    }
+
+    let Some(secret) = shared_secret() else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "No pude leer el secret compartido (OS_AUTH_SHARED_SECRET_FILE).".to_string(),
+        };
+    };
+
+    let payload = serde_json::json!({
+        "app_slug": "hera",
+        "to": recipient,
+        "subject": subject,
+        "body": body,
+    });
+
     info!(
-        "📧 [Hera] Dispatching Email to: {} | Subject: {} | Attachment: {}",
-        recipient, subject, attachment
+        "📧 [Hera] Dispatching Email to: {} | Subject: {}",
+        recipient, subject
     );
 
-    ToolResult {
-        name: call.name.clone(),
-        success: true,
-        output: format!(
-            "Email successfully dispatched via port 25 relay to {}.",
-            recipient
-        ),
+    let client = reqwest::Client::new();
+    let url = "http://127.0.0.1:5177/api/platform/email/send";
+
+    match client
+        .post(url)
+        .header("x-os-service-token", secret)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            let log_id = json
+                                .get("data")
+                                .and_then(|d| d.get("log_id"))
+                                .and_then(|l| l.as_str())
+                                .unwrap_or("unknown");
+                            ToolResult {
+                                name: call.name.clone(),
+                                success: true,
+                                output: format!("Email sent successfully. Log ID: {}", log_id),
+                            }
+                        } else {
+                            let err = json
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("Unknown error");
+                            ToolResult {
+                                name: call.name.clone(),
+                                success: false,
+                                output: format!("Email send failed: {}", err),
+                            }
+                        }
+                    }
+                    Err(e) => ToolResult {
+                        name: call.name.clone(),
+                        success: false,
+                        output: format!("Failed to parse response: {}", e),
+                    },
+                }
+            } else {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("HTTP error: {}", resp.status()),
+                }
+            }
+        }
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Failed to send HTTP request: {}", e),
+        },
     }
 }
 

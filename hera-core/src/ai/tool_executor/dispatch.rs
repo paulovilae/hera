@@ -3,8 +3,8 @@
 use serde_json::Value;
 
 use crate::ai::tools::{
-    apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding, data, geo,
-    infra_health, infra_smoke, mission_control, platform, productivity, storage,
+    apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding, data, email_imap,
+    geo, infra_health, infra_smoke, mission_control, platform, productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -130,6 +130,7 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "mc_add_wishlist" => mission_control::execute_mc_add_wishlist(call).await,
         "mc_set_objective" => mission_control::execute_mc_set_objective(call).await,
         "generate_image" | "hera_draw" => platform::execute_draw(call).await,
+        "review_image" | "describe_image" => platform::execute_review_image(call).await,
         "animate_avatar" => platform::execute_animate_avatar(call).await,
         "hera_search" => platform::execute_search(call).await,
         "geocode" => geo::execute_geocode(call).await,
@@ -160,8 +161,14 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "desktop_type" => platform::execute_desktop_type(call).await,
         "edit_app_theme" => platform::execute_edit_app_theme(call).await,
         "read_email" => productivity::execute_read_email(call).await,
+        "reply_email" => email_imap::execute_reply_email(call).await,
+        "mark_read" => email_imap::execute_mark_read(call).await,
+        "move_email" => email_imap::execute_move_email(call).await,
+        "delete_email" => email_imap::execute_delete_email(call).await,
         "list_calendar_events" => productivity::execute_list_calendar_events(call).await,
         "read_notes" => productivity::execute_read_notes(call).await,
+        "list_image_loras" => platform::execute_list_image_loras(call).await,
+        "corporate_research" => platform::execute_corporate_research(call).await,
         _ => return None,
     };
     Some(result)
@@ -232,6 +239,8 @@ async fn dispatch_data_tool(call: &ToolCall) -> Option<ToolResult> {
         "memento_vector_search" => data::execute_memento_vector_search(call).await,
         "save_memory" => productivity::execute_save_memory(call).await,
         "query_memory" => productivity::execute_query_memory(call).await,
+        "recall_session_context" => productivity::execute_recall_session_context(call).await,
+        "document_to_text" => productivity::execute_document_to_text(call).await,
         _ => return None,
     };
     Some(result)

@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 use crate::ai::tool_executor::{ToolCall, ToolResult};
 
 const MEMENTO_SOCK: &str = "/tmp/memento.sock";
-const IMAP_CONF: &str = "/home/paulo/.config/imagineos/secrets/imap.conf";
+pub(crate) const IMAP_CONF: &str = "/home/paulo/.config/imagineos/secrets/imap.conf";
 const CALENDAR_CONF: &str = "/home/paulo/.config/imagineos/secrets/calendar.conf";
 const NOTES_DIR: &str = "/home/paulo/Notes";
 
@@ -32,6 +32,56 @@ async fn memento_send(action: &str, payload: Value) -> Result<Value, String> {
         .map_err(|e| format!("Memento read error: {}", e))?;
 
     serde_json::from_slice(&buf).map_err(|e| format!("Memento parse error: {}", e))
+}
+
+// ─── document_to_text ──────────────────────────────────────────────────────
+// Conversor de documentos: Hera EXPONE el tool, pero el trabajo lo hace Memento (dueño de la
+// ingesta de conocimiento). REGLA DE PLATAFORMA: se manda la UBICACIÓN, no el archivo. Reenvía a la
+// acción IPC `extract_text {path}` de Memento y devuelve el texto extraído.
+
+pub(crate) async fn execute_document_to_text(call: &ToolCall) -> ToolResult {
+    let path = match call.arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+        _ => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: "Missing 'path' argument".to_string(),
+            }
+        }
+    };
+
+    match memento_send("extract_text", serde_json::json!({ "path": path })).await {
+        Ok(resp) => {
+            if let Some(e) = resp.get("error").and_then(|v| v.as_str()) {
+                return ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("extract_text: {e}"),
+                };
+            }
+            let text = resp.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let source_type = resp.get("source_type").and_then(|v| v.as_str()).unwrap_or("text");
+            if text.is_empty() {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: "El documento no tiene texto extraíble (¿escaneado o vacío?).".to_string(),
+                }
+            } else {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: format!("[{source_type}]\n{text}"),
+                }
+            }
+        }
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("Memento no disponible: {e}"),
+        },
+    }
 }
 
 // ─── save_memory ─────────────────────────────────────────────────────────
@@ -260,6 +310,132 @@ fn format_memory_results(call: &ToolCall, res: Value) -> ToolResult {
     }
 }
 
+// ─── recall_session_context ───────────────────────────────────────────────
+
+pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResult {
+    let app_id = call
+        .arguments
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ava")
+        .to_string();
+
+    let session_id = call
+        .arguments
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let focus = call
+        .arguments
+        .get("focus")
+        .and_then(|v| v.as_str())
+        .unwrap_or("full")
+        .to_string();
+
+    let mut payload = serde_json::json!({
+        "user_id": "paulo",
+        "app_id": app_id
+    });
+    if let Some(sid) = session_id {
+        payload["session_id"] = Value::String(sid);
+    }
+
+    info!(
+        "[Productivity] recall_session_context app='{}' focus='{}'",
+        app_id, focus
+    );
+
+    match memento_send("recall_recursive_context", payload).await {
+        Ok(res) => {
+            let mut parts: Vec<String> = Vec::new();
+
+            // Durable facts — highest signal, always shown
+            if let Some(facts) = res.get("durable_facts").and_then(|v| v.as_array()) {
+                if !facts.is_empty() {
+                    let lines: Vec<String> = facts
+                        .iter()
+                        .filter_map(|f| {
+                            let content = f.get("content").and_then(|v| v.as_str())?;
+                            let title = f
+                                .get("entry_title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            Some(if title.is_empty() {
+                                format!("• {}", content)
+                            } else {
+                                format!("• [{}] {}", title, content)
+                            })
+                        })
+                        .collect();
+                    parts.push(format!("## Durable facts\n{}", lines.join("\n")));
+                }
+            }
+
+            // Recent events — shown for "full" and "recent"
+            if focus != "decisions" {
+                if let Some(events) = res.get("recent_events").and_then(|v| v.as_array()) {
+                    let shown: Vec<String> = events
+                        .iter()
+                        .take(8)
+                        .filter_map(|e| {
+                            let content = e.get("content").and_then(|v| v.as_str())?;
+                            let ts = e
+                                .get("timestamp")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            Some(format!("• {} ({})", &content[..content.len().min(120)], &ts[..ts.len().min(10)]))
+                        })
+                        .collect();
+                    if !shown.is_empty() {
+                        parts.push(format!("## Recent events\n{}", shown.join("\n")));
+                    }
+                }
+            }
+
+            // Session/project summaries — only for "full"
+            if focus == "full" {
+                for key in &["project_summaries", "room_summaries", "session_summaries"] {
+                    if let Some(summaries) = res.get(key).and_then(|v| v.as_array()) {
+                        if let Some(latest) = summaries.last() {
+                            if let Some(content) = latest.get("content").and_then(|v| v.as_str()) {
+                                let label = key.replace('_', " ");
+                                parts.push(format!(
+                                    "## {}\n{}",
+                                    label,
+                                    &content[..content.len().min(400)]
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if parts.is_empty() {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: format!("No prior context found for app='{}'.", app_id),
+                }
+            } else {
+                ToolResult {
+                    name: call.name.clone(),
+                    success: true,
+                    output: parts.join("\n\n"),
+                }
+            }
+        }
+        Err(e) => {
+            warn!("recall_session_context failed: {}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Memento recall failed: {}", e),
+            }
+        }
+    }
+}
+
 // ─── read_email ───────────────────────────────────────────────────────────
 
 pub(crate) async fn execute_read_email(call: &ToolCall) -> ToolResult {
@@ -394,11 +570,12 @@ try:
         for part in msg_data:
             if isinstance(part, tuple):
                 msg = email.message_from_bytes(part[1])
+                msg_id = msg.get('Message-ID', '')
                 subject = decode_str(msg.get('Subject', '(no subject)'))
                 from_ = decode_str(msg.get('From', ''))
                 date_ = msg.get('Date', '')
                 body = get_body(msg)
-                results.append(f"From: {from_}\nSubject: {subject}\nDate: {date_}\n{body[:300]}\n---")
+                results.append(f"UID: {uid.decode()}\nMessageID: {msg_id}\nFrom: {from_}\nSubject: {subject}\nDate: {date_}\n{body[:300]}\n---")
     mail.logout()
     print('\n'.join(results) if results else 'No messages found.')
 except Exception as e:
@@ -719,7 +896,7 @@ pub(crate) async fn execute_read_notes(call: &ToolCall) -> ToolResult {
 
 // ─── Python execution helper ──────────────────────────────────────────────
 
-async fn run_python_with_env(tool_name: &str, script: &str, env: &[(&str, &str)]) -> ToolResult {
+pub(crate) async fn run_python_with_env(tool_name: &str, script: &str, env: &[(&str, &str)]) -> ToolResult {
     let mut cmd = tokio::process::Command::new("python3");
     cmd.arg("-c").arg(script);
     for (k, v) in env {
