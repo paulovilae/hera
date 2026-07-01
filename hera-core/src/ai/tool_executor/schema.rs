@@ -25,9 +25,21 @@ pub struct AgentArtifact {
     pub persona: String,
 }
 
-fn parse_tool_artifact(path: &Path) -> Option<ToolArtifact> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut schema = serde_json::from_str::<Value>(&content).ok()?;
+/// `Ok(None)` means "valid JSON, but not a tool schema" (e.g. Vetra's contract templates
+/// living alongside real tools under `Tools/apps/<app>/`) — distinct from `Err(())`, a
+/// genuine read/parse failure. Conflating the two used to make every non-tool JSON in a
+/// tools dir default to `consumers = ["all"]` (line below) and leak into every caller's
+/// tool list regardless of `permissions`.
+fn parse_tool_artifact(path: &Path) -> Result<Option<ToolArtifact>, ()> {
+    let content = std::fs::read_to_string(path).map_err(|_| ())?;
+    let mut schema = serde_json::from_str::<Value>(&content).map_err(|_| ())?;
+
+    let looks_like_tool = schema.get("type").and_then(|v| v.as_str()) == Some("function")
+        && schema.get("function").and_then(|f| f.get("name")).is_some();
+    if !looks_like_tool {
+        return Ok(None);
+    }
+
     let consumers = schema
         .get("metadata")
         .and_then(|metadata| metadata.get("consumers"))
@@ -50,11 +62,11 @@ fn parse_tool_artifact(path: &Path) -> Option<ToolArtifact> {
         obj.remove("metadata");
     }
 
-    Some(ToolArtifact {
+    Ok(Some(ToolArtifact {
         schema,
         consumers,
         is_skeleton,
-    })
+    }))
 }
 
 fn collect_tool_schemas_from_dir(dir: &Path, tools: &mut Vec<Value>, agent_name: &str) {
@@ -75,13 +87,13 @@ fn collect_tool_schemas_from_dir(dir: &Path, tools: &mut Vec<Value>, agent_name:
             }
 
             match parse_tool_artifact(&entry_path) {
-                Some(artifact) if artifact.is_skeleton => {
+                Ok(Some(artifact)) if artifact.is_skeleton => {
                     tracing::debug!(
                         "Skipping skeleton_not_implemented tool: {:?}",
                         entry_path
                     );
                 }
-                Some(artifact) => {
+                Ok(Some(artifact)) => {
                     let allowed = artifact
                         .consumers
                         .iter()
@@ -95,7 +107,10 @@ fn collect_tool_schemas_from_dir(dir: &Path, tools: &mut Vec<Value>, agent_name:
                         );
                     }
                 }
-                None => {
+                Ok(None) => {
+                    tracing::debug!("Skipping non-tool JSON artifact: {:?}", entry_path);
+                }
+                Err(()) => {
                     eprintln!("Warning: Failed to parse tool JSON at {:?}", entry_path);
                 }
             }
