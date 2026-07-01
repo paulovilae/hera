@@ -8,8 +8,13 @@ edition = "2024"
 # (llama-server / candle-server) via HERA_PRIMARY_OMNI_URL and friends.
 # Single binary deploys to all nodes regardless of GPU presence.
 default = ["vision", "audio", "desktop-control", "execution-tools"]
-# Opt-in feature for edge nodes that need local inference (requires CUDA at runtime).
-local-llm = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:hf-hub", "dep:tokenizers", "dep:hound", "dep:llama-cpp-2"]
+# Local sentence embeddings (candle BERT on CPU). Compiles on any node — no CUDA.
+# Used for semantic memory recall and difficulty gray-zone tiebreak.
+embeddings = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:hf-hub", "dep:tokenizers"]
+# GPU acceleration for candle + llama.cpp. Opt-in; requires CUDA at runtime.
+cuda = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda", "llama-cpp-2/cuda"]
+# Full local inference (GPU nodes): embeddings + GPU + llama.cpp engine.
+local-llm = ["embeddings", "cuda", "dep:hound", "dep:llama-cpp-2"]
 vision = []
 audio = []
 desktop-control = []
@@ -35,10 +40,11 @@ async-trait = "0.1.86"
 hera-execution = { path = "../hera-execution", optional = true }
 hera-web = { path = "../hera-web" }
 
-# Native AI Execution Engine — optional, gated on local-llm feature
-candle-core = { version = "0.9.2", features = ["cuda"], optional = true }
-candle-transformers = { version = "0.9.2", features = ["cuda"], optional = true }
-candle-nn = { version = "0.9.2", features = ["cuda"], optional = true }
+# Native AI Execution Engine — optional. CUDA is opt-in via the `cuda` feature
+# so the `embeddings` feature can build candle on CPU-only nodes (e.g. anchor).
+candle-core = { version = "0.9.2", optional = true }
+candle-transformers = { version = "0.9.2", optional = true }
+candle-nn = { version = "0.9.2", optional = true }
 hf-hub = { version = "0.5.0", optional = true }
 tokenizers = { version = "0.22.2", features = ["http"], optional = true }
 image = "0.25.9"
@@ -46,7 +52,7 @@ anyhow = "1.0.102"
 hound = { version = "3.5.1", optional = true }
 byteorder = "1.5.0"
 bytes = "1.11.1"
-llama-cpp-2 = { version = "0.1.138", default-features = false, features = ["cuda"], optional = true }
+llama-cpp-2 = { version = "0.1.138", default-features = false, optional = true }
 encoding_rs = "0.8.35"
 calamine = "0.34.0"
 genpdf = "0.2.0"

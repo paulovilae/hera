@@ -1,4 +1,10 @@
 //! Platform tool executors: desktop, draw, search, speak, video, files, agents, skills, soul, user interaction
+pub(crate) mod code;
+pub(crate) mod media;
+
+pub(crate) use code::{execute_run_code, execute_write_file};
+pub(crate) use media::{execute_draw, execute_animate_avatar, execute_speak, execute_video, execute_review_image};
+
 use crate::ai::tool_executor::{ToolCall, ToolResult, find_skill_artifact, load_agent_artifact};
 use hera_execution::agents::hera::Hera;
 use serde_json::json;
@@ -14,7 +20,7 @@ const HOME_ROOT: &str = "/home/paulo";
 const TMP_ROOT: &str = "/tmp";
 const SMARTOS_ROUTER_URL: &str = "http://127.0.0.1:3000";
 
-fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<PathBuf, String> {
+pub(crate) fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<PathBuf, String> {
     let raw = Path::new(path);
     let candidate = if raw.exists() {
         std::fs::canonicalize(raw).map_err(|e| format!("Failed to resolve path: {}", e))?
@@ -106,7 +112,7 @@ fn parse_ipc_result(response: &str) -> Result<String, String> {
     }
 }
 
-fn hera_execution_agent() -> Hera {
+pub(super) fn hera_execution_agent() -> Hera {
     Hera::new(SMARTOS_ROUTER_URL)
 }
 
@@ -609,63 +615,6 @@ pub(crate) async fn execute_create_skill(call: &ToolCall) -> ToolResult {
     }
 }
 
-pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
-    let prompt = call
-        .arguments
-        .get("prompt")
-        .and_then(|p| p.as_str())
-        .unwrap_or("A beautiful digital artwork");
-    let width = call
-        .arguments
-        .get("width")
-        .and_then(|w| w.as_u64())
-        .map(|w| w as u32);
-    let height = call
-        .arguments
-        .get("height")
-        .and_then(|h| h.as_u64())
-        .map(|h| h as u32);
-
-    let hera = hera_execution_agent();
-    match hera
-        .generate_image(
-            prompt, None, width, height, None, None, None, None, None, None, None,
-        )
-        .await
-    {
-        Ok(res) => {
-            let image_url = res
-                .get("image_url")
-                .and_then(|u| u.as_str())
-                .unwrap_or("(no URL)");
-            info!("🎨 [Hera] Image generated: {}", image_url);
-
-            // Build a public URL that candle-core serves at /outputs/{filename}
-            // The filename is the last segment of image_url (e.g., "/outputs/hera_drawn_UUID.png")
-            let filename = image_url.split('/').next_back().unwrap_or(image_url);
-            let public_url = format!("https://imaginos.ai/outputs/{}", filename);
-            let response = format!(
-                "Image generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the image is delivered inline.",
-                public_url
-            );
-
-            ToolResult {
-                name: call.name.clone(),
-                success: true,
-                output: response,
-            }
-        }
-        Err(e) => {
-            tracing::error!("🎨 [Hera] Image generation failed: {:?}", e);
-            ToolResult {
-                name: call.name.clone(),
-                success: false,
-                output: format!("Image generation failed: {}", e),
-            }
-        }
-    }
-}
-
 pub(crate) async fn execute_search(call: &ToolCall) -> ToolResult {
     let query = call
         .arguments
@@ -686,63 +635,6 @@ pub(crate) async fn execute_search(call: &ToolCall) -> ToolResult {
             name: call.name.clone(),
             success: false,
             output: format!("Search failed: {}", e),
-        },
-    }
-}
-
-pub(crate) async fn execute_speak(call: &ToolCall) -> ToolResult {
-    let text = call
-        .arguments
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    let voice = call.arguments.get("voice").and_then(|v| v.as_str());
-
-    let hera = hera_execution_agent();
-    match hera.synthesize_speech(text, voice).await {
-        Ok(result) => {
-            info!("🔊 [Hera] Speech synthesized");
-            ToolResult {
-                name: call.name.clone(),
-                success: true,
-                output: format!(
-                    "Speech generated successfully: {}",
-                    serde_json::to_string(&result).unwrap_or_default()
-                ),
-            }
-        }
-        Err(e) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: format!("TTS failed: {}", e),
-        },
-    }
-}
-
-pub(crate) async fn execute_video(call: &ToolCall) -> ToolResult {
-    let prompt = call
-        .arguments
-        .get("prompt")
-        .and_then(|p| p.as_str())
-        .unwrap_or("A smooth cinematic video");
-
-    let hera = hera_execution_agent();
-    match hera.synthesize_video(prompt).await {
-        Ok(result) => {
-            info!("🎬 [Hera] Video generated");
-            ToolResult {
-                name: call.name.clone(),
-                success: true,
-                output: format!(
-                    "Video generated successfully: {}",
-                    serde_json::to_string(&result).unwrap_or_default()
-                ),
-            }
-        }
-        Err(e) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: format!("Video generation failed: {}", e),
         },
     }
 }
@@ -859,296 +751,6 @@ pub(crate) async fn execute_get_system_time(call: &ToolCall) -> ToolResult {
     }
 }
 
-pub(crate) async fn execute_run_code(call: &ToolCall) -> ToolResult {
-    let lang = call
-        .arguments
-        .get("language")
-        .and_then(|l| l.as_str())
-        .unwrap_or("python");
-    let code = call
-        .arguments
-        .get("code")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    let packages: Vec<String> = call
-        .arguments
-        .get("packages")
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if code.trim().is_empty() {
-        return ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: "Missing code payload.".to_string(),
-        };
-    }
-    if code.len() > 100_000 {
-        return ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: "Code payload too large. Limit is 100000 bytes.".to_string(),
-        };
-    }
-    if packages.len() > 16
-        || packages
-            .iter()
-            .any(|pkg| !validate_python_package_name(pkg))
-    {
-        return ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: "Package list contains invalid names or exceeds the maximum allowed count."
-                .to_string(),
-        };
-    }
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let bean_name = format!("bean_{}", timestamp);
-    let beans_dir = "/home/paulo/Programs/apps/OS/Beans";
-    let _ = std::fs::create_dir_all(beans_dir);
-
-    // Cognitive Memory Pipeline: Record bean logic into Memento universally before execution
-    // Doing it natively blocking here; socket is fast UDS.
-    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect("/tmp/memento.sock") {
-        use std::io::Write;
-        let payload = serde_json::json!({
-            "action": "store_knowledge",
-            "payload": {
-                "key": bean_name.clone(),
-                "content": format!("Language: {}\nPackages: {:?}\nCode:\n{}", lang, packages, code),
-                "tags": "bean, code_interpreter"
-            },
-            "client": {
-                "app": "hera",
-                "token": std::env::var("MEMENTO_CLIENT_TOKEN").ok()
-            }
-        });
-        let _ = stream.write_all(payload.to_string().as_bytes());
-    }
-
-    if lang.to_lowercase() == "rust" {
-        let project_dir = format!("{}/{}", beans_dir, bean_name);
-        if let Err(e) = std::fs::create_dir_all(format!("{}/src", project_dir)) {
-            return ToolResult {
-                name: call.name.clone(),
-                success: false,
-                output: format!("Failed to create Rust bean directory: {}", e),
-            };
-        }
-
-        let mut deps = r#"[dependencies]
-tokio = { version = "1", features = ["full", "rt-multi-thread"] }
-reqwest = { version = "0.11", features = ["json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-"#
-        .to_string();
-        for pkg in &packages {
-            deps.push_str(&format!("{} = \"*\"\n", pkg));
-        }
-
-        let cargo_toml = format!(
-            r#"[package]
-name = "{}"
-version = "0.1.0"
-edition = "2021"
-
-{}
-"#,
-            bean_name, deps
-        );
-
-        std::fs::write(format!("{}/Cargo.toml", project_dir), cargo_toml).unwrap_or_default();
-        std::fs::write(format!("{}/src/main.rs", project_dir), code).unwrap_or_default();
-
-        match std::process::Command::new("cargo")
-            .arg("run")
-            .arg("--release")
-            .current_dir(&project_dir)
-            .output()
-        {
-            Ok(out) => {
-                let out_str = String::from_utf8_lossy(&out.stdout).to_string();
-                let err_str = String::from_utf8_lossy(&out.stderr).to_string();
-                let success = out.status.success();
-
-                let mut final_out =
-                    format!("RUST ROASTED BEAN EXECUTION:\n---\nSTDOUT:\n{}\n", out_str);
-                if !success || !err_str.is_empty() {
-                    final_out.push_str(&format!(
-                        "---\nSTDERR (or cargo compilation logs):\n{}\n",
-                        err_str
-                    ));
-                }
-                final_out.push_str(&format!(
-                    "---\nBean saved permanently in {} and recorded in Memento.",
-                    project_dir
-                ));
-
-                ToolResult {
-                    name: call.name.clone(),
-                    success,
-                    output: final_out,
-                }
-            }
-            Err(e) => ToolResult {
-                name: call.name.clone(),
-                success: false,
-                output: format!("Cargo execution failed: {}", e),
-            },
-        }
-    } else if lang.to_lowercase() == "python" {
-        // Sanitize LLM-generated code: strip single spurious leading spaces.
-        // Local models occasionally emit lines with exactly 1 leading space on
-        // what should be top-level statements (e.g. " y = np.sin(x)").
-        // Real Python indentation uses 2+ spaces; 1-space is almost always an LLM error.
-        let sanitized: String = code
-            .lines()
-            .map(|line| {
-                if line.starts_with(' ') && !line.starts_with("  ") {
-                    line.trim_start_matches(' ')
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let p = format!("{}/{}.py", beans_dir, bean_name);
-        if let Err(e) = std::fs::write(&p, &sanitized) {
-            return ToolResult {
-                name: call.name.clone(),
-                success: false,
-                output: format!("Failed to write Python bean: {}", e),
-            };
-        }
-
-        let mut pip_log = String::new();
-        if !packages.is_empty() {
-            let mut cmd = std::process::Command::new("python3");
-            cmd.arg("-m")
-                .arg("pip")
-                .arg("install")
-                .arg("--user")
-                .arg("--break-system-packages")
-                .arg("--quiet");
-            for pkg in &packages {
-                cmd.arg(pkg);
-            }
-            match cmd.output() {
-                Ok(out) if out.status.success() => {
-                    pip_log = format!("Installed: {:?}", packages);
-                }
-                Ok(out) => {
-                    // PEP 668 or already-installed: warn but still run the code.
-                    // The package may already be available; don't abort.
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    pip_log = format!(
-                        "pip warning (code still runs): {}",
-                        err.lines().next().unwrap_or("non-zero exit")
-                    );
-                }
-                Err(e) => {
-                    pip_log = format!("pip unavailable ({}), proceeding anyway", e);
-                }
-            }
-        }
-
-        match std::process::Command::new("python3").arg(&p).output() {
-            Ok(out) => {
-                let out_str = String::from_utf8_lossy(&out.stdout).to_string();
-                let err_str = String::from_utf8_lossy(&out.stderr).to_string();
-                let success = out.status.success();
-                let mut res = if success {
-                    if err_str.trim().is_empty() {
-                        out_str
-                    } else {
-                        format!("STDOUT:\n{}\n---\nSTDERR:\n{}", out_str, err_str)
-                    }
-                } else {
-                    format!("PYTHON SOFT BEAN ERROR:\n{}\n{}", err_str, out_str)
-                };
-                if !pip_log.is_empty() {
-                    res = format!("{}\n---\n{}", pip_log, res);
-                }
-                res = format!(
-                    "{}\n---\nBean saved permanently at {} and logged in Memento.",
-                    res, p
-                );
-                ToolResult {
-                    name: call.name.clone(),
-                    success,
-                    output: res,
-                }
-            }
-            Err(e) => ToolResult {
-                name: call.name.clone(),
-                success: false,
-                output: e.to_string(),
-            },
-        }
-    } else {
-        ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: format!("Language '{}' not supported. Use 'rust' or 'python'.", lang),
-        }
-    }
-}
-
-pub(crate) async fn execute_write_file(call: &ToolCall) -> ToolResult {
-    let path = call
-        .arguments
-        .get("path")
-        .and_then(|p| p.as_str())
-        .unwrap_or("");
-    let content = call
-        .arguments
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-
-    if path.is_empty() {
-        return ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: "Missing path".into(),
-        };
-    }
-
-    let resolved_path = match resolve_guarded_fs_path(path, true) {
-        Ok(path) => path,
-        Err(error) => {
-            return ToolResult {
-                name: call.name.clone(),
-                success: false,
-                output: error,
-            };
-        }
-    };
-
-    match std::fs::write(&resolved_path, content) {
-        Ok(_) => ToolResult {
-            name: call.name.clone(),
-            success: true,
-            output: format!("Successfully wrote to {}", resolved_path.display()),
-        },
-        Err(e) => ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: format!("Failed to write file: {}", e),
-        },
-    }
-}
-
 pub(crate) async fn execute_web_scraper(call: &ToolCall) -> ToolResult {
     let url = call
         .arguments
@@ -1172,22 +774,14 @@ pub(crate) async fn execute_web_scraper(call: &ToolCall) -> ToolResult {
             };
         }
     };
-    let Some(host) = parsed_url.host_str() else {
+    // Validacion SSRF UNIFICADA con data.rs: valida esquema + host prohibido +
+    // resuelve el DNS y comprueba TODAS las IPs (cierra DNS rebinding a IP interna /
+    // metadata de GCP). Reemplaza el blocklist debil por-string anterior.
+    if let Err(error) = crate::ai::tools::data::validate_outbound_url(parsed_url.as_str()).await {
         return ToolResult {
             name: call.name.clone(),
             success: false,
-            output: "URL must include a hostname.".to_string(),
-        };
-    };
-    if matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("169.254.")
-    {
-        return ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: format!("Blocked scraping private or loopback host '{}'.", host),
+            output: error,
         };
     }
 
@@ -1324,6 +918,309 @@ pub(crate) async fn execute_generate_access_link(call: &ToolCall) -> ToolResult 
             success: false,
             output: format!("Could not reach OS-v3: {}", e),
         },
+    }
+}
+
+// ── list_image_loras ──────────────────────────────────────────────────────────
+// Reads available LoRAs from the local triggers.json + lora_weights.json files,
+// or from the sd.cpp /sdapi/v1/loras endpoint if the image server is reachable.
+// Falls back gracefully to the file-based list; always returns something useful.
+pub(crate) async fn execute_list_image_loras(call: &ToolCall) -> ToolResult {
+    let loras_dir = std::env::var("HERA_LORAS_DIR")
+        .unwrap_or_else(|_| "/home/paulo/models/image-stack/loras".to_string());
+
+    let triggers_path = format!("{}/triggers.json", loras_dir);
+    let weights_path = format!("{}/lora_weights.json", loras_dir);
+
+    // Try loading triggers.json (lora_name -> [keyword, ...])
+    let triggers: std::collections::HashMap<String, Vec<String>> =
+        std::fs::read_to_string(&triggers_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+
+    let weights: std::collections::HashMap<String, f32> =
+        std::fs::read_to_string(&weights_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+
+    if !triggers.is_empty() {
+        // Build list from local files
+        let mut lines: Vec<String> = triggers
+            .iter()
+            .map(|(name, keywords)| {
+                let weight = weights.get(name).copied().unwrap_or(0.7);
+                let trigger_str = keywords.join(", ");
+                format!("- **{}** (weight: {:.2}) — triggers: {}", name, weight, trigger_str)
+            })
+            .collect();
+        lines.sort();
+
+        info!("[Hera] list_image_loras: {} LoRAs from local files", lines.len());
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!(
+                "Available LoRAs ({} total):\n{}\n\nTo use a LoRA explicitly: `<lora:name:weight>` in your prompt.",
+                lines.len(),
+                lines.join("\n")
+            ),
+        };
+    }
+
+    // No local files — try sd.cpp REST endpoint
+    let draw_base = std::env::var("HERA_DRAW_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string());
+    let endpoint = format!("{}/sdapi/v1/loras", draw_base);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    match client.get(&endpoint).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    let entries = json.as_array().cloned().unwrap_or_default();
+                    let lines: Vec<String> = entries
+                        .iter()
+                        .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+                        .map(|name| format!("- **{}**", name))
+                        .collect();
+                    ToolResult {
+                        name: call.name.clone(),
+                        success: true,
+                        output: format!("Available LoRAs ({} total):\n{}", lines.len(), lines.join("\n")),
+                    }
+                }
+                Err(_) => ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: "Image server responded but returned invalid JSON for /sdapi/v1/loras".to_string(),
+                },
+            }
+        }
+        _ => {
+            // Hardcoded baseline when nothing else is available
+            let baseline = vec![
+                "- **flux-schnell-q4** (weight: 1.00) — triggers: fast, quick draft, sketch",
+                "- **realistic_vision** (weight: 0.70) — triggers: realistic, photo, portrait, photography",
+            ];
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "LoRA list unavailable (image server offline, no local triggers.json). Known baseline LoRAs:\n{}",
+                    baseline.join("\n")
+                ),
+            }
+        }
+    }
+}
+
+// ── corporate_research ────────────────────────────────────────────────────────
+// Multi-phase corporate dossier tool:
+//   1. Four parallel web searches (profile, market, competitors, ESG).
+//   2. Assembles a raw research dossier from the results.
+//   3. Synthesizes a structured McKinsey-style JSON report via Hera IPC.
+pub(crate) async fn execute_corporate_research(call: &ToolCall) -> ToolResult {
+    let entity = match call.arguments.get("entity").and_then(|v| v.as_str()) {
+        Some(e) if !e.trim().is_empty() => e.trim().to_string(),
+        _ => {
+            return ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: "Missing required argument: 'entity' (company name to research)".to_string(),
+            };
+        }
+    };
+
+    let depth = call
+        .arguments
+        .get("depth")
+        .and_then(|v| v.as_str())
+        .unwrap_or("standard");
+
+    let lang = call
+        .arguments
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("es");
+
+    // Build search queries based on depth and language
+    let queries: Vec<String> = if lang == "en" {
+        vec![
+            format!("{} company profile history founder products services", entity),
+            format!("{} industry market size growth trends", entity),
+            format!("{} main competitors market share competitive advantage", entity),
+            format!("{} ESG sustainability governance shareholders ownership structure", entity),
+        ]
+    } else {
+        vec![
+            format!("{} empresa perfil corporativo historia fundador productos servicios", entity),
+            format!("{} industria mercado tamaño crecimiento tendencias", entity),
+            format!("{} competidores principales cuota mercado rivales ventaja competitiva", entity),
+            format!("{} ESG sostenibilidad gobernanza accionistas estructura propiedad", entity),
+        ]
+    };
+
+    // Limit queries for 'quick' depth
+    let active_queries: Vec<&String> = match depth {
+        "quick" => queries.iter().take(2).collect(),
+        _ => queries.iter().collect(),
+    };
+
+    info!(
+        "[Hera] corporate_research: researching '{}' ({} queries, lang={})",
+        entity,
+        active_queries.len(),
+        lang
+    );
+
+    // Execute searches in parallel via native_web_search
+    let hera = hera_execution_agent();
+    let search_futures: Vec<_> = active_queries
+        .iter()
+        .map(|q| hera.native_web_search(q))
+        .collect();
+
+    let search_results = futures_util::future::join_all(search_futures).await;
+
+    // Assemble raw dossier from successful searches
+    let mut dossier_parts: Vec<String> = Vec::new();
+    let query_labels = ["PERFIL / PROFILE", "MERCADO / MARKET", "COMPETIDORES / COMPETITORS", "ESG / GOBERNANZA"];
+
+    for (i, result) in search_results.into_iter().enumerate() {
+        let label = query_labels.get(i).copied().unwrap_or("RESEARCH");
+        match result {
+            Ok(content) if !content.trim().is_empty() => {
+                dossier_parts.push(format!("## {}\n{}", label, content.trim()));
+            }
+            Ok(_) => {
+                dossier_parts.push(format!("## {}\n(No results found)", label));
+            }
+            Err(e) => {
+                dossier_parts.push(format!("## {}\n(Search error: {})", label, e));
+            }
+        }
+    }
+
+    if dossier_parts.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("All web searches failed for '{}'. Check hera_search availability.", entity),
+        };
+    }
+
+    let raw_dossier = dossier_parts.join("\n\n");
+
+    // LLM synthesis via Hera IPC — returns structured JSON report
+    let system_prompt = if lang == "en" {
+        format!(
+            "You are a Senior McKinsey strategic consultant. Based ONLY on the research dossier provided, \
+             generate a structured corporate profile for '{}' in JSON format with these keys: \
+             company_overview, industry_context, consulting_kpis (market_share_percent, year_over_year_growth, \
+             employee_count, revenue_estimate, geographic_reach), swot (strengths, weaknesses, opportunities, \
+             threats as arrays), competitors (array of {{name, advantage, risk}}), \
+             catalysts_and_news (recent_headlines array, executive_summary), history_background, \
+             ownership_structure, esg_outlook, investment_scores (growth, operations, leadership, market as 1-10 integers). \
+             DO NOT invent data. If a field is unknown, use null or an empty array.",
+            entity
+        )
+    } else {
+        format!(
+            "Eres un consultor estratégico Senior de McKinsey. Basándote ÚNICAMENTE en el dossier de investigación, \
+             genera un perfil corporativo estructurado en JSON para '{}' con estas claves: \
+             company_overview, industry_context, consulting_kpis (market_share_percent, year_over_year_growth, \
+             employee_count, revenue_estimate, geographic_reach), swot (strengths, weaknesses, opportunities, \
+             threats como arrays), competitors (array de {{name, advantage, risk}}), \
+             catalysts_and_news (recent_headlines array, executive_summary), history_background, \
+             ownership_structure, esg_outlook, investment_scores (growth, operations, leadership, market enteros 1-10). \
+             NO inventes datos. Si un campo es desconocido, usa null o array vacío.",
+            entity
+        )
+    };
+
+    let user_prompt = format!(
+        "Empresa a investigar: {}\n\nDOSSIER DE INVESTIGACIÓN:\n{}",
+        entity, raw_dossier
+    );
+
+    let mut stream = match UnixStream::connect(HERA_SOCKET).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Return raw dossier if IPC is unavailable
+            return ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Research dossier for '{entity}' (synthesis unavailable — Hera IPC error: {e}):\n\n{raw_dossier}"
+                ),
+            };
+        }
+    };
+
+    let ipc_request = json!({
+        "action": "generate",
+        "payload": {
+            "app": "hera",
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ],
+            "temperature": 0.15,
+            "max_tokens": 4096,
+            "permissions": [],
+            "response_format": { "type": "json_object" }
+        }
+    });
+
+    let payload = format!("{}\n", ipc_request);
+    if let Err(e) = stream.write_all(payload.as_bytes()).await {
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Research dossier for '{entity}' (synthesis write error: {e}):\n\n{raw_dossier}"),
+        };
+    }
+    if let Err(e) = stream.shutdown().await {
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Research dossier for '{entity}' (synthesis shutdown error: {e}):\n\n{raw_dossier}"),
+        };
+    }
+
+    let mut response = String::new();
+    if let Err(e) = stream.read_to_string(&mut response).await {
+        return ToolResult {
+            name: call.name.clone(),
+            success: true,
+            output: format!("Research dossier for '{entity}' (synthesis read error: {e}):\n\n{raw_dossier}"),
+        };
+    }
+
+    match parse_ipc_result(&response) {
+        Ok(synthesized) => {
+            info!("[Hera] corporate_research: synthesis complete for '{}'", entity);
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: synthesized,
+            }
+        }
+        Err(e) => {
+            // Synthesis failed — return the raw dossier so the call is still useful
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format!(
+                    "Research dossier for '{entity}' (synthesis error: {e}):\n\n{raw_dossier}"
+                ),
+            }
+        }
     }
 }
 

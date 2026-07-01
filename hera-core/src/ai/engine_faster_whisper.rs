@@ -11,18 +11,53 @@ pub struct FasterWhisperEngine {
     compute_type: Arc<String>,
 }
 
+/// Resolve the faster-whisper helper script robustly, independent of the process
+/// cwd. pm2 launches hera-core from `Hera/` (not `Hera/hera-core/`), so the old
+/// default `../hera-core/scripts/...` resolved to a nonexistent `OS/hera-core/scripts`
+/// and the STT backend silently failed to mount (the mic "didn't hear" anything).
+fn resolve_script_path() -> anyhow::Result<PathBuf> {
+    // 1. Explicit override always wins (use this on nodes where the repo lives at a
+    //    different path than the build node, e.g. a scp'd binary on anchor).
+    if let Ok(p) = std::env::var("HERA_FASTER_WHISPER_SCRIPT") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Ok(pb);
+        }
+        anyhow::bail!(
+            "HERA_FASTER_WHISPER_SCRIPT set but not found at {}",
+            pb.display()
+        );
+    }
+    // 2. Compile-time crate dir — absolute, correct regardless of cwd on the build node.
+    let manifest =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/faster_whisper_stt.py");
+    if manifest.exists() {
+        return Ok(manifest);
+    }
+    // 3. Alongside the running executable (covers scp'd binaries shipping scripts next to them).
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let cand = dir.join("scripts/faster_whisper_stt.py");
+        if cand.exists() {
+            return Ok(cand);
+        }
+    }
+    // 4. Legacy cwd-relative fallback (works only when cwd is Hera/hera-core).
+    let legacy = PathBuf::from("../hera-core/scripts/faster_whisper_stt.py");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    anyhow::bail!(
+        "faster-whisper helper script not found (tried {} and cwd-relative); \
+         set HERA_FASTER_WHISPER_SCRIPT to an absolute path",
+        manifest.display()
+    );
+}
+
 impl FasterWhisperEngine {
     pub fn new() -> anyhow::Result<Self> {
-        let script_path = PathBuf::from(env_or(
-            "HERA_FASTER_WHISPER_SCRIPT",
-            "../hera-core/scripts/faster_whisper_stt.py",
-        ));
-        if !script_path.exists() {
-            anyhow::bail!(
-                "faster-whisper helper script not found at {}",
-                script_path.display()
-            );
-        }
+        let script_path = resolve_script_path()?;
 
         Ok(Self {
             script_path: Arc::new(script_path),
@@ -36,7 +71,7 @@ impl FasterWhisperEngine {
 
 #[async_trait::async_trait]
 impl SpeechToTextEngine for FasterWhisperEngine {
-    async fn transcribe_audio(&self, wav_bytes: &[u8]) -> Result<String, InferenceError> {
+    async fn transcribe_audio(&self, wav_bytes: &[u8], lang: Option<&str>) -> Result<String, InferenceError> {
         let normalized_wav = normalize_audio_to_wav(wav_bytes).map_err(|err| {
             InferenceError::ExecutionFailed(format!("Audio normalization failed: {}", err))
         })?;
@@ -55,18 +90,39 @@ impl SpeechToTextEngine for FasterWhisperEngine {
             InferenceError::ExecutionFailed(format!("Failed to write temp audio file: {}", err))
         })?;
 
+        // Resolve effective language: per-request → env default → auto-detect.
+        let effective_lang = lang
+            .map(|l| l.trim().to_ascii_lowercase())
+            .filter(|l| !l.is_empty() && l != "auto" && l != "automatic")
+            .or_else(|| {
+                std::env::var("HERA_WHISPER_LANGUAGE")
+                    .ok()
+                    .map(|l| l.trim().to_ascii_lowercase())
+                    .filter(|l| !l.is_empty() && l != "auto")
+            });
+
+        if let Some(ref resolved) = effective_lang {
+            tracing::debug!(language = %resolved, "STT faster-whisper: using language");
+        }
+
+        let mut cmd_args: Vec<String> = vec![
+            self.script_path.to_string_lossy().into_owned(),
+            "--audio".to_string(),
+            input_path.to_string_lossy().into_owned(),
+            "--model".to_string(),
+            self.model.as_ref().clone(),
+            "--device".to_string(),
+            self.device.as_ref().clone(),
+            "--compute-type".to_string(),
+            self.compute_type.as_ref().clone(),
+        ];
+        if let Some(lang_str) = effective_lang {
+            cmd_args.push("--language".to_string());
+            cmd_args.push(lang_str);
+        }
+
         let output = Command::new(self.python_bin.as_ref())
-            .args([
-                self.script_path.to_string_lossy().as_ref(),
-                "--audio",
-                input_path.to_string_lossy().as_ref(),
-                "--model",
-                self.model.as_ref(),
-                "--device",
-                self.device.as_ref(),
-                "--compute-type",
-                self.compute_type.as_ref(),
-            ])
+            .args(&cmd_args)
             .output()
             .map_err(|err| {
                 InferenceError::ExecutionFailed(format!(

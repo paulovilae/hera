@@ -60,11 +60,14 @@ pub fn prompt_preview(prompt: &str) -> String {
         return String::new();
     }
 
-    let mut preview = trimmed.replace('\n', " ");
-    if preview.len() > 160 {
-        preview.truncate(160);
+    let preview = trimmed.replace('\n', " ");
+    // char-safe truncation: String::truncate panics on a non-char-boundary,
+    // which multibyte (e.g. Korean) search/prompt content can trigger.
+    if preview.chars().count() > 160 {
+        preview.chars().take(160).collect()
+    } else {
+        preview
     }
-    preview
 }
 
 pub fn append_llm_audit_event(event: &LlmAuditEvent) {

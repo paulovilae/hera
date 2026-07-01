@@ -151,6 +151,40 @@ pub fn detect_intent_from_user_message(
     // "Estado OS" / "Estado del sistema" — full PM2 status with restart counts
     if matches!(
         command,
+        "estado de bots"
+            | "estado bots"
+            | "bots"
+            | "bot status"
+            | "status de bots"
+            | "estado robots"
+            | "estado de robots"
+    ) {
+        info!("🎯 [Hera] Explicit fast-path command: list_bots");
+        return Some(ToolCall {
+            name: "list_bots".to_string(),
+            arguments: serde_json::json!({}),
+        });
+    }
+
+    if matches!(
+        command,
+        "ver mercados"
+            | "mercados"
+            | "listar mercados"
+            | "lista de mercados"
+            | "available markets"
+            | "view markets"
+            | "markets"
+    ) {
+        info!("🎯 [Hera] Explicit fast-path command: list_markets");
+        return Some(ToolCall {
+            name: "list_markets".to_string(),
+            arguments: serde_json::json!({"limit": 25}),
+        });
+    }
+
+    if matches!(
+        command,
         "/status"
             | "/system-status"
             | "/server-status"

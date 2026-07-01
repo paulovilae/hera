@@ -32,15 +32,26 @@ struct GenerateTextParams {
     #[schemars(description = "Optional app identifier for memory/schema context")]
     #[serde(default)]
     app: String,
+    #[schemars(
+        description = "Optional Hera route profile id (e.g. \"coding\" to engage Ava Coder's agentic loop + 6 coding tools, or \"ops\"). Default None keeps generic routing."
+    )]
+    #[serde(default)]
+    route_profile: Option<String>,
+    #[schemars(
+        description = "Optional caller identity used for tool allowed_callers gating (e.g. \"ava_coder\" / \"coding\"). Default None falls back to app/hera."
+    )]
+    #[serde(default)]
+    caller: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ExecuteToolParams {
     #[schemars(description = "Exact Hera tool name")]
     name: String,
-    #[schemars(description = "JSON arguments object to pass to the tool")]
+    // HashMap forces schemars to emit type:object so MCP clients serialize correctly.
+    #[schemars(description = "Arguments to pass to the tool (key-value pairs)")]
     #[serde(default)]
-    arguments: serde_json::Value,
+    arguments: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -77,17 +88,80 @@ fn default_permissions() -> Vec<String> {
     vec!["all".to_string()]
 }
 
+/// Patterns in the user prompt that signal an intent to get JSON output via text directive.
+/// These trigger tool-call hijacking in the model (it interprets the JSON-shaped instruction
+/// as a tool use signal). Fix: engage `response_format: json_object` instead and warn.
+fn has_json_directive(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    p.contains("solo con json")
+        || p.contains("only json")
+        || p.contains("formato json")
+        || p.contains("in json format")
+        || (p.contains("responde") && p.contains("json") && p.contains("solo"))
+        || (p.contains("respond") && p.contains("json") && p.contains("only"))
+}
+
 async fn send_ipc_generate(params: &GenerateTextParams) -> String {
+    let permissions = if params.permissions.is_empty() {
+        json!(["all"])
+    } else {
+        json!(params.permissions)
+    };
+    let mut inner = json!({
+        "prompt": params.prompt,
+        "persona_path": if params.persona_path.is_empty() { serde_json::Value::Null } else { json!(params.persona_path) },
+        "max_tokens": params.max_tokens.unwrap_or(800),
+        "temperature": params.temperature.unwrap_or(0.3),
+        "permissions": permissions,
+        "app": params.app,
+        // MCP callers explicitly request tools via permissions; prevent lightweight-mode
+        // detection from silently disabling them for short prompts (e.g. "hola").
+        "context_budget_mode": "standard",
+    });
+
+    // JSON trap guard: text directives like "Responde SOLO con JSON" cause the model
+    // to interpret the response as a tool call (hijack). Engage native JSON mode via
+    // response_format instead — the engine honors it without hijacking.
+    // Prefer structured text output: "Lista numerada, cada ítem: CAMPO: X | CAMPO: Y"
+    if has_json_directive(&params.prompt) {
+        tracing::warn!(
+            "JSON directive detected in prompt — auto-enabling response_format:json_object \
+             to prevent tool hijacking. Prefer structured text output next time: \
+             'Lista numerada, cada ítem en una línea: CAMPO1: X | CAMPO2: Y'"
+        );
+        inner["response_format"] = json!({"type": "json_object"});
+    }
+
+    // Thread the route profile through so an MCP client can request the dedicated
+    // coding surface ("coding"): that profile maps to the heavy context budget AND
+    // is what `is_coding_context` keys off, which engages the agentic loop + low
+    // deterministic temperature + the 6 coding tools. Default None = no key sent =
+    // current generic behaviour (no regression).
+    if let Some(route_profile) = params
+        .route_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        inner["route_profile"] = json!(route_profile);
+    }
+
+    // Optional explicit caller for tool `allowed_callers` gating. The execution-time
+    // caller otherwise derives from `app` (or "hera" when app is empty); set this to
+    // "ava_coder"/"coding" if the app field can't be used. Hera's `contextualize_tool_call`
+    // only fills `caller` when absent, so an explicit value here wins.
+    if let Some(caller) = params
+        .caller
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        inner["caller"] = json!(caller);
+    }
+
     let payload = json!({
         "action": "generate",
-        "payload": {
-            "prompt": params.prompt,
-            "persona_path": if params.persona_path.is_empty() { serde_json::Value::Null } else { json!(params.persona_path) },
-            "max_tokens": params.max_tokens.unwrap_or(800),
-            "temperature": params.temperature.unwrap_or(0.3),
-            "permissions": if params.permissions.is_empty() { json!(["all"]) } else { json!(params.permissions) },
-            "app": params.app
-        }
+        "payload": inner,
     });
 
     match UnixStream::connect(HERA_SOCKET).await {
@@ -145,9 +219,29 @@ impl HeraMcp {
         description = "Execute any existing Hera tool by exact name with a JSON arguments object. This reuses Hera's canonical tool executor rather than reimplementing tool logic."
     )]
     async fn execute_tool(&self, Parameters(params): Parameters<ExecuteToolParams>) -> String {
+        let raw = serde_json::Value::Object(params.arguments.into_iter().collect());
+        // Unwrap double-serialized args: some MCP clients (or intermediate layers) encode the
+        // arguments object as a JSON string. When the resulting object has exactly one entry
+        // whose VALUE is a JSON string that itself parses as an object, peel that outer layer.
+        let arguments = if let serde_json::Value::Object(ref map) = raw {
+            if map.len() == 1 {
+                if let Some((_, serde_json::Value::String(s))) = map.iter().next() {
+                    serde_json::from_str::<serde_json::Value>(s)
+                        .ok()
+                        .filter(|v| v.is_object())
+                        .unwrap_or(raw.clone())
+                } else {
+                    raw
+                }
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
         let call = ToolCall {
             name: params.name,
-            arguments: params.arguments,
+            arguments,
         };
         let result = execute_tool(&call).await;
         result.output

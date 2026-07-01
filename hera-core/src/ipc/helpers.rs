@@ -889,6 +889,129 @@ pub async fn save_chat_turn_event(
     {
         tracing::warn!("save_chat_turn_event failed: {}", err);
     }
+    // Fire-and-forget KG extraction: assistant turns carry most relational signal.
+    // User turns are skipped to avoid noise from questions without factual content.
+    if role == "assistant" && content.len() > 80 {
+        let (uid, aid, text) = (user_id.clone(), app_id.clone(), content.clone());
+        tokio::spawn(async move {
+            extract_and_save_kg_triples(&uid, &aid, &text).await;
+        });
+    }
+}
+
+/// Light-weight KG extraction: sends a small prompt to the local Hera model to
+/// extract entity/relation triples, then upserts them into Memento's kg_store.
+/// Uses a lightweight context budget and a 500-ms connect timeout so the main
+/// chat path is never blocked or slowed.
+async fn extract_and_save_kg_triples(user_id: &str, app_id: &str, text: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let snippet = &text[..text.len().min(600)];
+    let prompt = format!(
+        "Extract named entities and their relations from the following text. \
+         Respond ONLY with a JSON object in this exact shape: \
+         {{\"triples\":[{{\"src\":{{\"name\":\"...\",\"type\":\"...\"}},\"rel\":\"...\",\"dst\":{{\"name\":\"...\",\"type\":\"...\"}},\"evidence\":\"...\"}}]}}. \
+         Use types like: persona, lugar, organizacion, concepto, evento, fecha. \
+         If no clear entities/relations, return {{\"triples\":[]}}.\n\n\
+         Text: {snippet}"
+    );
+
+    let ipc_msg = serde_json::json!({
+        "action": "generate",
+        "payload": {
+            "prompt": prompt,
+            "max_tokens": 400,
+            "temperature": 0.1,
+            "context_budget_mode": "lightweight",
+            "response_format": {"type": "json_object"},
+        }
+    });
+
+    let Ok(Ok(mut stream)) = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::UnixStream::connect("/tmp/hera-core.sock"),
+    ).await else { return };
+
+    let _ = stream.write_all(ipc_msg.to_string().as_bytes()).await;
+    let _ = stream.shutdown().await;
+
+    let mut raw = Vec::new();
+    let Ok(Ok(_)) = tokio::time::timeout(
+        std::time::Duration::from_millis(8_000),
+        stream.read_to_end(&mut raw),
+    ).await else { return };
+
+    let Ok(resp) = serde_json::from_slice::<serde_json::Value>(&raw) else { return };
+    let result_str = resp.pointer("/data/result").and_then(|v| v.as_str()).unwrap_or("");
+    if result_str.is_empty() { return }
+
+    // Parse the model output — it may be a raw JSON string or already parsed
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result_str) else { return };
+    let triples = match parsed.get("triples").and_then(|v| v.as_array()) {
+        Some(t) if !t.is_empty() => t.to_owned(),
+        _ => return,
+    };
+
+    let kg_payload = serde_json::json!({
+        "app_id": app_id,
+        "source_kind": "memory",
+        "doc_id": user_id,
+        "triples": triples,
+    });
+    if let Some(resp) = call_memento("kg_upsert_triples", kg_payload).await {
+        tracing::debug!(
+            "[KG] upserted {} triples for user={} app={}",
+            triples.len(),
+            user_id,
+            app_id,
+        );
+        if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+            tracing::warn!("[KG] kg_upsert_triples error: {}", err);
+        }
+    }
+}
+
+/// Persist a history-compression summary to Memento so the next session can
+/// seed its context with what was discussed, without re-reading all turns.
+pub async fn save_session_summary(user_id: &str, app_id: &str, session_id: &str, summary: &str) {
+    if user_id.is_empty() || summary.trim().is_empty() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "user_id": user_id,
+        "tenant_id": "default",
+        "app_id": app_id,
+        "session_id": session_id,
+        "scope": "personal",
+        "source": "hera_compression",
+        "memory_type": "session_summary",
+        "content": summary,
+        "tags": ["session_summary", "compressed_history"],
+        "auto_derive": false,
+    });
+    if let Some(resp) = call_memento("save_scoped_memory", payload).await
+        && let Some(err) = resp.get("error").and_then(|v| v.as_str())
+    {
+        tracing::warn!("save_session_summary failed: {}", err);
+    }
+}
+
+/// Trigger Memento's compress_session for a given user+session so summaries are
+/// derived eagerly instead of waiting for the next auto_derive threshold.
+pub async fn memento_compress_session(user_id: &str, app_id: &str, session_id: &str) {
+    if user_id.is_empty() || session_id.is_empty() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "user_id": user_id,
+        "app_id": app_id,
+        "session_id": session_id,
+    });
+    if let Some(resp) = call_memento("compress_session", payload).await
+        && let Some(err) = resp.get("error").and_then(|v| v.as_str())
+    {
+        tracing::warn!("memento_compress_session failed: {}", err);
+    }
 }
 
 // ─── Recall feedback (Phase 2 of the embedder flywheel) ───────────────────
@@ -953,6 +1076,39 @@ pub async fn report_recall_feedback(
         "feedback_kind": feedback_kind,
     });
     let _ = call_memento("recall_feedback", payload).await;
+}
+
+/// Fire-and-forget: records a usage event in Memento after each generate call.
+/// Fails silently — never blocks or panics the generate path.
+pub fn spawn_log_usage(
+    app_id: String,
+    user_id: String,
+    session_id: String,
+    route_profile: String,
+    model: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+    is_cloud: bool,
+    latency_ms: u64,
+) {
+    tokio::spawn(async move {
+        let payload = serde_json::json!({
+            "app_id": app_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "route_profile": route_profile,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "is_cloud": is_cloud,
+            "latency_ms": latency_ms
+        });
+        if call_memento("hera_log_usage", payload).await.is_none() {
+            tracing::debug!("[Hera Usage] log_usage failed or timed out (best-effort)");
+        }
+    });
 }
 
 #[cfg(test)]

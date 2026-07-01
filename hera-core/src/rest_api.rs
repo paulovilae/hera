@@ -158,7 +158,8 @@ pub async fn serve_rest_api(port: u16, ipc: IpcState) {
         .with_state(state)
         .layer(cors);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // Doble pila IPv4+IPv6: bind a [::] (net.ipv6.bindv6only=0 acepta IPv4-mapeado).
+    let addr = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -492,6 +493,7 @@ fn anthropic_to_chat_request(payload: &AnthropicMessageRequest) -> Result<ChatRe
         tools: payload.tools.clone(),
         tool_choice: payload.tool_choice.clone(),
         reasoning_effort: None,
+        response_format: None,
     })
 }
 
@@ -535,6 +537,7 @@ fn anthropic_count_to_chat_request(payload: CountTokensRequest) -> Result<ChatRe
         tools: payload.tools,
         tool_choice: None,
         reasoning_effort: None,
+        response_format: None,
     })
 }
 
@@ -995,6 +998,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             reasoning_effort: None,
+            response_format: None,
         };
 
         let resp = crate::ai::ChatResponse {

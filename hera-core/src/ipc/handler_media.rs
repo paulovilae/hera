@@ -10,6 +10,22 @@ fn draw_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string())
 }
 
+/// Display name of the active image backend, reported to callers so UIs never
+/// hardcode the engine. Set HERA_DRAW_MODEL when you swap the draw model.
+fn draw_model() -> String {
+    std::env::var("HERA_DRAW_MODEL").unwrap_or_else(|_| "Z-Image Turbo".to_string())
+}
+
+/// Per-LoRA auto-injection weight from lora_weights.json (default 0.7 — 1.0 tends
+/// to over-cook and drop quality). Set per LoRA via the Telegram /lora_weight cmd.
+fn lora_weight(name: &str) -> f32 {
+    std::fs::read_to_string("/home/paulo/models/image-stack/loras/lora_weights.json")
+        .ok()
+        .and_then(|c| serde_json::from_str::<std::collections::HashMap<String, f32>>(&c).ok())
+        .and_then(|m| m.get(name).copied())
+        .unwrap_or(0.7)
+}
+
 /// Handle the "generate_image" action — FLUX/sd.cpp image generation with auto-LoRA.
 #[cfg_attr(not(feature = "local-llm"), allow(unused_variables))]
 pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> HandlerOutcome {
@@ -50,7 +66,7 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
                 for keyword in keywords {
                     let kw_lower = keyword.to_lowercase();
                     if prompt_lower.contains(&kw_lower) && !claimed_keywords.contains(&kw_lower) {
-                        prompt.push_str(&format!(" <lora:{}:1.0>", lora_name));
+                        prompt.push_str(&format!(" <lora:{}:{:.2}>", lora_name, lora_weight(&lora_name)));
                         claimed_keywords.insert(kw_lower);
                         break;
                     }
@@ -93,12 +109,19 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
         // Fallback to sd.cpp REST API (endpoint configurable via HERA_DRAW_URL)
         let draw_endpoint = format!("{}/v1/images/generations", draw_url());
         let client = reqwest::Client::new();
-        let payload = serde_json::json!({
+        // sd.cpp (OpenAI-compat) lee "size" ("WxH"), NO width/height sueltos: sin "size" usa
+        // 512x512 por defecto e ignora las dimensiones pedidas (banners/wide salían cuadrados).
+        let mut payload = serde_json::json!({
             "prompt": prompt,
             "width": width,
             "height": height,
+            "size": format!("{width}x{height}"),
             "response_format": "b64_json"
         });
+        // Optional seed for reproducibility (caller passes it; sd.cpp honors "seed").
+        if let Some(seed) = request.payload.get("seed").and_then(|s| s.as_i64()) {
+            payload["seed"] = serde_json::json!(seed);
+        }
         match client
             .post(&draw_endpoint)
             .json(&payload)
@@ -129,8 +152,8 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
 
     HandlerOutcome::Result {
         result_text,
-        origin: "unknown".to_string(),
-        model: String::new(),
+        origin: "sd.cpp".to_string(),
+        model: draw_model(),
         tool_calls: None,
     }
 }
@@ -188,6 +211,7 @@ pub async fn handle_vision_analysis(request: &IpcPayload, state: &IpcState) -> H
             tools: None,
             tool_choice: None,
             reasoning_effort: None,
+            response_format: None,
         };
 
         match vision.generate_content(chat_req).await {
@@ -262,6 +286,7 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
         tools: None,
         tool_choice: None,
         reasoning_effort: None,
+        response_format: None,
     };
 
     let enhanced = match state.engine.generate_content(chat_req).await {

@@ -5,8 +5,9 @@ use super::context::{
     prepare_runtime_execution_context, prepare_tool_result_followup_request,
 };
 use super::helpers::{
-    RuntimePromotionContext, infer_origin_from_model, record_observation_and_promote_runtime_hint,
-    record_runtime_observation,
+    RuntimePromotionContext, canonicalize_user_id, infer_origin_from_model,
+    record_observation_and_promote_runtime_hint, record_runtime_observation,
+    report_recall_feedback, save_chat_turn_event,
 };
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
@@ -156,6 +157,62 @@ pub async fn handle_generate_stream(
         &state.engine,
     )
     .await;
+
+    // Coding/ops CLI surface: run the multi-turn agentic loop on the STREAMING
+    // path, emitting a `tool_status` event per round so the operator sees the
+    // tools execute live (read_file → edit_file → cargo_test …). Gated to the
+    // coding/ops surfaces so widget streaming keeps its single-batch token-stream
+    // behaviour untouched. The final answer is sent as one chunk after the loop.
+    if super::agentic_loop::agentic_loop_enabled()
+        && parsed.context_budget.allow_tools
+        && super::agentic_loop::is_agentic_cli_surface(&parsed)
+    {
+        if let Some(req) = chat_req.clone() {
+            // stream_start
+            let mut s = serde_json::to_string(&IpcResponse {
+                status: "stream_start".to_string(),
+                data: serde_json::json!({}),
+            })
+            .unwrap_or_default();
+            s.push('\n');
+            let _ = stream.write_all(s.as_bytes()).await;
+
+            // Run the loop, threading the stream so each round emits tool_status.
+            let outcome = super::agentic_loop::run_agentic_loop(
+                &state.engine,
+                req,
+                &parsed,
+                Some(&mut *stream),
+            )
+            .await;
+            tracing::info!(
+                "🔁 [Hera Stream] Agentic loop finished: iterations={} stop_reason={} tools={}",
+                outcome.iterations,
+                outcome.stop_reason,
+                outcome.executed_calls_json.len()
+            );
+
+            // final answer as one chunk
+            let mut c = serde_json::to_string(&IpcResponse {
+                status: "chunk".to_string(),
+                data: serde_json::json!({ "text": outcome.result_text }),
+            })
+            .unwrap_or_default();
+            c.push('\n');
+            let _ = stream.write_all(c.as_bytes()).await;
+
+            // done
+            let mut d = serde_json::to_string(&IpcResponse {
+                status: "done".to_string(),
+                data: serde_json::json!({}),
+            })
+            .unwrap_or_default();
+            d.push('\n');
+            let _ = stream.write_all(d.as_bytes()).await;
+
+            return HandlerOutcome::DirectResponse;
+        }
+    }
 
     if let Some(req) = chat_req.clone() {
         let est_tokens = super::helpers::estimate_tokens(&req);
@@ -353,6 +410,40 @@ pub async fn handle_generate_stream(
                     },
                 )
                 .await;
+
+                if !lightweight_mode && parsed.context_budget.include_memory {
+                    let user_id = canonicalize_user_id(
+                        &parsed.sender_name,
+                        &parsed.chat_id,
+                        &parsed.session_id,
+                    );
+                    let app_id = parsed.app_name.clone();
+                    let session_id = parsed.session_id.clone();
+                    let user_content = parsed.prompt.clone();
+                    let assistant_content = final_result_text.clone();
+                    let attribution = prompt_assembly.recall_attribution.clone();
+                    tokio::spawn(async move {
+                        save_chat_turn_event(
+                            user_id.clone(),
+                            app_id.clone(),
+                            session_id.clone(),
+                            "user".to_string(),
+                            user_content,
+                        )
+                        .await;
+                        save_chat_turn_event(
+                            user_id,
+                            app_id,
+                            session_id,
+                            "assistant".to_string(),
+                            assistant_content.clone(),
+                        )
+                        .await;
+                        // Phase 2 flywheel: report which recalled ids the model cited
+                        // so Memento can build (positives, negatives) training data.
+                        report_recall_feedback(attribution.as_ref(), &assistant_content).await;
+                    });
+                }
             }
             Err(e) => {
                 let err_msg = IpcResponse {

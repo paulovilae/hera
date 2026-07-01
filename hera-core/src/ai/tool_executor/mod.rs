@@ -377,6 +377,7 @@ mod tests {
         name: String,
         execution_kind: Option<String>,
         risk_level: Option<String>,
+        status: Option<String>,
         path: String,
     }
 
@@ -428,6 +429,11 @@ mod tests {
                     .and_then(|value| value.get("risk_level"))
                     .and_then(|value| value.as_str())
                     .map(ToString::to_string),
+                status: schema
+                    .get("metadata")
+                    .and_then(|value| value.get("status"))
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string),
                 path: path
                     .strip_prefix(root)
                     .unwrap_or(&path)
@@ -454,8 +460,12 @@ mod tests {
 
     #[test]
     fn all_registered_function_tools_have_runtime_dispatch() {
+        // Skeleton tools (status == "skeleton_not_implemented") are intentionally
+        // un-dispatched WIP: they are hidden from the model (see parse_tool_artifact)
+        // and therefore exempt from the dispatch-coverage invariant.
         let missing = load_function_tools()
             .into_iter()
+            .filter(|tool| tool.status.as_deref() != Some("skeleton_not_implemented"))
             .filter(|tool| !tool_has_runtime_dispatch(&tool.name, tool.execution_kind.as_deref()))
             .map(|tool| {
                 format!(

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::helpers::{
     canonicalize_user_id, fetch_db_schema_context, fetch_rag_context, fetch_rag_pinned,
     fetch_recursive_context, fetch_runtime_preflight, fetch_semantic_memories,
-    fetch_semantic_memory,
+    fetch_semantic_memory, save_session_summary,
 };
 use super::llm_audit::{LlmAuditEvent, build_event};
 use super::route_profiles::resolve_route_profile;
@@ -256,7 +256,8 @@ pub async fn prepare_chat_request(
             req.reasoning_effort = Some(parsed.reasoning_effort.clone());
         }
         apply_history_budget(req, &parsed.context_budget);
-        compress_if_needed(req, engine, &parsed.context_budget).await;
+        let user_id = canonicalize_user_id(&parsed.sender_name, &parsed.chat_id, &parsed.session_id);
+        compress_if_needed(req, engine, &parsed.context_budget, &parsed.session_id, &user_id, &parsed.app_id).await;
     }
 
     chat_req
@@ -523,7 +524,10 @@ pub fn app_is_stateless(app_name: &str) -> bool {
 }
 
 pub fn context_budget_for_mode(mode: &str, lightweight_mode: bool) -> ContextBudget {
-    if lightweight_mode {
+    // Explicit heavier modes are honoured even for lightweight prompts (e.g. MCP callers
+    // that pass permissions/context_budget_mode explicitly still want tools for "hola").
+    let collapse = lightweight_mode && !matches!(mode, "standard" | "heavy" | "minimal");
+    if collapse {
         return ContextBudget {
             mode: "lightweight".to_string(),
             include_memory: false,
@@ -545,11 +549,11 @@ pub fn context_budget_for_mode(mode: &str, lightweight_mode: bool) -> ContextBud
             include_tool_schemas: false,
             include_db_schema: false,
             allow_tools: false,
-            max_memory_chars: 1_200,
+            max_memory_chars: 6_000,
             max_tool_schema_chars: 0,
             max_db_schema_chars: 0,
-            max_history_messages: 8,
-            compression_trigger_tokens: 12_000,
+            max_history_messages: 14,
+            compression_trigger_tokens: 25_000,
         },
         "heavy" => ContextBudget {
             mode: "heavy".to_string(),
@@ -557,11 +561,11 @@ pub fn context_budget_for_mode(mode: &str, lightweight_mode: bool) -> ContextBud
             include_tool_schemas: true,
             include_db_schema: true,
             allow_tools: true,
-            max_memory_chars: 4_000,
-            max_tool_schema_chars: 24_000,
-            max_db_schema_chars: 10_000,
-            max_history_messages: 24,
-            compression_trigger_tokens: 28_000,
+            max_memory_chars: 40_000,
+            max_tool_schema_chars: 48_000,
+            max_db_schema_chars: 20_000,
+            max_history_messages: 48,
+            compression_trigger_tokens: 80_000,
         },
         _ => ContextBudget {
             mode: "standard".to_string(),
@@ -569,27 +573,27 @@ pub fn context_budget_for_mode(mode: &str, lightweight_mode: bool) -> ContextBud
             include_tool_schemas: true,
             include_db_schema: true,
             allow_tools: true,
-            max_memory_chars: 2_400,
-            max_tool_schema_chars: 14_000,
-            max_db_schema_chars: 6_000,
-            max_history_messages: 14,
-            compression_trigger_tokens: 20_000,
+            max_memory_chars: 24_000,
+            max_tool_schema_chars: 28_000,
+            max_db_schema_chars: 12_000,
+            max_history_messages: 24,
+            compression_trigger_tokens: 50_000,
         },
     }
 }
 
 fn parse_context_budget(payload: &serde_json::Value, lightweight_mode: bool) -> ContextBudget {
-    let mode = payload
+    let explicit_mode = payload
         .get("context_budget_mode")
-        .and_then(|value| value.as_str())
-        .unwrap_or(if lightweight_mode {
-            "lightweight"
-        } else {
-            "standard"
-        })
+        .and_then(|value| value.as_str());
+    let mode = explicit_mode
+        .unwrap_or(if lightweight_mode { "lightweight" } else { "standard" })
         .trim()
         .to_ascii_lowercase();
-    let mut budget = context_budget_for_mode(&mode, lightweight_mode);
+    // When the caller explicitly requested a budget mode, don't let lightweight detection
+    // override it — the caller knows what they need (e.g. MCP with permissions: ["all"]).
+    let effective_lightweight = if explicit_mode.is_some() { false } else { lightweight_mode };
+    let mut budget = context_budget_for_mode(&mode, effective_lightweight);
 
     if let Some(overrides) = payload
         .get("context_budget")
@@ -714,9 +718,15 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         })
         .unwrap_or_else(|| vec!["all".to_string()]);
 
+    // `caller` is a last-resort identity: callers (e.g. the Hera MCP) that cannot
+    // set `app`/`app_name` may pass an explicit `caller` ("ava_coder"/"coding") so
+    // it flows into `app_name` and thus into the execution-time tool caller used by
+    // `allowed_callers` gating (contextualize_tool_call derives caller from app_name).
+    // `app`/`app_name` still win when present, so this is non-regressive.
     let app_name = payload
         .get("app")
         .or_else(|| payload.get("app_name"))
+        .or_else(|| payload.get("caller"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -842,7 +852,7 @@ pub async fn build_full_system_prompt(
         .and_then(|s| s.to_str())
         .unwrap_or("");
     let (recursive_ctx, semantic_ctx, rag_pinned_ctx, rag_retrieved_ctx, recall_attribution) =
-        if budget.include_memory && !lightweight_mode {
+        if budget.include_memory {
             let user_id = canonicalize_user_id(sender_name, chat_id, session_id);
             let recursive = clamp_chars(
                 fetch_recursive_context(&user_id, app_name, session_id).await,
@@ -867,7 +877,10 @@ pub async fn build_full_system_prompt(
     // prompt. Per-turn memory (recursive_ctx + semantic_ctx) is appended AT THE
     // END so the KV cache / provider cache hits across turns.
     let persona_text = std::fs::read_to_string(persona_path)
-        .unwrap_or_else(|_| "You are an AI assistant.".to_string());
+        .unwrap_or_else(|e| {
+            tracing::warn!(path = persona_path, error = %e, "persona file not found — using bare fallback");
+            "You are an AI assistant.".to_string()
+        });
     let base_system_prompt = format!("{}{}", persona_text, memento_ctx);
 
     let agent_identity = std::path::Path::new(persona_path)
@@ -875,7 +888,7 @@ pub async fn build_full_system_prompt(
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
 
-    let schemas = if lightweight_mode || !budget.include_tool_schemas || !budget.allow_tools {
+    let schemas = if !budget.include_tool_schemas || !budget.allow_tools {
         String::new()
     } else {
         clamp_chars(
@@ -883,7 +896,7 @@ pub async fn build_full_system_prompt(
             budget.max_tool_schema_chars,
         )
     };
-    let db_schema_ctx = if lightweight_mode || !budget.include_db_schema {
+    let db_schema_ctx = if !budget.include_db_schema {
         String::new()
     } else {
         clamp_chars(
@@ -1141,10 +1154,15 @@ pub fn apply_history_budget(req: &mut ChatRequest, budget: &ContextBudget) {
 }
 
 /// Compress chat history if it exceeds 24k tokens (safety buffer for 32k engine limit).
+/// The generated summary is also persisted to Memento as a `session_summary` so the next
+/// session can seed its context from it instead of starting cold.
 pub async fn compress_if_needed(
     req: &mut ChatRequest,
     engine: &Arc<dyn LLMEngine + Send + Sync>,
     budget: &ContextBudget,
+    session_id: &str,
+    user_id: &str,
+    app_id: &str,
 ) {
     let est_tokens = super::helpers::estimate_tokens(req);
     if est_tokens <= budget.compression_trigger_tokens || req.messages.len() <= 6 {
@@ -1217,6 +1235,15 @@ pub async fn compress_if_needed(
                         summary_resp.model,
                         compress_origin
                     );
+                    // Persist the summary so the next session inherits this context
+                    // without re-reading all turns (cross-session continuity).
+                    if !user_id.is_empty() {
+                        let summary_owned = summary_txt.clone();
+                        let (uid, aid, sid) = (user_id.to_string(), app_id.to_string(), session_id.to_string());
+                        tokio::spawn(async move {
+                            save_session_summary(&uid, &aid, &sid, &summary_owned).await;
+                        });
+                    }
                     req.messages.push(sys);
                     req.messages.push(ChatMessage {
                         role: "assistant".to_string(),

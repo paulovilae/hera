@@ -17,7 +17,7 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
     RouteProfile {
         id: "cartera_widget",
         app: "cartera",
-        persona_path: "/home/paulo/Programs/apps/OS/Agents/chepito.md",
+        persona_path: "/home/paulo/Programs/apps/OS/Agents/hada_financiera.md",
         default_context_budget_mode: "lightweight",
         prefer_stream: true,
         target_p95_ms: 700,
@@ -26,7 +26,7 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
     RouteProfile {
         id: "cartera_admin_chat",
         app: "cartera",
-        persona_path: "/home/paulo/Programs/apps/OS/Agents/chepito.md",
+        persona_path: "/home/paulo/Programs/apps/OS/Agents/hada_financiera.md",
         default_context_budget_mode: "standard",
         prefer_stream: false,
         target_p95_ms: 2000,
@@ -84,6 +84,43 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
         default_context_budget_mode: "standard",
         prefer_stream: false,
         target_p95_ms: 1200,
+        target_first_token_ms: None,
+    },
+    RouteProfile {
+        id: "ops",
+        app: "ops",
+        persona_path: "/home/paulo/Programs/apps/OS/Agents/ava_ops.md",
+        // heavy = full tools + schema + memory; allow_tools=true so the agentic
+        // loop engages (diagnose → read logs → propose/verify). Operator OPS
+        // copilot surface (CLI `claude --ops`).
+        default_context_budget_mode: "heavy",
+        prefer_stream: false,
+        target_p95_ms: 120_000,
+        target_first_token_ms: None,
+    },
+    RouteProfile {
+        id: "coding",
+        app: "coding",
+        persona_path: "/home/paulo/Programs/apps/OS/Agents/ava_coder.md",
+        // heavy = full tools + schema + memory; allow_tools=true so the agentic
+        // loop engages. This is the dedicated coding surface (CLI `claude`,
+        // ava_coder bot) that gets low deterministic temperature.
+        default_context_budget_mode: "heavy",
+        prefer_stream: false,
+        // Coding tasks run many tool rounds (read→edit→build→fix); generous SLO.
+        target_p95_ms: 120_000,
+        target_first_token_ms: None,
+    },
+    RouteProfile {
+        id: "heavy",
+        app: "",
+        persona_path: DEFAULT_PERSONA,
+        // heavy = full tools + schema + memory; targets complex analytical tasks
+        // (financial analysis, multi-step reasoning) where the primary 35B model
+        // is needed. Callers can request this via route_profile: "heavy" from MCP.
+        default_context_budget_mode: "heavy",
+        prefer_stream: false,
+        target_p95_ms: 60_000,
         target_first_token_ms: None,
     },
     RouteProfile {

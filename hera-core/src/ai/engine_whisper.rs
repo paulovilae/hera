@@ -66,7 +66,7 @@ impl WhisperEngine {
         })
     }
 
-    pub async fn transcribe_audio(&self, wav_bytes: &[u8]) -> Result<String> {
+    pub async fn transcribe_audio(&self, wav_bytes: &[u8], lang: Option<&str>) -> Result<String> {
         let normalized_wav = normalize_audio_to_wav(wav_bytes)?;
         let mut reader = WavReader::new(std::io::Cursor::new(normalized_wav))?;
         let spec = reader.spec();
@@ -113,7 +113,7 @@ impl WhisperEngine {
 
         let mut model_lock = self.model.lock().await;
 
-        let language_token = whisper_language_token(&self.tokenizer);
+        let language_token = whisper_language_token_for(&self.tokenizer, lang);
 
         // Standard Decoder Execution
         let mut text_output = String::new();
@@ -182,8 +182,8 @@ impl WhisperEngine {
 
 #[async_trait::async_trait]
 impl SpeechToTextEngine for WhisperEngine {
-    async fn transcribe_audio(&self, wav_bytes: &[u8]) -> Result<String, InferenceError> {
-        WhisperEngine::transcribe_audio(self, wav_bytes)
+    async fn transcribe_audio(&self, wav_bytes: &[u8], lang: Option<&str>) -> Result<String, InferenceError> {
+        WhisperEngine::transcribe_audio(self, wav_bytes, lang)
             .await
             .map_err(|err| InferenceError::ExecutionFailed(err.to_string()))
     }
@@ -243,7 +243,21 @@ impl WhisperModelConfig {
     }
 }
 
-fn whisper_language_token(tokenizer: &Tokenizer) -> Option<u32> {
+/// Resolve the Whisper language token for a given transcription request.
+///
+/// Priority: per-request `lang` hint → `HERA_WHISPER_LANGUAGE` env var → auto-detect (None).
+/// `lang` values of `""`, `"auto"`, or `"automatic"` are treated as "use the env default".
+fn whisper_language_token_for(tokenizer: &Tokenizer, lang: Option<&str>) -> Option<u32> {
+    // Per-request hint takes priority when it is a non-empty, non-auto value.
+    if let Some(req_lang) = lang {
+        let req_lang = req_lang.trim().to_ascii_lowercase();
+        if !req_lang.is_empty() && req_lang != "auto" && req_lang != "automatic" {
+            tracing::debug!(language = %req_lang, "STT: using per-request language override");
+            return tokenizer.token_to_id(&format!("<|{}|>", req_lang));
+        }
+    }
+
+    // Fall back to environment default.
     let language = std::env::var("HERA_WHISPER_LANGUAGE")
         .unwrap_or_else(|_| "auto".to_string())
         .trim()

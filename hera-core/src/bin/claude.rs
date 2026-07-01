@@ -17,6 +17,7 @@ struct Config {
     model: Option<String>,
     socket_path: String,
     permissions: Vec<String>,
+    session: Option<String>,
 }
 
 impl Default for Config {
@@ -30,6 +31,7 @@ impl Default for Config {
             model: None,
             socket_path: DEFAULT_SOCKET.to_string(),
             permissions: Vec::new(),
+            session: None,
         }
     }
 }
@@ -82,6 +84,40 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
             "--app" => {
                 config.app = iter.next().ok_or("missing value after --app")?;
             }
+            "--coding" => {
+                // Operator coding agent: route to the `coding` profile (heavy +
+                // agentic loop + low deterministic temp) and grant the surgical
+                // coding tools. Operator-only by construction — this CLI runs on
+                // the node itself (SSH access = operator). The coding tools are
+                // Critical, so `unsafe_all` is required to grant them.
+                config.app = "coding".to_string();
+                for tool in [
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "grep_search",
+                    "glob_search",
+                    "cargo_check",
+                    "cargo_test",
+                    "unsafe_all",
+                ] {
+                    config.permissions.push(tool.to_string());
+                }
+            }
+            "--ops" => {
+                // Operator OPS copilot: route to the `ops` profile (heavy +
+                // agentic loop) and grant read/diagnose tools via `all`. NOTE:
+                // `all` covers Low/High-risk tools (read_pm2_logs,
+                // diagnose_services, review_all_apps_status, verify_app_health,
+                // system_status, read_os_logs, memento_query, ...) but NOT
+                // Critical ones like `service_restart` — those need `unsafe_all`.
+                // So by default the copilot DIAGNOSES and PROPOSES fixes; it does
+                // not autonomously restart production services. Operator-only by
+                // construction (runs on the node, SSH = operator). For an action
+                // session, add `--permission service_restart --permission unsafe_all`.
+                config.app = "ops".to_string();
+                config.permissions.push("all".to_string());
+            }
             "--model" => {
                 config.model = Some(iter.next().ok_or("missing value after --model")?);
             }
@@ -92,6 +128,9 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
                 config
                     .permissions
                     .push(iter.next().ok_or("missing value after --permission")?);
+            }
+            "--session" => {
+                config.session = Some(iter.next().ok_or("missing value after --session")?);
             }
             "--json" => {
                 config.json_mode = true;
@@ -210,8 +249,22 @@ async fn send_prompt(
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
     }
+    apply_session(&mut payload, config);
 
     send_request(config, payload).await
+}
+
+/// Attach a per-call session identity so memory does not bleed across runs
+/// (e.g. eval tasks): a unique session_id makes Hera derive a unique user_id,
+/// so Memento recall stays scoped to this single conversation.
+fn apply_session(payload: &mut Value, config: &Config) {
+    if let Some(session) = &config.session
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("session_id".to_string(), json!(session));
+        obj.insert("chat_id".to_string(), json!(session));
+        obj.insert("sender_name".to_string(), json!(session));
+    }
 }
 
 async fn send_messages(
@@ -239,6 +292,7 @@ async fn send_messages(
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
     }
+    apply_session(&mut payload, config);
 
     send_request(config, payload).await
 }
@@ -262,9 +316,63 @@ async fn send_request(
     stream.write_all(&wire).await?;
     stream.shutdown().await?;
 
-    let mut buffer = String::new();
-    stream.read_to_string(&mut buffer).await?;
-    parse_response(&buffer, config.stream)
+    if config.stream {
+        // Live: read events line-by-line as they arrive so tool calls and text
+        // appear in real time (the agentic loop emits a tool_status per round).
+        stream_live(stream).await
+    } else {
+        let mut buffer = String::new();
+        stream.read_to_string(&mut buffer).await?;
+        parse_response(&buffer, false)
+    }
+}
+
+/// Render a streaming Hera response live: print chunk text as it arrives and
+/// show each tool call (`tool_status`) the moment the agent runs it. Operator
+/// rule: icons, never emojis — tool lines use a dim middot marker.
+async fn stream_live(stream: UnixStream) -> Result<IpcReply, Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(stream).lines();
+    let mut text = String::new();
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let msg: Value = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        match msg.get("status").and_then(Value::as_str).unwrap_or("") {
+            "tool_status" => {
+                if let Some(name) = msg.pointer("/data/name").and_then(Value::as_str) {
+                    // Dim line so tool activity is visible but secondary to text.
+                    println!("\x1b[2m  · {name}\x1b[0m");
+                    io::stdout().flush()?;
+                }
+            }
+            "chunk" => {
+                if let Some(chunk) = msg.pointer("/data/text").and_then(Value::as_str) {
+                    let cleaned = strip_think_prefix(chunk);
+                    print!("{cleaned}");
+                    io::stdout().flush()?;
+                    text.push_str(cleaned);
+                }
+            }
+            "error" => {
+                let error = msg
+                    .pointer("/data/error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown Hera IPC error");
+                return Err(error.to_string().into());
+            }
+            _ => {}
+        }
+    }
+    if !text.is_empty() {
+        println!();
+    }
+    Ok(IpcReply { text })
 }
 
 fn parse_response(response: &str, streamed: bool) -> Result<IpcReply, Box<dyn std::error::Error>> {
@@ -336,6 +444,10 @@ fn print_help() {
            -p, --prompt <text>       Run a one-shot prompt\n\
            --system <text>           Inject a system prompt\n\
            --app <name>              Hera app name for routing and policy\n\
+           --coding                  Operator coding agent (coding profile +\n\
+                                     agentic loop + surgical tools granted)\n\
+           --ops                     Operator OPS copilot (read/diagnose tools +\n\
+                                     agentic loop; destructive actions opt-in)\n\
            --model <name>            Override model hint\n\
            --socket <path>           Hera IPC socket path\n\
            --permission <name>       Allow a Hera tool (repeatable)\n\

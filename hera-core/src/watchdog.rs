@@ -153,21 +153,44 @@ fn check_pm2_services(state: &mut WatchdogState, emergencies: &mut Vec<Emergency
         Err(_) => return,
     };
 
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
     for proc in &procs {
         let name = proc.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-        let status = proc
-            .get("pm2_env")
+        let env = proc.get("pm2_env");
+        let status = env
             .and_then(|e| e.get("status"))
             .and_then(|s| s.as_str())
             .unwrap_or("?");
-        let restarts = proc
-            .get("pm2_env")
+        let restarts = env
             .and_then(|e| e.get("restart_time"))
             .and_then(|r| r.as_u64())
             .unwrap_or(0);
+        // Read pm2's own restart_delay so we don't compound a rotation that
+        // pm2 is already pacing. If pm2 set a delay (e.g. 8000 ms for movilo
+        // to let port 5175 release), the watchdog must give pm2 that window
+        // before issuing its own restart — otherwise we race pm2's retry and
+        // inflate the restart counter.
+        let restart_delay_ms = env
+            .and_then(|e| e.get("restart_delay"))
+            .and_then(|r| r.as_u64())
+            .unwrap_or(0);
+        let pm_uptime = env
+            .and_then(|e| e.get("pm_uptime"))
+            .and_then(|u| u.as_u64())
+            .unwrap_or(0);
+        let since_last_start_ms = now_ms.saturating_sub(pm_uptime);
 
         // Detect crashed/errored/stopped services
         if status == "errored" || status == "stopped" {
+            // Respect pm2's restart_delay: if pm2 just stopped the process and
+            // is about to restart it itself, skip this tick.
+            if restart_delay_ms > 0 && since_last_start_ms < restart_delay_ms + 2000 {
+                continue;
+            }
             let attempt_count = state.restart_counts.entry(name.to_string()).or_insert(0);
 
             if *attempt_count < MAX_AUTO_RESTARTS {

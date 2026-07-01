@@ -5,8 +5,9 @@ use super::context::{
     prepare_runtime_execution_context, prepare_tool_result_followup_request,
 };
 use super::helpers::{
-    RuntimePromotionContext, infer_origin_from_model, record_observation_and_promote_runtime_hint,
-    record_runtime_observation,
+    RuntimePromotionContext, canonicalize_user_id, infer_origin_from_model,
+    record_observation_and_promote_runtime_hint, record_runtime_observation, report_recall_feedback,
+    save_chat_turn_event, spawn_log_usage,
 };
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
@@ -47,7 +48,13 @@ pub async fn handle_generate(
         parsed.prompt,
         fast_path_prompt
     );
-    if !fast_path_prompt.is_empty() {
+    // Tool paths are gated on the budget's allow_tools. A caller that asks for
+    // pure generation (allow_tools=false, e.g. dossier section/metadata/chart
+    // synthesis) must NOT have its request hijacked into a tool call — the
+    // fast-path intent detector and the schema-query planner below both fire
+    // proactively off the prompt content and would otherwise turn a "write me
+    // charts JSON" call into a query_memory/memento_vector_search execution.
+    if parsed.context_budget.allow_tools && !fast_path_prompt.is_empty() {
         if fast_path_prompt.trim_start().starts_with('/') {
             tracing::info!(
                 "🧭 [Hera IPC] Explicit command candidate received: {}",
@@ -101,7 +108,9 @@ pub async fn handle_generate(
     }
 
     let schema_plan_started_at = Instant::now();
-    if let Some(planned_call) = try_plan_schema_query(&state.engine, &parsed).await {
+    if parsed.context_budget.allow_tools
+        && let Some(planned_call) = try_plan_schema_query(&state.engine, &parsed).await
+    {
         let planner_latency_ms = schema_plan_started_at.elapsed().as_millis();
         let contextual_tool_call = contextualize_tool_call(&planned_call, &parsed);
         if crate::ai::tool_executor::permissions_allow_tool(
@@ -216,8 +225,133 @@ pub async fn handle_generate(
             est_tokens,
             lightweight_mode
         );
+
+        // Fase 1 (docs/AVA_CODING_AGENT_PLAN.md): real multi-turn agentic loop.
+        // Behind HERA_AGENTIC_LOOP, and only for tool-enabled requests. Replaces
+        // the single-shot "execute 1 batch → format → done" path below with
+        // generate → execute tools → re-feed results → repeat. Reuses the exact
+        // same tool executors; the bots' current behaviour is unchanged when the
+        // flag is off. Fast-path + schema-planner above still short-circuit first.
+        if parsed.context_budget.allow_tools && super::agentic_loop::agentic_loop_enabled() {
+            let loop_outcome =
+                super::agentic_loop::run_agentic_loop(&state.engine, req, &parsed, None).await;
+            tracing::info!(
+                "🔁 [Hera IPC] Agentic loop finished: iterations={} stop_reason={} tools={}",
+                loop_outcome.iterations,
+                loop_outcome.stop_reason,
+                loop_outcome.executed_calls_json.len()
+            );
+            let result_text = loop_outcome.result_text;
+            let response_origin = loop_outcome.origin;
+            let response_model = loop_outcome.model;
+            let tool_calls = if loop_outcome.executed_calls_json.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Array(loop_outcome.executed_calls_json))
+            };
+
+            let duration_ms = started_at.elapsed().as_millis() as u64;
+            let outcome = build_runtime_outcome_artifacts(
+                "generate",
+                &parsed,
+                &prompt_assembly,
+                duration_ms,
+                None,
+                lightweight_mode,
+                &provider_requested,
+                &response_origin,
+                &response_model,
+                true,
+                tool_calls
+                    .as_ref()
+                    .and_then(|value| value.as_array().map(|items| items.len()))
+                    .unwrap_or(0),
+                result_text.len(),
+                est_tokens,
+                chat_req
+                    .as_ref()
+                    .map(|req| req.messages.len())
+                    .unwrap_or_default(),
+                None,
+            );
+            append_llm_audit_event(&outcome.audit_event);
+            record_observation_and_promote_runtime_hint(
+                outcome.observation_payload,
+                RuntimePromotionContext {
+                    preflight: runtime_preflight.clone(),
+                    mode: "generate",
+                    app_id: &parsed.app_name,
+                    route_profile: &parsed.route_profile_id,
+                    persona_path: &parsed.persona_path,
+                    session_id: &parsed.session_id,
+                    trace_id: &parsed.trace_id,
+                    chat_id: &parsed.chat_id,
+                    current_budget_mode: &parsed.context_budget.mode,
+                    persona_drift: parsed.persona_drift,
+                    success: true,
+                },
+            )
+            .await;
+
+            if !lightweight_mode && parsed.context_budget.include_memory {
+                let user_id = canonicalize_user_id(
+                    &parsed.sender_name,
+                    &parsed.chat_id,
+                    &parsed.session_id,
+                );
+                let app_id = parsed.app_name.clone();
+                let session_id = parsed.session_id.clone();
+                let user_content = parsed.prompt.clone();
+                let assistant_content = result_text.clone();
+                let attribution = prompt_assembly.recall_attribution.clone();
+                tokio::spawn(async move {
+                    save_chat_turn_event(
+                        user_id.clone(),
+                        app_id.clone(),
+                        session_id.clone(),
+                        "user".to_string(),
+                        user_content,
+                    )
+                    .await;
+                    save_chat_turn_event(
+                        user_id,
+                        app_id,
+                        session_id,
+                        "assistant".to_string(),
+                        assistant_content.clone(),
+                    )
+                    .await;
+                    report_recall_feedback(attribution.as_ref(), &assistant_content).await;
+                });
+            }
+
+            // Path A — usage logging (best-effort, fire-and-forget).
+            // Agentic loop does not expose per-turn token counts yet; use 0.
+            spawn_log_usage(
+                parsed.app_name.clone(),
+                canonicalize_user_id(&parsed.sender_name, &parsed.chat_id, &parsed.session_id),
+                parsed.session_id.clone(),
+                parsed.route_profile_id.clone(),
+                response_model.clone(),
+                0,
+                0,
+                0,
+                response_origin.contains("cloud"),
+                duration_ms,
+            );
+
+            return HandlerOutcome::Result {
+                result_text,
+                origin: response_origin,
+                model: response_model,
+                tool_calls,
+            };
+        }
+
         match state.engine.generate_content(req).await {
             Ok(resp) => {
+                // Capture usage tokens before resp is consumed by choices access.
+                let resp_usage = resp.usage.clone();
                 let mut response_model = resp.model.clone();
                 let mut response_origin = infer_origin_from_model(&resp.model).to_string();
                 let origin_emoji = match response_origin.as_str() {
@@ -239,10 +373,19 @@ pub async fn handle_generate(
                         result_text = content.clone();
                     }
 
-                    // 6. Parse and execute output tool calls
-                    let mut parsed_calls = crate::ai::tool_executor::parse_tool_calls(&result_text);
+                    // 6. Parse and execute output tool calls — only when tools
+                    // are allowed. A pure-generation caller (allow_tools=false)
+                    // must get its text back verbatim, never routed through a
+                    // tool execution + second-pass that discards the answer.
+                    let mut parsed_calls = if parsed.context_budget.allow_tools {
+                        crate::ai::tool_executor::parse_tool_calls(&result_text)
+                    } else {
+                        Vec::new()
+                    };
 
-                    if let Some(tc_array) = &choice.message.tool_calls {
+                    if let (true, Some(tc_array)) =
+                        (parsed.context_budget.allow_tools, &choice.message.tool_calls)
+                    {
                         for tc in tc_array {
                             let mut extracted_name = None;
                             let mut extracted_args = None;
@@ -343,6 +486,48 @@ pub async fn handle_generate(
                     }
                 }
 
+                // Frame B3: quality cascade. If a non-tool local answer is poor
+                // (empty / too short / disclaims) and didn't already come from
+                // cloud, escalate once to the cloud failover. Sovereign-first:
+                // this only fires on demonstrated local-quality failure, and only
+                // replaces the answer if the escalation is actually better.
+                //
+                // Gated on the master cloud switch: with HERA_ALLOW_CLOUD_FALLBACK
+                // unset (the default) this never touches a paid provider — it was
+                // the missing gate behind the 2026-06-09 OpenRouter billing incident.
+                if tool_calls.is_none()
+                    && response_origin != "cloud"
+                    && crate::ai::router::cloud_globally_enabled()
+                {
+                    let difficulty = super::difficulty::Difficulty::from_reasoning_effort(
+                        &parsed.reasoning_effort,
+                    );
+                    if super::difficulty::is_low_quality_answer(&result_text, difficulty)
+                        && let Some(mut cloud_req) = chat_req.clone()
+                    {
+                        cloud_req.provider = Some("cloud".to_string());
+                        tracing::info!(
+                            "⬆️ [Hera B3] Local answer low-quality (difficulty={}); escalating to cloud failover",
+                            difficulty.as_str()
+                        );
+                        match state.engine.generate_content(cloud_req).await {
+                            Ok(resp2) => {
+                                if let Some(choice) = resp2.choices.first()
+                                    && let Some(content) = &choice.message.content
+                                    && !super::difficulty::is_low_quality_answer(content, difficulty)
+                                {
+                                    result_text = content.clone();
+                                    response_origin = "cloud".to_string();
+                                    response_model = resp2.model.clone();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("B3 cloud escalation failed: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 let duration_ms = started_at.elapsed().as_millis() as u64;
                 let outcome = build_runtime_outcome_artifacts(
                     "generate",
@@ -385,6 +570,64 @@ pub async fn handle_generate(
                     },
                 )
                 .await;
+
+                if !lightweight_mode && parsed.context_budget.include_memory {
+                    let user_id = canonicalize_user_id(
+                        &parsed.sender_name,
+                        &parsed.chat_id,
+                        &parsed.session_id,
+                    );
+                    let app_id = parsed.app_name.clone();
+                    let session_id = parsed.session_id.clone();
+                    let user_content = parsed.prompt.clone();
+                    let assistant_content = result_text.clone();
+                    let attribution = prompt_assembly.recall_attribution.clone();
+                    tokio::spawn(async move {
+                        save_chat_turn_event(
+                            user_id.clone(),
+                            app_id.clone(),
+                            session_id.clone(),
+                            "user".to_string(),
+                            user_content,
+                        )
+                        .await;
+                        save_chat_turn_event(
+                            user_id,
+                            app_id,
+                            session_id,
+                            "assistant".to_string(),
+                            assistant_content.clone(),
+                        )
+                        .await;
+                        // Phase 2 flywheel: report which recalled ids the model cited
+                        // so Memento can build (positives, negatives) training data.
+                        report_recall_feedback(attribution.as_ref(), &assistant_content).await;
+                    });
+                }
+
+                // Path B — usage logging (best-effort, fire-and-forget).
+                {
+                    let prompt_tokens = resp_usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
+                    let completion_tokens =
+                        resp_usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+                    let total_tokens = resp_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+                    spawn_log_usage(
+                        parsed.app_name.clone(),
+                        canonicalize_user_id(
+                            &parsed.sender_name,
+                            &parsed.chat_id,
+                            &parsed.session_id,
+                        ),
+                        parsed.session_id.clone(),
+                        parsed.route_profile_id.clone(),
+                        response_model.clone(),
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        response_origin.contains("cloud"),
+                        duration_ms,
+                    );
+                }
 
                 return HandlerOutcome::Result {
                     result_text,

@@ -17,29 +17,13 @@ pub struct RouterEngine {
     cloud_engine: Arc<dyn LLMEngine + Send + Sync>,
 }
 
-/// Append a sovereignty marker to the assistant message. The bot persona (e.g. memo.md)
-/// can interpret these markers, but more importantly: the marker is deterministic
-/// regardless of LLM behavior. Imaginclaw / chat UIs use it to display the right image.
-///
-/// Local engines → Memo (the male blue-cat mascot — "we're sovereign")
-/// Cloud engines → Memo Familia (signals reliance on external API)
-fn tag_response_engine(response: &mut ChatResponse, engine_tag: &str) {
-    let (label, image_path) = match engine_tag {
-        "local-primary" | "local-secondary" | "local-tertiary" => {
-            ("Memo (Local Sovereign LLM)", "/imaginclaw/assets/memo_stand.jpg")
-        }
-        "cloud" => {
-            ("Memo Familia (Cloud API)", "/imaginclaw/assets/memo_family.jpg")
-        }
-        _ => return,
-    };
-    let marker = format!("\n\n![{}]({})", label, image_path);
-    if let Some(choice) = response.choices.first_mut() {
-        if let Some(content) = choice.message.content.as_mut() {
-            content.push_str(&marker);
-        }
-    }
-}
+// NOTE (2026-05-30): the router used to append a Memo mascot image to EVERY local
+// response (`tag_response_engine`). That hardcoded Movilo's mascot onto every app's
+// output — Consulting briefs, dossiers and any artifact generated through Hera ended
+// with a blue-cat picture. The marker was also redundant: each bot's persona (memo.md,
+// chigui.md, ...) already instructs the model to emit its OWN signature/mascot, and
+// Imaginclaw does not parse the marker. So per-app identity lives in the persona, not
+// the router. Removed: Memo is no longer forced everywhere; non-chat artifacts stay clean.
 
 impl RouterEngine {
     pub fn new(
@@ -80,9 +64,8 @@ impl LLMEngine for RouterEngine {
                 primary_req.model
             );
             match self.primary_engine.generate_content(primary_req).await {
-                Ok(mut response) => {
+                Ok(response) => {
                     info!("✅ Primary sovereign execution successful");
-                    tag_response_engine(&mut response, "local-primary");
                     return Ok(response);
                 }
                 Err(e) => {
@@ -101,9 +84,8 @@ impl LLMEngine for RouterEngine {
                     with_explicit_endpoint(local_req.clone(), std::env::var("HERA_SECONDARY_OMNI_URL").ok());
                 info!("🕯️ Routing inference execution via Secondary Sovereign Engine...");
                 match secondary_engine.generate_content(secondary_req).await {
-                    Ok(mut response) => {
+                    Ok(response) => {
                         info!("✅ Secondary sovereign execution successful");
-                        tag_response_engine(&mut response, "local-secondary");
                         return Ok(response);
                     }
                     Err(e) => {
@@ -123,9 +105,8 @@ impl LLMEngine for RouterEngine {
                     with_explicit_endpoint(local_req.clone(), std::env::var("HERA_TERTIARY_OMNI_URL").ok());
                 info!("🕯️ Routing inference execution via Tertiary Sovereign Engine...");
                 match tertiary_engine.generate_content(tertiary_req).await {
-                    Ok(mut response) => {
+                    Ok(response) => {
                         info!("✅ Tertiary sovereign execution successful");
-                        tag_response_engine(&mut response, "local-tertiary");
                         return Ok(response);
                     }
                     Err(e) => {
@@ -145,9 +126,8 @@ impl LLMEngine for RouterEngine {
         if (provider == "auto" || provider == "gemini" || provider == "cloud") && cloud_allowed {
             info!("☁️ Re-routing inference execution onto Cloud MultiModal Engine...");
             match self.cloud_engine.generate_content(cloud_req).await {
-                Ok(mut response) => {
+                Ok(response) => {
                     info!("✅ Cloud failover successful");
-                    tag_response_engine(&mut response, "cloud");
                     return Ok(response);
                 }
                 Err(e) => {
@@ -360,11 +340,23 @@ fn with_explicit_endpoint(mut req: ChatRequest, endpoint: Option<String>) -> Cha
     req
 }
 
-fn cloud_fallback_allowed(req: &ChatRequest) -> bool {
-    if std::env::var("HERA_ALLOW_CLOUD_FALLBACK")
+/// Sovereign-first master switch for paid cloud inference.
+///
+/// Cloud is DENIED by default. It is only enabled when `HERA_ALLOW_CLOUD_FALLBACK`
+/// is explicitly set to a truthy value (`1` / `true` / `yes`). This is the opposite
+/// of an opt-out: an absent or empty var means "no cloud, no charges".
+///
+/// Background: a deploy without this var set silently billed ~$100 to OpenRouter
+/// because the previous logic defaulted to ALLOW (2026-06-09 incident).
+pub fn cloud_globally_enabled() -> bool {
+    std::env::var("HERA_ALLOW_CLOUD_FALLBACK")
         .ok()
-        .is_some_and(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "False"))
-    {
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "YES"))
+}
+
+fn cloud_fallback_allowed(req: &ChatRequest) -> bool {
+    // Sovereign-first: cloud stays off unless explicitly enabled.
+    if !cloud_globally_enabled() {
         return false;
     }
 
