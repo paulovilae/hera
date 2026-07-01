@@ -11,7 +11,12 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-const HERA_SOCKET: &str = "/tmp/hera-core.sock";
+/// Override with `HERA_SOCKET_PATH` to point this MCP bridge at a forwarded socket
+/// (e.g. an SSH-tunneled path to a remote node's real hera-core) instead of a local
+/// daemon — useful when the local machine only runs a lightweight fallback instance.
+fn hera_socket_path() -> String {
+    std::env::var("HERA_SOCKET_PATH").unwrap_or_else(|_| "/tmp/hera-core.sock".to_string())
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GenerateTextParams {
@@ -164,7 +169,8 @@ async fn send_ipc_generate(params: &GenerateTextParams) -> String {
         "payload": inner,
     });
 
-    match UnixStream::connect(HERA_SOCKET).await {
+    let socket_path = hera_socket_path();
+    match UnixStream::connect(&socket_path).await {
         Ok(mut stream) => {
             let msg_bytes = payload.to_string();
             if let Err(error) = stream.write_all(msg_bytes.as_bytes()).await {
@@ -190,7 +196,7 @@ async fn send_ipc_generate(params: &GenerateTextParams) -> String {
         }
         Err(error) => format!(
             "Cannot connect to Hera daemon at {}. Is it running? Error: {}",
-            HERA_SOCKET, error
+            socket_path, error
         ),
     }
 }
