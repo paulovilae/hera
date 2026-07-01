@@ -47,6 +47,12 @@ echo "🧹 Releasing VRAM before native binding..."
 # Start Native Llama Server.
 # --split-mode none + --main-gpu 0 = Force ALL layers onto GPU 0 (24GB)
 # This keeps GPU 1 completely free for FLUX (12GB) + Wan2.1 video
+OMNI_KV_CACHE_TYPE_K="${IMAGINEOS_OMNI_KV_CACHE_TYPE_K:-q8_0}"
+OMNI_KV_CACHE_TYPE_V="${IMAGINEOS_OMNI_KV_CACHE_TYPE_V:-q8_0}"
+OMNI_ROPE_SCALING="${IMAGINEOS_OMNI_ROPE_SCALING:-}"
+OMNI_ROPE_SCALE="${IMAGINEOS_OMNI_ROPE_SCALE:-}"
+OMNI_YARN_ORIG_CTX="${IMAGINEOS_OMNI_YARN_ORIG_CTX:-}"
+
 args=(
     "$MODEL_BIN"
     --model "$MODEL_FILE" \
@@ -58,11 +64,26 @@ args=(
     --ctx-size "$OMNI_CTX_SIZE" \
     --batch-size "$OMNI_BATCH_SIZE" \
     --threads "$OMNI_THREADS" \
-    --reasoning "$OMNI_REASONING"
+    --reasoning "$OMNI_REASONING" \
+    --flash-attn on \
+    --cache-type-k "$OMNI_KV_CACHE_TYPE_K" \
+    --cache-type-v "$OMNI_KV_CACHE_TYPE_V"
 )
 
 if [ -n "$MMPROJ_FILE" ]; then
     args+=(--mmproj "$MMPROJ_FILE")
+fi
+
+# YaRN RoPE scaling — activar cuando se usa Unsloth 128K GGUF
+# Setear: IMAGINEOS_OMNI_ROPE_SCALING=yarn IMAGINEOS_OMNI_ROPE_SCALE=4 IMAGINEOS_OMNI_YARN_ORIG_CTX=32768
+if [ -n "$OMNI_ROPE_SCALING" ]; then
+    args+=(--rope-scaling "$OMNI_ROPE_SCALING")
+fi
+if [ -n "$OMNI_ROPE_SCALE" ]; then
+    args+=(--rope-scale "$OMNI_ROPE_SCALE")
+fi
+if [ -n "$OMNI_YARN_ORIG_CTX" ]; then
+    args+=(--yarn-orig-ctx "$OMNI_YARN_ORIG_CTX")
 fi
 
 exec "${args[@]}"
