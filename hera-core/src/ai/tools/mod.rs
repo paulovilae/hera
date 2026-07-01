@@ -10,6 +10,7 @@ pub mod brand_studio;
 pub mod build_feedback;
 pub mod coding;
 pub mod data;
+pub mod deploy;
 pub mod email_imap;
 pub mod geo;
 pub mod infra_health;
