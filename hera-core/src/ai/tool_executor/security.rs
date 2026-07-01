@@ -25,7 +25,10 @@ pub(crate) fn tool_risk_level(tool_name: &str) -> ToolRiskLevel {
         | "execute_workflow"
         | "dispatch_email"
         | "bind_telegram_workspace"
-        | "edit_app_theme" => ToolRiskLevel::High,
+        | "edit_app_theme"
+        | "git_add"
+        | "git_commit"
+        | "pm2_restart" => ToolRiskLevel::High,
         _ => ToolRiskLevel::Low,
     }
 }
