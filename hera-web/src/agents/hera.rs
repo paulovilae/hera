@@ -384,6 +384,89 @@ impl Hera {
         Ok(serde_json::to_value(res)?)
     }
 
+    /// Animates a mascot or human face speaking the given text with lip-sync.
+    /// Uses the viseme backend (mascots) or wav2lip backend (human faces).
+    pub async fn animate_avatar(
+        &self,
+        text: &str,
+        character: &str,
+        face_url: Option<&str>,
+        voice: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let viseme_url = std::env::var("VISEME_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8014".to_string());
+        let wav2lip_url = std::env::var("WAV2LIP_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8012".to_string());
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()?;
+
+        let video_bytes = if let Some(furl) = face_url {
+            // Human face path — download face image, base64-encode, call wav2lip
+            let face_resp = client
+                .get(furl)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| anyhow!("Failed to download face image: {}", e))?;
+            if !face_resp.status().is_success() {
+                return Err(anyhow!(
+                    "Face image download returned status {}",
+                    face_resp.status()
+                ));
+            }
+            let face_bytes = face_resp.bytes().await?;
+            let face_b64 = BASE64_STANDARD.encode(&face_bytes);
+
+            let mut body = json!({ "face_b64": face_b64, "text": text });
+            if let Some(v) = voice {
+                body.as_object_mut().unwrap().insert("voice".to_string(), json!(v));
+            }
+
+            let resp = client
+                .post(format!("{}/say", wav2lip_url))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("wav2lip /say request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("wav2lip /say returned status {}", resp.status()));
+            }
+            resp.bytes().await?
+        } else {
+            // Mascot path — call viseme backend
+            let mut body = json!({ "text": text, "character": character });
+            if let Some(v) = voice {
+                body.as_object_mut().unwrap().insert("voice".to_string(), json!(v));
+            }
+
+            let resp = client
+                .post(format!("{}/say", viseme_url))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("viseme /say request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("viseme /say returned status {}", resp.status()));
+            }
+            resp.bytes().await?
+        };
+
+        // Save mp4 to the shared outputs dir (same dir as generate_image PNGs)
+        let output_dir = generated_outputs_dir()?;
+        fs::create_dir_all(&output_dir)?;
+
+        let filename = format!("avatar_anim_{}.mp4", Uuid::new_v4());
+        let filepath = output_dir.join(&filename);
+        fs::write(&filepath, &video_bytes)?;
+
+        Ok(json!({
+            "status": "success",
+            "video_url": format!("/outputs/{}", filename)
+        }))
+    }
+
     pub async fn native_web_scrape(&self, url: &str) -> Result<String> {
         let res = self.http_client.get(url).send().await?;
         if !res.status().is_success() {
@@ -422,21 +505,72 @@ impl Hera {
         Ok(truncated)
     }
 
+    /// Web search. Prefers self-hosted SearXNG instances (sovereign, no API
+    /// key, multi-engine, not blocked by datacenter-IP anomaly detection).
+    /// Falls back to scraping DuckDuckGo Lite if every SearXNG is unset/down.
+    ///
+    /// `HERA_SEARXNG_URL` may be a comma-separated list of bases tried in order
+    /// until one returns results (e.g. genesis primary, laptop failover:
+    /// `http://10.100.0.2:8088,http://100.121.94.69:8088`). The first instance
+    /// that yields non-empty results wins; instances that error or return zero
+    /// are skipped, and only if all are exhausted does it fall back to DDG.
     pub async fn native_web_search(&self, query: &str) -> Result<String> {
+        if let Ok(raw) = std::env::var("HERA_SEARXNG_URL") {
+            for base in raw.split(',') {
+                let base = base.trim().trim_end_matches('/');
+                if base.is_empty() {
+                    continue;
+                }
+                match self.searxng_search(base, query).await {
+                    Ok(results) if !results.is_empty() => return Ok(results.join("\n---\n")),
+                    Ok(_) => eprintln!("[hera] SearXNG {} returned 0 results for '{}', trying next", base, query),
+                    Err(e) => eprintln!("[hera] SearXNG {} failed ({}), trying next", base, e),
+                }
+            }
+            eprintln!("[hera] all SearXNG instances exhausted for '{}', falling back to DDG", query);
+        }
+        self.duckduckgo_scrape(query).await
+    }
+
+    async fn searxng_search(&self, base: &str, query: &str) -> Result<Vec<String>> {
+        let url = format!("{base}/search");
+        let res = self.http_client.get(&url)
+            .query(&[("q", query), ("format", "json")])
+            .header("User-Agent", "ImagineOS-Hera/1.0")
+            .send().await?;
+        if !res.status().is_success() {
+            return Err(anyhow!("SearXNG returned {}", res.status()));
+        }
+        let body: serde_json::Value = res.json().await?;
+        let mut out = Vec::new();
+        if let Some(items) = body.get("results").and_then(|v| v.as_array()) {
+            for item in items.iter().take(8) {
+                let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let link = item.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let snippet = item.get("content").and_then(|v| v.as_str()).unwrap_or("").trim();
+                if !title.is_empty() && (!snippet.is_empty() || !link.is_empty()) {
+                    out.push(format!("Title: {title}\nURL: {link}\nSnippet: {snippet}\n"));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn duckduckgo_scrape(&self, query: &str) -> Result<String> {
         let url = "https://lite.duckduckgo.com/lite/";
         let params = [("q", query)];
-        
+
         let res = self.http_client.post(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
             .form(&params)
             .send().await?;
-            
+
         if !res.status().is_success() {
             return Err(anyhow!("Search failed: {}", res.status()));
         }
         let html_content = res.text().await?;
         let document = scraper::Html::parse_document(&html_content);
-        
+
         let link_selector = scraper::Selector::parse(".result-link").unwrap();
         let snippet_selector = scraper::Selector::parse(".result-snippet").unwrap();
 
@@ -449,7 +583,7 @@ impl Hera {
             let title = links[i].text().collect::<Vec<_>>().join(" ").trim().to_string();
             let url = links[i].value().attr("href").unwrap_or_default().to_string();
             let snippet = snippets[i].text().collect::<Vec<_>>().join(" ").trim().to_string();
-            
+
             if !title.is_empty() && !snippet.is_empty() {
                 results.push(format!("Title: {}\nURL: {}\nSnippet: {}\n", title, url, snippet));
             }
