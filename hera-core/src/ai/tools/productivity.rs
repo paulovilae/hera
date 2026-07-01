@@ -8,6 +8,7 @@ use crate::ai::tool_executor::{ToolCall, ToolResult};
 
 const MEMENTO_SOCK: &str = "/tmp/memento.sock";
 pub(crate) const IMAP_CONF: &str = "/home/paulo/.config/imagineos/secrets/imap.conf";
+const IMAP_CONF_SECONDARY: &str = "/home/paulo/.config/imagineos/secrets/imap-secondary.conf";
 const CALENDAR_CONF: &str = "/home/paulo/.config/imagineos/secrets/calendar.conf";
 const NOTES_DIR: &str = "/home/paulo/Notes";
 
@@ -438,45 +439,18 @@ pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResul
 
 // ─── read_email ───────────────────────────────────────────────────────────
 
-pub(crate) async fn execute_read_email(call: &ToolCall) -> ToolResult {
-    let folder = call
-        .arguments
-        .get("folder")
-        .and_then(|v| v.as_str())
-        .unwrap_or("INBOX")
-        .to_string();
-    let limit = call
-        .arguments
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(10);
-    let unread_only = call
-        .arguments
-        .get("unread_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let search_term = call
-        .arguments
-        .get("search")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+struct ImapCreds {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    label: String,
+}
 
-    // Read credentials
-    let conf = match std::fs::read_to_string(IMAP_CONF) {
-        Ok(c) => c,
-        Err(_) => {
-            return ToolResult {
-                name: call.name.clone(),
-                success: false,
-                output: format!(
-                    "Email credentials not configured. Create {} with:\nhost=imap.gmail.com\nport=993\nusername=your@gmail.com\npassword=your_app_password",
-                    IMAP_CONF
-                ),
-            }
-        }
-    };
+const IMAP_SECRETS_DIR: &str = "/home/paulo/.config/imagineos/secrets";
 
+fn parse_imap_conf(path: &str, label: &str) -> Option<ImapCreds> {
+    let conf = std::fs::read_to_string(path).ok()?;
     let mut host = String::new();
     let mut port = 993u16;
     let mut username = String::new();
@@ -493,28 +467,45 @@ pub(crate) async fn execute_read_email(call: &ToolCall) -> ToolResult {
             password = v.trim().to_string();
         }
     }
-
-    if host.is_empty() || username.is_empty() || password.is_empty() {
-        return ToolResult {
-            name: call.name.clone(),
-            success: false,
-            output: format!(
-                "Incomplete credentials in {}. Need: host, port, username, password.",
-                IMAP_CONF
-            ),
-        };
+    let is_placeholder = password.starts_with("REPLACE_WITH") || password == "your_app_password";
+    if host.is_empty() || username.is_empty() || password.is_empty() || is_placeholder {
+        return None;
     }
+    Some(ImapCreds { host, port, username, password, label: label.to_string() })
+}
 
-    let search_criteria = if !search_term.is_empty() {
-        search_term
-    } else if unread_only {
-        "UNSEEN".to_string()
-    } else {
-        "ALL".to_string()
-    };
+/// Discover all valid IMAP configs in the secrets dir.
+/// imap.conf is primary (sovereign); imap-*.conf are additional inboxes.
+fn discover_imap_configs() -> Vec<ImapCreds> {
+    let mut configs = Vec::new();
+    // Primary first
+    if let Some(c) = parse_imap_conf(IMAP_CONF, "Soberano") {
+        configs.push(c);
+    }
+    // Additional: imap-*.conf (alphabetical)
+    if let Ok(entries) = std::fs::read_dir(IMAP_SECRETS_DIR) {
+        let mut extras: Vec<_> = entries
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.starts_with("imap-") && s.ends_with(".conf")
+            })
+            .collect();
+        extras.sort_by_key(|e| e.file_name());
+        for entry in extras {
+            let path = entry.path();
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let label = stem.trim_start_matches("imap-").to_string();
+            if let Some(c) = parse_imap_conf(path.to_str().unwrap_or(""), &label) {
+                configs.push(c);
+            }
+        }
+    }
+    configs
+}
 
-    // Pass credentials as env vars to avoid Rust format string escaping issues
-    static EMAIL_SCRIPT: &str = r#"
+static EMAIL_SCRIPT: &str = r#"
 import imaplib, email, ssl, os
 from email.header import decode_header
 
@@ -525,6 +516,7 @@ passwd = os.environ['IMAP_PASS']
 folder = os.environ.get('IMAP_FOLDER', 'INBOX')
 limit  = int(os.environ.get('IMAP_LIMIT', '10'))
 criteria = os.environ.get('IMAP_SEARCH', 'ALL')
+source = os.environ.get('IMAP_SOURCE', '')
 
 def decode_str(s):
     if s is None: return ''
@@ -575,29 +567,98 @@ try:
                 from_ = decode_str(msg.get('From', ''))
                 date_ = msg.get('Date', '')
                 body = get_body(msg)
-                results.append(f"UID: {uid.decode()}\nMessageID: {msg_id}\nFrom: {from_}\nSubject: {subject}\nDate: {date_}\n{body[:300]}\n---")
+                src_line = f"Inbox: {source}\n" if source else ''
+                results.append(f"{src_line}UID: {uid.decode()}\nMessageID: {msg_id}\nFrom: {from_}\nSubject: {subject}\nDate: {date_}\n{body[:300]}\n---")
     mail.logout()
-    print('\n'.join(results) if results else 'No messages found.')
+    print('\n'.join(results) if results else f'No messages found in {source or folder}.')
 except Exception as e:
-    print(f'ERROR: {e}')
+    print(f'ERROR [{source}]: {e}')
 "#;
 
-    info!("📧 [Productivity] Reading email for {} from {}", username, folder);
-
-    run_python_with_env(
-        &call.name,
+async fn fetch_inbox(tool_name: &str, creds: &ImapCreds, folder: &str, limit: i64, search: &str) -> String {
+    let result = run_python_with_env(
+        tool_name,
         EMAIL_SCRIPT,
         &[
-            ("IMAP_HOST", host.as_str()),
-            ("IMAP_PORT", &port.to_string()),
-            ("IMAP_USER", username.as_str()),
-            ("IMAP_PASS", password.as_str()),
-            ("IMAP_FOLDER", folder.as_str()),
+            ("IMAP_HOST", creds.host.as_str()),
+            ("IMAP_PORT", &creds.port.to_string()),
+            ("IMAP_USER", creds.username.as_str()),
+            ("IMAP_PASS", creds.password.as_str()),
+            ("IMAP_FOLDER", folder),
             ("IMAP_LIMIT", &limit.to_string()),
-            ("IMAP_SEARCH", search_criteria.as_str()),
+            ("IMAP_SEARCH", search),
+            ("IMAP_SOURCE", creds.label.as_str()),
         ],
     )
-    .await
+    .await;
+    result.output
+}
+
+pub(crate) async fn execute_read_email(call: &ToolCall) -> ToolResult {
+    let folder = call
+        .arguments
+        .get("folder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("INBOX")
+        .to_string();
+    let limit = call
+        .arguments
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10);
+    let unread_only = call
+        .arguments
+        .get("unread_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let search_term = call
+        .arguments
+        .get("search")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let search_criteria = if !search_term.is_empty() {
+        search_term
+    } else if unread_only {
+        "UNSEEN".to_string()
+    } else {
+        "ALL".to_string()
+    };
+
+    let configs = discover_imap_configs();
+
+    if configs.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!(
+                "Incomplete credentials. Configure {}/imap.conf or {}/imap-<name>.conf files.",
+                IMAP_SECRETS_DIR, IMAP_SECRETS_DIR
+            ),
+        };
+    }
+
+    info!("📧 [Productivity] Reading {} inbox(es)", configs.len());
+
+    // Fetch all inboxes concurrently
+    let fetches: Vec<_> = configs
+        .iter()
+        .map(|c| fetch_inbox(&call.name, c, &folder, limit, &search_criteria))
+        .collect();
+    let outputs = futures_util::future::join_all(fetches).await;
+
+    let parts: Vec<String> = outputs.into_iter().filter(|s| !s.is_empty()).collect();
+
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: if parts.is_empty() {
+            "No messages found in any inbox.".to_string()
+        } else {
+            parts.join("\n\n")
+        },
+    }
 }
 
 // ─── list_calendar_events ─────────────────────────────────────────────────
