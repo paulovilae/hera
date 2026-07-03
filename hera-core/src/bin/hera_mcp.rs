@@ -57,6 +57,11 @@ struct ExecuteToolParams {
     #[schemars(description = "Arguments to pass to the tool (key-value pairs)")]
     #[serde(default)]
     arguments: std::collections::HashMap<String, serde_json::Value>,
+    #[schemars(
+        description = "Optional caller identity used for tool allowed_callers gating (e.g. \"coding\" / \"ava_coder\"). Default None applies caller=\"external_mcp\"."
+    )]
+    #[serde(default)]
+    caller: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -244,6 +249,26 @@ impl HeraMcp {
             }
         } else {
             raw
+        };
+        // Inject caller into arguments._hera.caller so tool_executor::security
+        // can gate allowed_callers. Default "external_mcp" for MCP clients.
+        let caller = params
+            .caller
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "external_mcp".to_string());
+        let arguments = match arguments {
+            serde_json::Value::Object(mut map) => {
+                let hera_entry = map
+                    .entry("_hera".to_string())
+                    .or_insert_with(|| json!({}));
+                if let serde_json::Value::Object(hera_map) = hera_entry {
+                    hera_map
+                        .entry("caller".to_string())
+                        .or_insert_with(|| json!(caller));
+                }
+                serde_json::Value::Object(map)
+            }
+            other => other,
         };
         let call = ToolCall {
             name: params.name,
