@@ -891,7 +891,15 @@ pub async fn save_chat_turn_event(
     }
     // Fire-and-forget KG extraction: assistant turns carry most relational signal.
     // User turns are skipped to avoid noise from questions without factual content.
-    if role == "assistant" && content.len() > 80 {
+    //
+    // GATE on a non-empty app_id. Without it this self-amplified into a runaway:
+    // the extraction's OWN `generate` call (which carries no app_id) produced a
+    // JSON turn that handler_generate saved as another assistant turn, which
+    // re-spawned extraction — a loop bounded only by 30B throughput (~1 every
+    // 3.7 s, saturating the GPU 24/7 with unattributed inference). Internal /
+    // anonymous generations (app_id == "") have no place in the per-app KG
+    // anyway, so only extract for turns that belong to a real app.
+    if role == "assistant" && content.len() > 80 && !app_id.trim().is_empty() {
         let (uid, aid, text) = (user_id.clone(), app_id.clone(), content.clone());
         tokio::spawn(async move {
             extract_and_save_kg_triples(&uid, &aid, &text).await;
