@@ -22,6 +22,7 @@ pub use self::registry::{
 };
 pub use self::schema::{find_skill_artifact, load_agent_artifact};
 pub use self::security::permissions_allow_tool;
+pub use self::security::tool_is_critical;
 pub use self::dispatch::execute_tool;
 
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 90_000;
