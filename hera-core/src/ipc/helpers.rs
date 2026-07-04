@@ -1079,12 +1079,46 @@ pub async fn report_recall_feedback(
 }
 
 /// Which node this Hera process runs on (genesis / anchor / ...), for telemetry.
-/// Mirrors the router's node-identity resolution: `HERA_NODE_ALIAS` overrides,
-/// else `HOSTNAME`. Empty string when neither is set.
+/// Node identity for telemetry: `HERA_NODE_ALIAS` overrides, else `HOSTNAME`,
+/// else the kernel hostname (`/etc/hostname`), else "unknown".
+///
+/// HOSTNAME is a shell var and is often NOT exported into the pm2 process env,
+/// so it can't be the only fallback — that left telemetry rows with an empty
+/// `node`. The `/etc/hostname` read lets every node self-identify with no config.
 pub fn hera_node() -> String {
-    std::env::var("HERA_NODE_ALIAS")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_default()
+    if let Ok(alias) = std::env::var("HERA_NODE_ALIAS") {
+        if !alias.trim().is_empty() {
+            return alias.trim().to_string();
+        }
+    }
+    if let Ok(host) = std::env::var("HOSTNAME") {
+        if !host.trim().is_empty() {
+            return host.trim().to_string();
+        }
+    }
+    if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
+        let host = host.trim();
+        if !host.is_empty() {
+            return host.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Mint a trace id for requests that arrive without one (MCP / direct callers).
+/// Every request should be correlatable across usage + tool-call telemetry and
+/// the `/ops/hera/trace/<id>` timeline — an empty trace_id makes a request
+/// invisible to that join. Format: `hera-<node>-<nanos>-<counter>` (no external
+/// dep; the atomic counter disambiguates ids minted within the same nanosecond).
+pub fn mint_trace_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("hera-{}-{:x}-{:x}", hera_node(), nanos, seq)
 }
 
 /// Char-safe truncation for telemetry previews of tool args/results. Larger cap

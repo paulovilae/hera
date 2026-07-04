@@ -6,7 +6,6 @@ use super::types::IpcResponse;
 use crate::ai::{ChatMessage, ChatRequest, LLMEngine, MessageContent};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
@@ -55,6 +54,11 @@ pub fn contextualize_tool_call(
         object
             .entry("trace_id".to_string())
             .or_insert_with(|| serde_json::json!(parsed.trace_id));
+    }
+    if !parsed.route_profile_id.is_empty() {
+        object
+            .entry("route_profile".to_string())
+            .or_insert_with(|| serde_json::json!(parsed.route_profile_id));
     }
     if !parsed.session_id.is_empty() {
         object
@@ -112,9 +116,10 @@ pub async fn execute_parsed_tool_calls(
 
         if crate::ai::tool_executor::permissions_allow_tool(&parsed.permissions, &call.name) {
             let contextual_call = contextualize_tool_call(call, parsed);
-            let started = Instant::now();
+            // Durable per-tool-call telemetry is emitted inside `execute_tool`
+            // itself (the universal chokepoint) so the fast-path, streaming and
+            // retry paths are covered too — not just this parsed-loop.
             let tool_res = crate::ai::tool_executor::execute_tool(&contextual_call).await;
-            let duration_ms = started.elapsed().as_millis() as u64;
             executed_tool_count += 1;
             execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
             executed_results.push((contextual_call.name.clone(), tool_res.success));
@@ -122,25 +127,6 @@ pub async fn execute_parsed_tool_calls(
                 "name": contextual_call.name,
                 "arguments": contextual_call.arguments
             }));
-
-            // Durable per-tool-call telemetry (best-effort, fire-and-forget).
-            spawn_log_tool_call(
-                parsed.trace_id.clone(),
-                parsed.session_id.clone(),
-                parsed.app_name.clone(),
-                parsed.route_profile_id.clone(),
-                seq as u32,
-                contextual_call.name.clone(),
-                telemetry_preview(&contextual_call.arguments.to_string(), TOOL_PREVIEW_CHARS),
-                telemetry_preview(&tool_res.output, TOOL_PREVIEW_CHARS),
-                duration_ms,
-                tool_res.success,
-                if tool_res.success {
-                    None
-                } else {
-                    Some(telemetry_preview(&tool_res.output, TOOL_PREVIEW_CHARS))
-                },
-            );
         } else {
             tracing::warn!(
                 "⚠️ [Hera IPC] LLM hallucinated tool {} which is denied by permissions",

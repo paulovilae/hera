@@ -746,7 +746,14 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         .trim()
         .to_ascii_lowercase();
 
-    let trace_id = extract_optional_string(payload, "trace_id");
+    let trace_id = {
+        let provided = extract_optional_string(payload, "trace_id");
+        if provided.is_empty() {
+            super::helpers::mint_trace_id()
+        } else {
+            provided
+        }
+    };
     let session_id = extract_optional_string(payload, "session_id");
     let chat_id = extract_optional_string(payload, "chat_id");
     let app_id = extract_optional_string(payload, "app_id");
