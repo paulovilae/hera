@@ -3,8 +3,9 @@
 use serde_json::Value;
 
 use crate::ai::tools::{
-    apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding, data, deploy,
-    email_imap, geo, infra_health, infra_smoke, mission_control, platform, productivity, storage,
+    apps_construvendo, apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding,
+    data, deploy, email_imap, geo, infra_health, infra_smoke, mission_control, platform,
+    productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -215,6 +216,8 @@ async fn dispatch_metadata_tool(call: &ToolCall) -> Option<ToolResult> {
                 Some(result)
             } else if let Some(result) = dispatch_movilo_tool(call).await {
                 Some(result)
+            } else if let Some(result) = dispatch_construvendo_tool(call).await {
+                Some(result)
             } else {
                 dispatch_latinos_tool(call).await
             }
@@ -316,6 +319,15 @@ async fn dispatch_movilo_tool(call: &ToolCall) -> Option<ToolResult> {
         "movilo_get_plans" => apps_movilo::execute_movilo_get_plans(call).await,
         "movilo_check_affiliation" => apps_movilo::execute_movilo_check_affiliation(call).await,
         "movilo_validate_qr" => apps_movilo::execute_movilo_validate_qr(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_construvendo_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "construvendo_faq" => apps_construvendo::execute_construvendo_faq(call).await,
+        "construvendo_simular" => apps_construvendo::execute_construvendo_simular(call).await,
         _ => return None,
     };
     Some(result)

@@ -122,6 +122,11 @@ pub(super) fn alias_terms_for_app(entry: &CanonicalAppEntry) -> Vec<String> {
         "capacita" => {
             aliases.insert("capacita-rust".to_string());
         }
+        "construvendo" => {
+            aliases.insert("construvendo-rust".to_string());
+            aliases.insert("olave bay".to_string());
+            aliases.insert("olave bay tower".to_string());
+        }
         _ => {}
     }
 
@@ -182,6 +187,7 @@ pub fn pm2_process_name_for_slug(slug: &str) -> &str {
         "desktop" => "desktop-rust",
         "paulo-vila-rust" => "paulo-vila",
         "capacita" => "capacita-rust",
+        "construvendo" => "construvendo-rust",
         "hera" => "hera-core",
         "whisper" => "hera-core",
         "audio-stt" => "hera-core",
