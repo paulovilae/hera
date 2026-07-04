@@ -338,6 +338,7 @@ pub async fn handle_generate(
                 0,
                 response_origin.contains("cloud"),
                 duration_ms,
+                parsed.trace_id.clone(),
             );
 
             return HandlerOutcome::Result {
@@ -626,6 +627,7 @@ pub async fn handle_generate(
                         total_tokens,
                         response_origin.contains("cloud"),
                         duration_ms,
+                        parsed.trace_id.clone(),
                     );
                 }
 

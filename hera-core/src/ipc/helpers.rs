@@ -1078,6 +1078,30 @@ pub async fn report_recall_feedback(
     let _ = call_memento("recall_feedback", payload).await;
 }
 
+/// Which node this Hera process runs on (genesis / anchor / ...), for telemetry.
+/// Mirrors the router's node-identity resolution: `HERA_NODE_ALIAS` overrides,
+/// else `HOSTNAME`. Empty string when neither is set.
+pub fn hera_node() -> String {
+    std::env::var("HERA_NODE_ALIAS")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_default()
+}
+
+/// Char-safe truncation for telemetry previews of tool args/results. Larger cap
+/// than the 160-char prompt preview (tool payloads are structured), but still
+/// bounded so a giant SQL result or file blob can't bloat the row. Not a
+/// redaction layer — secret-bearing args are only length-limited here.
+pub fn telemetry_preview(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > max_chars {
+        let mut s: String = trimmed.chars().take(max_chars).collect();
+        s.push('…');
+        s
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Fire-and-forget: records a usage event in Memento after each generate call.
 /// Fails silently — never blocks or panics the generate path.
 pub fn spawn_log_usage(
@@ -1091,6 +1115,7 @@ pub fn spawn_log_usage(
     total_tokens: u32,
     is_cloud: bool,
     latency_ms: u64,
+    trace_id: String,
 ) {
     tokio::spawn(async move {
         let payload = serde_json::json!({
@@ -1103,10 +1128,52 @@ pub fn spawn_log_usage(
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
             "is_cloud": is_cloud,
-            "latency_ms": latency_ms
+            "latency_ms": latency_ms,
+            "trace_id": trace_id,
+            "node": hera_node()
         });
         if call_memento("hera_log_usage", payload).await.is_none() {
             tracing::debug!("[Hera Usage] log_usage failed or timed out (best-effort)");
+        }
+    });
+}
+
+/// Fire-and-forget: records one per-tool-call telemetry row in Memento.
+/// This is the durable per-tool grain that was previously discarded — the
+/// data (name + args + result + success) already exists in memory at the tool
+/// execution site; this persists it keyed by `trace_id`. Best-effort, never
+/// blocks the tool path.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_log_tool_call(
+    trace_id: String,
+    session_id: String,
+    app_id: String,
+    route_profile: String,
+    seq: u32,
+    tool_name: String,
+    args_preview: String,
+    result_preview: String,
+    duration_ms: u64,
+    success: bool,
+    error: Option<String>,
+) {
+    tokio::spawn(async move {
+        let payload = serde_json::json!({
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "app_id": app_id,
+            "route_profile": route_profile,
+            "node": hera_node(),
+            "seq": seq,
+            "tool_name": tool_name,
+            "args_preview": args_preview,
+            "result_preview": result_preview,
+            "duration_ms": duration_ms,
+            "success": success,
+            "error": error
+        });
+        if call_memento("hera_log_tool_call", payload).await.is_none() {
+            tracing::debug!("[Hera Tool Telemetry] log_tool_call failed or timed out (best-effort)");
         }
     });
 }
