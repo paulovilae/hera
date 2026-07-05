@@ -5,10 +5,11 @@ use super::context::{
     prepare_runtime_execution_context, prepare_tool_result_followup_request,
 };
 use super::helpers::{
-    RuntimePromotionContext, canonicalize_user_id, infer_origin_from_model,
+    RuntimePromotionContext, canonicalize_user_id, hera_node, infer_origin_from_model,
     record_observation_and_promote_runtime_hint, record_runtime_observation,
     report_recall_feedback, save_chat_turn_event,
 };
+use super::inflight;
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
     FollowupStrategy, contextualize_tool_call, execute_parsed_tool_calls, execute_tool_followup,
@@ -168,6 +169,15 @@ pub async fn handle_generate_stream(
         && super::agentic_loop::is_agentic_cli_surface(&parsed)
     {
         if let Some(req) = chat_req.clone() {
+            // Wave 3 in-flight registry: this is the CLI coding/ops streaming
+            // path — exactly the surface where `hera_compile.sh` runs a long
+            // multi-iteration self-compile that previously looked hung.
+            inflight::insert(
+                &parsed.trace_id,
+                &parsed.app_name,
+                &parsed.route_profile_id,
+                &hera_node(),
+            );
             // stream_start
             let mut s = serde_json::to_string(&IpcResponse {
                 status: "stream_start".to_string(),
@@ -210,11 +220,20 @@ pub async fn handle_generate_stream(
             d.push('\n');
             let _ = stream.write_all(d.as_bytes()).await;
 
+            inflight::remove(&parsed.trace_id);
             return HandlerOutcome::DirectResponse;
         }
     }
 
     if let Some(req) = chat_req.clone() {
+        // Wave 3 in-flight registry: general streaming path (widgets). Removed
+        // right after the match below, which covers both the Ok and Err arms.
+        inflight::insert(
+            &parsed.trace_id,
+            &parsed.app_name,
+            &parsed.route_profile_id,
+            &hera_node(),
+        );
         let est_tokens = super::helpers::estimate_tokens(&req);
         tracing::info!(
             "🔊 [Hera Stream] Starting stream for app='{}' — {} msgs, ~{} tokens (lightweight_mode={})",
@@ -479,6 +498,7 @@ pub async fn handle_generate_stream(
                 let _ = record_runtime_observation(outcome.observation_payload).await;
             }
         }
+        inflight::remove(&parsed.trace_id);
     }
 
     HandlerOutcome::DirectResponse

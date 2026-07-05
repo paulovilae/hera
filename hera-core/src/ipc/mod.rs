@@ -23,6 +23,7 @@ pub mod handler_media;
 pub mod handler_stream;
 pub mod handler_tools;
 pub mod helpers;
+pub mod inflight;
 pub mod llm_audit;
 pub mod route_profiles;
 pub mod runtime_tools;
@@ -211,6 +212,21 @@ async fn dispatch(
         }
         "transcribe_audio" => handler_audio::handle_transcribe_audio(request, state).await,
         "get_tools" => handler_tools::handle_get_tools(request, state),
+        "hera_inflight" => {
+            // Cheap liveness poll (Wave 3): no LLM, no DB — just the process-global
+            // registry. Written directly (not via HandlerOutcome::Result, which
+            // only carries a flat `result_text` string) so callers get a clean
+            // top-level `{"inflight": [...]}` shape, safe to poll every ~1s.
+            let response = IpcResponse {
+                status: "success".to_string(),
+                data: serde_json::json!({ "inflight": inflight::snapshot() }),
+            };
+            if let Ok(mut res_str) = serde_json::to_string(&response) {
+                res_str.push('\n');
+                let _ = stream.write_all(res_str.as_bytes()).await;
+            }
+            HandlerOutcome::DirectResponse
+        }
         "download_lora" => handler_lora::handle_download_lora(request).await,
         "session_end" => {
             // Eagerly trigger Memento compress_session so cross-session memory is
