@@ -6,8 +6,10 @@
 
 use crate::ai::{ChatRequest, ChatResponse, InferenceError, LLMEngine};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use std::{fs, path::{Path, PathBuf}};
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 pub struct RouterEngine {
@@ -48,6 +50,61 @@ impl RouterEngine {
     }
 }
 
+/// Concurrency admission control (Hera concurrency/backpressure fix, 2026-07-05).
+///
+/// `hera-core` used to forward every concurrent `generate` request straight onto
+/// the single GPU `llama-server` (:8080) with NO admission control — under load
+/// (real bots + background derivation + agentic loops + `spawn_parallel_agents`
+/// fan-out, which self-connects back through this same IPC `generate` path)
+/// requests piled up, tail latency hit 49s, and clients timed out mid-flight
+/// ("Failed to write IPC response: Broken pipe (os error 32)"). See
+/// docs/HERA_CONCURRENCY_BACKPRESSURE.md for the full diagnosis.
+///
+/// Verified live on genesis (2026-07-05): the omni server's own `/props` reports
+/// `total_slots: 4` (llama-server auto-picked N=4 for `--parallel -1`).
+/// `Hera/scripts/start_native_omni.sh` now pins `--parallel` explicitly via
+/// `IMAGINEOS_OMNI_PARALLEL_SLOTS` (default 4) so the real backend slot count
+/// stays deterministic across restarts — keep `HERA_PRIMARY_ENGINE_SLOTS` (below)
+/// equal to that value; they are two separate processes/env domains so nothing
+/// enforces the equality automatically.
+///
+/// This semaphore bounds how many requests may be in-flight against the PRIMARY
+/// engine at once. Excess requests wait up to
+/// `HERA_PRIMARY_ENGINE_ACQUIRE_TIMEOUT_SECS` (default 8s) for a free slot; if
+/// none frees up in time, the primary attempt is treated exactly like a
+/// primary-engine error and the existing secondary/tertiary/cloud failover chain
+/// takes over — a fast, honest failover beats a silent 49s stall that
+/// broken-pipes the caller.
+///
+/// Known scope limit (documented, not silently dropped): this bounds admission
+/// uniformly for every caller — it does not yet distinguish interactive chat
+/// from background derivation (KG extraction, session/room/project summary
+/// compression). `ChatRequest` carries no priority/route_profile field today,
+/// so a true two-lane scheme needs that plumbed through every call site first.
+/// Uniform bounded-wait-then-failover still stops any single caller (including
+/// a runaway background task) from queuing indefinitely, which was the acute
+/// failure mode — full priority lanes are a follow-up, not this fix.
+fn primary_engine_semaphore() -> Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let slots = std::env::var("HERA_PRIMARY_ENGINE_SLOTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4);
+        Arc::new(Semaphore::new(slots))
+    })
+    .clone()
+}
+
+fn primary_engine_acquire_timeout() -> Duration {
+    let secs = std::env::var("HERA_PRIMARY_ENGINE_ACQUIRE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(8);
+    Duration::from_secs(secs)
+}
+
 #[async_trait::async_trait]
 impl LLMEngine for RouterEngine {
     async fn generate_content(&self, req: ChatRequest) -> Result<ChatResponse, InferenceError> {
@@ -63,19 +120,47 @@ impl LLMEngine for RouterEngine {
                 "🕯️ Routing inference execution via Primary Sovereign Engine (model='{}')...",
                 primary_req.model
             );
-            match self.primary_engine.generate_content(primary_req).await {
-                Ok(response) => {
-                    info!("✅ Primary sovereign execution successful");
-                    return Ok(response);
-                }
-                Err(e) => {
-                    if provider == "local_direct" {
-                        return Err(e); // Hard fail if local is strictly requested
+            let permit = tokio::time::timeout(
+                primary_engine_acquire_timeout(),
+                primary_engine_semaphore().acquire_owned(),
+            )
+            .await;
+            match permit {
+                Ok(Ok(_permit)) => {
+                    match self.primary_engine.generate_content(primary_req).await {
+                        Ok(response) => {
+                            info!("✅ Primary sovereign execution successful");
+                            return Ok(response);
+                        }
+                        Err(e) => {
+                            if provider == "local_direct" {
+                                return Err(e); // Hard fail if local is strictly requested
+                            }
+                            warn!(
+                                "⚠️ Primary sovereign execution failed: {:?}. Attempting standby failover...",
+                                e
+                            );
+                        }
                     }
+                }
+                Ok(Err(_closed)) => {
+                    warn!("⚠️ Primary engine semaphore closed unexpectedly; treating as saturated.");
+                    if provider == "local_direct" {
+                        return Err(InferenceError::ExecutionFailed(
+                            "Primary sovereign engine unavailable (semaphore closed).".to_string(),
+                        ));
+                    }
+                }
+                Err(_elapsed) => {
                     warn!(
-                        "⚠️ Primary sovereign execution failed: {:?}. Attempting standby failover...",
-                        e
+                        "⚠️ Primary sovereign engine saturated (all slots busy for {:?}) — failing over instead of queuing further...",
+                        primary_engine_acquire_timeout()
                     );
+                    if provider == "local_direct" {
+                        return Err(InferenceError::ExecutionFailed(
+                            "Primary sovereign engine busy (backend saturated); local_direct disallows failover.".to_string(),
+                        ));
+                    }
                 }
             }
 
@@ -170,16 +255,59 @@ impl LLMEngine for RouterEngine {
                 "🕯️ Routing STREAMING inference via Primary Sovereign Engine (model='{}')...",
                 primary_req.model
             );
-            match self.primary_engine.generate_stream(primary_req).await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => {
-                    if provider == "local_direct" {
-                        return Err(e);
+            let permit = tokio::time::timeout(
+                primary_engine_acquire_timeout(),
+                primary_engine_semaphore().acquire_owned(),
+            )
+            .await;
+            match permit {
+                Ok(Ok(owned_permit)) => {
+                    match self.primary_engine.generate_stream(primary_req).await {
+                        Ok(mut inner_rx) => {
+                            // Hold the slot permit for the WHOLE stream lifetime, not just
+                            // admission — a streaming generation still occupies a real GPU
+                            // slot until its last token, so release-on-admission would
+                            // undercount true concurrency.
+                            let (tx, rx) = tokio::sync::mpsc::channel(32);
+                            tokio::spawn(async move {
+                                let _permit = owned_permit; // dropped (released) when this task ends
+                                while let Some(item) = inner_rx.recv().await {
+                                    if tx.send(item).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                            return Ok(rx);
+                        }
+                        Err(e) => {
+                            if provider == "local_direct" {
+                                return Err(e);
+                            }
+                            warn!(
+                                "⚠️ Primary sovereign streaming failed: {:?}. Attempting standby failover...",
+                                e
+                            );
+                        }
                     }
+                }
+                Ok(Err(_closed)) => {
+                    warn!("⚠️ Primary engine semaphore closed unexpectedly; treating as saturated.");
+                    if provider == "local_direct" {
+                        return Err(InferenceError::ExecutionFailed(
+                            "Primary sovereign engine unavailable (semaphore closed).".to_string(),
+                        ));
+                    }
+                }
+                Err(_elapsed) => {
                     warn!(
-                        "⚠️ Primary sovereign streaming failed: {:?}. Attempting standby failover...",
-                        e
+                        "⚠️ Primary sovereign engine saturated (all slots busy for {:?}) — failing over instead of queuing further...",
+                        primary_engine_acquire_timeout()
                     );
+                    if provider == "local_direct" {
+                        return Err(InferenceError::ExecutionFailed(
+                            "Primary sovereign engine busy (backend saturated); local_direct disallows failover.".to_string(),
+                        ));
+                    }
                 }
             }
 
