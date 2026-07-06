@@ -126,6 +126,7 @@ To invoke a tool, you MUST output exactly this format:
             reasoning_effort: None,
             response_format: None,
             app: None,
+            priority: None,
             vision_model: None,
             tts_model: None,
             stt_model: None,

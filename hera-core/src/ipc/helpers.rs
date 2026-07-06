@@ -932,6 +932,7 @@ async fn extract_and_save_kg_triples(user_id: &str, app_id: &str, text: &str) {
             "temperature": 0.1,
             "context_budget_mode": "lightweight",
             "response_format": {"type": "json_object"},
+            "priority": "background",
         }
     });
 

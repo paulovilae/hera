@@ -79,14 +79,18 @@ impl RouterEngine {
 /// takes over — a fast, honest failover beats a silent 49s stall that
 /// broken-pipes the caller.
 ///
-/// Known scope limit (documented, not silently dropped): this bounds admission
-/// uniformly for every caller — it does not yet distinguish interactive chat
-/// from background derivation (KG extraction, session/room/project summary
-/// compression). `ChatRequest` carries no priority/route_profile field today,
-/// so a true two-lane scheme needs that plumbed through every call site first.
-/// Uniform bounded-wait-then-failover still stops any single caller (including
-/// a runaway background task) from queuing indefinitely, which was the acute
-/// failure mode — full priority lanes are a follow-up, not this fix.
+/// Two-lane priority (2026-07-06, closes item 3 of
+/// docs/HERA_CONCURRENCY_BACKPRESSURE.md): `ChatRequest.priority ==
+/// Some("background")` (see `is_background_priority`) skips the wait/failover
+/// path entirely — it takes an immediately-free slot via `try_acquire_owned`
+/// or is skipped outright, never queuing behind interactive chat and never
+/// spilling onto secondary/tertiary/cloud compute. Wired today at the one
+/// known internal fire-and-forget caller, `ipc::helpers::save_chat_turn_event`'s
+/// KG-triple extraction. Known remaining scope limit: Memento's own
+/// session/room/project summary derivation calls Hera `generate` over its own
+/// IPC path (not through this Rust caller), so it isn't tagged `background`
+/// yet — a follow-up needs to thread `"priority": "background"` into that
+/// call from the Memento side.
 fn primary_engine_semaphore() -> Arc<Semaphore> {
     static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SEM.get_or_init(|| {
@@ -108,6 +112,15 @@ fn primary_engine_acquire_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// `req.priority == Some("background")` marks fire-and-forget internal work
+/// (KG-triple extraction from `ipc::helpers::save_chat_turn_event`, future
+/// memory-derivation callers) that must never queue for a primary-engine slot
+/// behind interactive chat, and must never spill onto secondary/tertiary/cloud
+/// compute either — see docs/HERA_CONCURRENCY_BACKPRESSURE.md item 3.
+fn is_background_priority(req: &ChatRequest) -> bool {
+    req.priority.as_deref() == Some("background")
+}
+
 #[async_trait::async_trait]
 impl LLMEngine for RouterEngine {
     async fn generate_content(&self, req: ChatRequest) -> Result<ChatResponse, InferenceError> {
@@ -115,6 +128,20 @@ impl LLMEngine for RouterEngine {
         let local_req = prepare_local_request(&req);
         let cloud_req = prepare_cloud_request(&req);
         let cloud_allowed = cloud_fallback_allowed(&req);
+
+        // Background admission lane: take an immediately-free primary slot or
+        // skip outright — no wait, no secondary/tertiary/cloud failover. See
+        // `is_background_priority`.
+        if is_background_priority(&req) {
+            let primary_req = with_endpoint_override(local_req.clone(), "HERA_PRIMARY_OMNI_URL");
+            return match primary_engine_semaphore().try_acquire_owned() {
+                Ok(_permit) => self.primary_engine.generate_content(primary_req).await,
+                Err(_) => Err(InferenceError::ExecutionFailed(
+                    "Background-priority request skipped: primary engine saturated (no free slot)."
+                        .to_string(),
+                )),
+            };
+        }
 
         // Priority 1-3: Sovereign AI execution across owned compute
         if provider == "auto" || provider == "local" || provider == "local_direct" {
@@ -263,6 +290,35 @@ impl LLMEngine for RouterEngine {
         let local_req = prepare_local_request(&req);
         let cloud_req = prepare_cloud_request(&req);
         let cloud_allowed = cloud_fallback_allowed(&req);
+
+        // Background admission lane — see the equivalent branch in
+        // `generate_content` / `is_background_priority`. Streaming background
+        // callers are not expected in practice today, but the semantics must
+        // match: an immediately-free slot or an outright skip, never a wait
+        // and never secondary/tertiary/cloud failover.
+        if is_background_priority(&req) {
+            let primary_req = with_endpoint_override(local_req.clone(), "HERA_PRIMARY_OMNI_URL");
+            return match primary_engine_semaphore().try_acquire_owned() {
+                Ok(owned_permit) => {
+                    let inner_rx = self.primary_engine.generate_stream(primary_req).await?;
+                    let mut inner_rx = inner_rx;
+                    let (tx, rx) = tokio::sync::mpsc::channel(32);
+                    tokio::spawn(async move {
+                        let _permit = owned_permit;
+                        while let Some(item) = inner_rx.recv().await {
+                            if tx.send(item).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    Ok(rx)
+                }
+                Err(_) => Err(InferenceError::ExecutionFailed(
+                    "Background-priority stream skipped: primary engine saturated (no free slot)."
+                        .to_string(),
+                )),
+            };
+        }
 
         if provider == "auto" || provider == "local" || provider == "local_direct" {
             let primary_req = with_endpoint_override(local_req.clone(), "HERA_PRIMARY_OMNI_URL");
@@ -592,9 +648,51 @@ fn workload_cloud_fallback_policy(class_name: &str) -> Option<String> {
         .map(|entry| entry.policy.cloud_fallback)
 }
 
+/// Looks up the never_external policy for `app_name`. Distinguishes two
+/// silent-failure shapes that previously collapsed into the same `None`
+/// (which `cloud_fallback_allowed` treats as "not never_external" and falls
+/// through to workload-class inference, i.e. cloud-allowed by default):
+///
+/// - **App simply not listed** in `app_cloud_policy.yaml` — expected for most
+///   apps, stays silent, no warning needed.
+/// - **Registry unreachable** (dir not found, file missing, or unparseable)
+///   — a config/deploy problem that would silently fail-open the
+///   compliance-sensitive never_external gate (legal/Memento) on a node
+///   with cloud enabled. This now logs a `warn!` so it shows up in
+///   `pm2 logs hera-core` instead of vanishing (Capa 3 hardening gap,
+///   see docs/HERA_CLOUD_COST_SAFETY.md).
 fn app_cloud_fallback_policy(app_name: &str) -> Option<String> {
-    let registry_dir = locate_os_v3_registry_dir()?;
-    let file = load_yaml::<AppCloudPolicyFile>(&registry_dir.join("app_cloud_policy.yaml")).ok()?;
+    let registry_dir = match locate_os_v3_registry_dir() {
+        Some(dir) => dir,
+        None => {
+            warn!(
+                "⚠️ app_cloud_policy lookup for app='{}' failed: OS-v3 registry dir not found — never_external gate cannot see this app on this node; falling through to workload-class inference.",
+                app_name
+            );
+            return None;
+        }
+    };
+    let policy_path = registry_dir.join("app_cloud_policy.yaml");
+    if !policy_path.exists() {
+        warn!(
+            "⚠️ app_cloud_policy lookup for app='{}' failed: {} does not exist — never_external gate cannot see this app; falling through to workload-class inference.",
+            app_name,
+            policy_path.display()
+        );
+        return None;
+    }
+    let file = match load_yaml::<AppCloudPolicyFile>(&policy_path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!(
+                "⚠️ app_cloud_policy lookup for app='{}' failed to parse {}: {:?} — never_external gate cannot see this app; falling through to workload-class inference.",
+                app_name,
+                policy_path.display(),
+                error
+            );
+            return None;
+        }
+    };
     file.app_cloud_policies
         .into_iter()
         .find(|entry| entry.policy.app.eq_ignore_ascii_case(app_name))

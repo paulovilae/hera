@@ -664,6 +664,7 @@ mod tests {
             reasoning_effort: None,
             response_format: None,
             app: None,
+            priority: None,
         }
     }
 

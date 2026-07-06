@@ -586,6 +586,7 @@ App: {}{}{}{}\nSchema:\n{}",
         reasoning_effort: Some("medium".to_string()),
         response_format: None,
         app: None,
+        priority: None,
     };
 
     let resp = engine.generate_content(req).await.ok()?;
@@ -667,6 +668,7 @@ pub async fn summarize_tool_output_for_user(
         reasoning_effort: Some("low".to_string()),
         response_format: None,
         app: None,
+        priority: None,
     };
 
     let resp = engine.generate_content(req).await.ok()?;
@@ -854,6 +856,7 @@ mod tests {
             reasoning_effort: None,
             response_format: None,
             app: None,
+            priority: None,
         }
     }
 

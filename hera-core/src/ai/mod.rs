@@ -105,6 +105,18 @@ pub struct ChatRequest {
     /// (see `openai_compat.rs`); never forwarded to a provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
+
+    /// Admission priority against the primary-engine concurrency semaphore
+    /// (see `router::primary_engine_semaphore`). `Some("background")` marks
+    /// fire-and-forget internal work (e.g. KG-triple extraction spawned from
+    /// `ipc::helpers::save_chat_turn_event`) that must never queue behind
+    /// interactive chat for a GPU slot — it takes a slot only if one is
+    /// immediately free and is skipped otherwise. Any other value (including
+    /// `None`, the default for every existing caller) keeps the current
+    /// bounded-wait-then-failover behavior. Stripped before any outbound
+    /// cloud/local HTTP call, never forwarded to a provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

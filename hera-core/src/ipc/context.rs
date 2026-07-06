@@ -1088,6 +1088,7 @@ pub fn build_new_chat_request(prompt: &str, system_prompt: String) -> ChatReques
         reasoning_effort: None,
         response_format: None,
         app: None,
+        priority: None,
     }
 }
 
