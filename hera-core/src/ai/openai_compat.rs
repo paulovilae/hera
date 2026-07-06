@@ -60,6 +60,18 @@ impl LLMEngine for OpenAICompatEngine {
             normalized_req.model = discovered_model;
         }
 
+        // Cost-safety gate (Capa 3): the model string above is now FINAL —
+        // this is the only point guaranteed to see exactly what's about to
+        // be billed, regardless of how routing set it. Fails closed.
+        if normalized_req.provider.as_deref() == Some("cloud")
+            && let Err(reason) = crate::ai::cloud_budget::enforce_free_tier_model(
+                &active_endpoint,
+                &normalized_req.model,
+            )
+        {
+            return Err(InferenceError::ExecutionFailed(reason));
+        }
+
         // Force multimodal array format to avoid strict provider crashes (e.g. OpenRouter expecting objects instead of strings)
         for message in &mut normalized_req.messages {
             if let crate::ai::MessageContent::Text(text) = &message.content {
@@ -81,6 +93,7 @@ impl LLMEngine for OpenAICompatEngine {
             obj.remove("tts_model");
             obj.remove("stt_model");
             obj.remove("nsfw");
+            obj.remove("app");
             // Some cloud providers (e.g. Groq) return 400 on non-standard fields
             // like `reasoning_effort` (llama.cpp locally just ignores it). Strip
             // it for cloud-routed requests so the failover doesn't bounce.
@@ -163,6 +176,16 @@ impl LLMEngine for OpenAICompatEngine {
             normalized_req.model = discovered_model;
         }
 
+        // Cost-safety gate (Capa 3) — see generate_content() for rationale.
+        if normalized_req.provider.as_deref() == Some("cloud")
+            && let Err(reason) = crate::ai::cloud_budget::enforce_free_tier_model(
+                &active_endpoint,
+                &normalized_req.model,
+            )
+        {
+            return Err(InferenceError::ExecutionFailed(reason));
+        }
+
         for message in &mut normalized_req.messages {
             if let crate::ai::MessageContent::Text(text) = &message.content {
                 message.content =
@@ -181,6 +204,7 @@ impl LLMEngine for OpenAICompatEngine {
             obj.remove("tts_model");
             obj.remove("stt_model");
             obj.remove("nsfw");
+            obj.remove("app");
             // Some cloud providers (e.g. Groq) return 400 on non-standard fields
             // like `reasoning_effort` (llama.cpp locally just ignores it). Strip
             // it for cloud-routed requests so the failover doesn't bounce.

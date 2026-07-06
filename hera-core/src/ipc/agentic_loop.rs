@@ -663,6 +663,7 @@ mod tests {
             tool_choice: None,
             reasoning_effort: None,
             response_format: None,
+            app: None,
         }
     }
 

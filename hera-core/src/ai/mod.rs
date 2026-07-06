@@ -4,6 +4,7 @@
 //! Transparently maps these requests down into optimized native execution clients
 //! (e.g., Gemini HTTP endpoints, local Llama GPU endpoints).
 
+pub mod cloud_budget;
 pub mod context_engine;
 pub mod gemini;
 pub mod openai_compat;
@@ -95,6 +96,15 @@ pub struct ChatRequest {
     /// honor this field; passing through keeps Hera engine-agnostic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<serde_json::Value>,
+
+    /// App slug the request originated from (e.g. "legal", "garcero"). Set
+    /// authoritatively by `ipc::context::prepare_chat_request` from the
+    /// already-resolved `ParsedPayload.app_name` — used by
+    /// `router::cloud_fallback_allowed` for the app→never_external cost/
+    /// compliance gate. Stripped before any outbound cloud/local HTTP call
+    /// (see `openai_compat.rs`); never forwarded to a provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,8 +206,11 @@ pub trait SpeechToTextEngine {
     /// `lang` is an optional per-request language hint (e.g. `"es"`, `"en"`).
     /// When `None`, each engine falls back to its configured default
     /// (e.g. `HERA_WHISPER_LANGUAGE` env var, or auto-detection).
-    async fn transcribe_audio(&self, wav_bytes: &[u8], lang: Option<&str>)
-    -> Result<String, crate::ai::InferenceError>;
+    async fn transcribe_audio(
+        &self,
+        wav_bytes: &[u8],
+        lang: Option<&str>,
+    ) -> Result<String, crate::ai::InferenceError>;
 }
 
 // --- Streaming API Schema ---

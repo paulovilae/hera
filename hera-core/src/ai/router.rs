@@ -8,7 +8,10 @@ use crate::ai::{ChatRequest, ChatResponse, InferenceError, LLMEngine};
 use serde::Deserialize;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
@@ -144,7 +147,9 @@ impl LLMEngine for RouterEngine {
                     }
                 }
                 Ok(Err(_closed)) => {
-                    warn!("⚠️ Primary engine semaphore closed unexpectedly; treating as saturated.");
+                    warn!(
+                        "⚠️ Primary engine semaphore closed unexpectedly; treating as saturated."
+                    );
                     if provider == "local_direct" {
                         return Err(InferenceError::ExecutionFailed(
                             "Primary sovereign engine unavailable (semaphore closed).".to_string(),
@@ -165,8 +170,10 @@ impl LLMEngine for RouterEngine {
             }
 
             if let Some(secondary_engine) = &self.secondary_engine {
-                let secondary_req =
-                    with_explicit_endpoint(local_req.clone(), std::env::var("HERA_SECONDARY_OMNI_URL").ok());
+                let secondary_req = with_explicit_endpoint(
+                    local_req.clone(),
+                    std::env::var("HERA_SECONDARY_OMNI_URL").ok(),
+                );
                 info!("🕯️ Routing inference execution via Secondary Sovereign Engine...");
                 match secondary_engine.generate_content(secondary_req).await {
                     Ok(response) => {
@@ -186,8 +193,10 @@ impl LLMEngine for RouterEngine {
             }
 
             if let Some(tertiary_engine) = &self.tertiary_engine {
-                let tertiary_req =
-                    with_explicit_endpoint(local_req.clone(), std::env::var("HERA_TERTIARY_OMNI_URL").ok());
+                let tertiary_req = with_explicit_endpoint(
+                    local_req.clone(),
+                    std::env::var("HERA_TERTIARY_OMNI_URL").ok(),
+                );
                 info!("🕯️ Routing inference execution via Tertiary Sovereign Engine...");
                 match tertiary_engine.generate_content(tertiary_req).await {
                     Ok(response) => {
@@ -209,6 +218,12 @@ impl LLMEngine for RouterEngine {
 
         // Priority 4: Commercial cloud failover
         if (provider == "auto" || provider == "gemini" || provider == "cloud") && cloud_allowed {
+            if let Err(reason) = crate::ai::cloud_budget::check_and_record_cloud_call(
+                crate::ai::cloud_budget::estimate_tokens(&cloud_req),
+            ) {
+                warn!("🛑 Cloud call denied by cost-safety gate: {}", reason);
+                return Err(InferenceError::ExecutionFailed(reason));
+            }
             info!("☁️ Re-routing inference execution onto Cloud MultiModal Engine...");
             match self.cloud_engine.generate_content(cloud_req).await {
                 Ok(response) => {
@@ -291,7 +306,9 @@ impl LLMEngine for RouterEngine {
                     }
                 }
                 Ok(Err(_closed)) => {
-                    warn!("⚠️ Primary engine semaphore closed unexpectedly; treating as saturated.");
+                    warn!(
+                        "⚠️ Primary engine semaphore closed unexpectedly; treating as saturated."
+                    );
                     if provider == "local_direct" {
                         return Err(InferenceError::ExecutionFailed(
                             "Primary sovereign engine unavailable (semaphore closed).".to_string(),
@@ -312,8 +329,10 @@ impl LLMEngine for RouterEngine {
             }
 
             if let Some(secondary_engine) = &self.secondary_engine {
-                let secondary_req =
-                    with_explicit_endpoint(local_req.clone(), std::env::var("HERA_SECONDARY_OMNI_URL").ok());
+                let secondary_req = with_explicit_endpoint(
+                    local_req.clone(),
+                    std::env::var("HERA_SECONDARY_OMNI_URL").ok(),
+                );
                 match secondary_engine.generate_stream(secondary_req).await {
                     Ok(stream) => return Ok(stream),
                     Err(e) => {
@@ -329,8 +348,10 @@ impl LLMEngine for RouterEngine {
             }
 
             if let Some(tertiary_engine) = &self.tertiary_engine {
-                let tertiary_req =
-                    with_explicit_endpoint(local_req.clone(), std::env::var("HERA_TERTIARY_OMNI_URL").ok());
+                let tertiary_req = with_explicit_endpoint(
+                    local_req.clone(),
+                    std::env::var("HERA_TERTIARY_OMNI_URL").ok(),
+                );
                 match tertiary_engine.generate_stream(tertiary_req).await {
                     Ok(stream) => return Ok(stream),
                     Err(e) => {
@@ -347,6 +368,15 @@ impl LLMEngine for RouterEngine {
         }
 
         if (provider == "auto" || provider == "gemini" || provider == "cloud") && cloud_allowed {
+            if let Err(reason) = crate::ai::cloud_budget::check_and_record_cloud_call(
+                crate::ai::cloud_budget::estimate_tokens(&cloud_req),
+            ) {
+                warn!(
+                    "🛑 Cloud streaming call denied by cost-safety gate: {}",
+                    reason
+                );
+                return Err(InferenceError::ExecutionFailed(reason));
+            }
             info!(
                 "☁️ Re-routing STREAMING inference onto Cloud MultiModal Engine (model='{}')...",
                 cloud_req.model
@@ -387,6 +417,23 @@ struct WorkloadPolicyEntry {
 #[derive(Debug, Deserialize)]
 struct WorkloadPolicy {
     class: String,
+    cloud_fallback: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AppCloudPolicyFile {
+    #[serde(default)]
+    app_cloud_policies: Vec<AppCloudPolicyEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppCloudPolicyEntry {
+    policy: AppCloudPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppCloudPolicy {
+    app: String,
     cloud_fallback: String,
 }
 
@@ -492,6 +539,21 @@ fn cloud_fallback_allowed(req: &ChatRequest) -> bool {
         return false;
     }
 
+    // Cost-safety gate (Capa 3), app→never_external: takes precedence over
+    // the workload-class inference below, which only looks at request SHAPE
+    // (image present? stt/tts model? max_tokens/model name?) and — as of
+    // this writing — never actually emits "stateful" for a normal chat
+    // request. Compliance-sensitive apps (legal/judicial data, Memento's
+    // cross-app memory store) must never leave sovereign compute regardless
+    // of what the classifier concludes about THIS particular message.
+    // Registry-driven (`Apps/OS-v3/registry/app_cloud_policy.yaml`) so new
+    // apps can be added without a rebuild.
+    if let Some(app_name) = req.app.as_deref() {
+        if app_cloud_fallback_policy(app_name).as_deref() == Some("never_external") {
+            return false;
+        }
+    }
+
     match inferred_workload_class(req).as_deref() {
         Some("stateful") => false,
         Some(class_name) => workload_cloud_fallback_policy(class_name)
@@ -506,10 +568,9 @@ fn inferred_workload_class(req: &ChatRequest) -> Option<String> {
         return Some("speech".to_string());
     }
     let has_image = req.messages.iter().any(|message| match &message.content {
-        crate::ai::MessageContent::Parts(parts) => parts.iter().any(|part| matches!(
-            part,
-            crate::ai::ContentPart::ImageUrl { .. }
-        )),
+        crate::ai::MessageContent::Parts(parts) => parts
+            .iter()
+            .any(|part| matches!(part, crate::ai::ContentPart::ImageUrl { .. })),
         _ => false,
     });
     if has_image || req.vision_model.is_some() {
@@ -523,16 +584,28 @@ fn inferred_workload_class(req: &ChatRequest) -> Option<String> {
 
 fn workload_cloud_fallback_policy(class_name: &str) -> Option<String> {
     let registry_dir = locate_os_v3_registry_dir()?;
-    let file = load_yaml::<WorkloadPolicyFile>(&registry_dir.join("workload_policies.yaml")).ok()?;
+    let file =
+        load_yaml::<WorkloadPolicyFile>(&registry_dir.join("workload_policies.yaml")).ok()?;
     file.workload_policies
         .into_iter()
         .find(|entry| entry.policy.class == class_name)
         .map(|entry| entry.policy.cloud_fallback)
 }
 
+fn app_cloud_fallback_policy(app_name: &str) -> Option<String> {
+    let registry_dir = locate_os_v3_registry_dir()?;
+    let file = load_yaml::<AppCloudPolicyFile>(&registry_dir.join("app_cloud_policy.yaml")).ok()?;
+    file.app_cloud_policies
+        .into_iter()
+        .find(|entry| entry.policy.app.eq_ignore_ascii_case(app_name))
+        .map(|entry| entry.policy.cloud_fallback)
+}
+
 fn current_network_mode() -> Option<String> {
     let registry_dir = locate_os_v3_registry_dir()?;
-    let nodes = load_yaml::<NodeRegistryFile>(&registry_dir.join("nodes.yaml")).ok()?.nodes;
+    let nodes = load_yaml::<NodeRegistryFile>(&registry_dir.join("nodes.yaml"))
+        .ok()?
+        .nodes;
     let profiles = load_yaml::<NetworkProfileFile>(&registry_dir.join("network_profiles.yaml"))
         .ok()?
         .network_profiles;
@@ -592,7 +665,12 @@ fn current_node_alias(nodes: &[NodeEntry]) -> Option<String> {
     }
 
     let hostname = std::env::var("HOSTNAME").ok()?;
-    nodes.iter()
-        .find(|node| node.profile.hostname == hostname || node.profile.alias == hostname || node.id == hostname)
+    nodes
+        .iter()
+        .find(|node| {
+            node.profile.hostname == hostname
+                || node.profile.alias == hostname
+                || node.id == hostname
+        })
         .map(|node| node.id.clone())
 }
