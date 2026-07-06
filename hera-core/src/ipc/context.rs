@@ -958,13 +958,14 @@ pub async fn build_full_system_prompt(
         )
     };
 
-    let think_directive = if lightweight_mode || budget.allow_tools {
+    let lightweight_prompt = lightweight_mode || budget.mode == "lightweight";
+    let think_directive = if lightweight_prompt || budget.allow_tools {
         // When tools are enabled: skip chain-of-thought — go straight to tool call
         "\n\nRespond naturally and briefly. Do not use <think> tags."
     } else {
         "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag."
     };
-    let json_directive = if lightweight_mode {
+    let json_directive = if lightweight_prompt || !budget.allow_tools {
         ""
     } else {
         "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be EXACTLY this format, with NO conversational text: <tool_call>{\"name\": \"function_name\", \"arguments\": {\"arg1\": \"val\"}}</tool_call>"
