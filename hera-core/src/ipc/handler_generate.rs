@@ -619,11 +619,33 @@ pub async fn handle_generate(
                 }
 
                 // Path B — usage logging (best-effort, fire-and-forget).
+                //
+                // resp.usage is normally populated correctly here (llama-server's
+                // OpenAI-compatible response includes a real `usage` object, and
+                // openai_compat.rs/gemini.rs both map it into ChatUsage — verified
+                // live 2026-07-05 via a direct curl to :8080). It can still be
+                // `None` for response shapes that don't carry it (e.g. a B3 cloud
+                // escalation reuses the ORIGINAL local resp_usage, not resp2's —
+                // a separate known gap, not fixed here). Rather than log a hard
+                // 0/0/0 (which silently undercounts real spend/local-compute use
+                // in hera_usage_events), fall back to the same cheap char/4
+                // estimate already computed for the audit event (`est_tokens`)
+                // for the prompt side, and estimate completion tokens the same
+                // way from the final result_text. Approximate, but far closer
+                // to reality than zero, and free (no extra engine round-trip).
                 {
-                    let prompt_tokens = resp_usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
-                    let completion_tokens =
-                        resp_usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
-                    let total_tokens = resp_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+                    let (prompt_tokens, completion_tokens, total_tokens) = match &resp_usage {
+                        Some(usage) => (
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.total_tokens,
+                        ),
+                        None => {
+                            let est_prompt = est_tokens as u32;
+                            let est_completion = (result_text.len() / 4) as u32;
+                            (est_prompt, est_completion, est_prompt + est_completion)
+                        }
+                    };
                     spawn_log_usage(
                         parsed.app_name.clone(),
                         canonicalize_user_id(
