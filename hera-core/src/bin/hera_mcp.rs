@@ -187,12 +187,56 @@ fn has_json_directive(prompt: &str) -> bool {
         || (p.contains("respond") && p.contains("json") && p.contains("only"))
 }
 
+/// True when this request targets Ava's dedicated coding surface — i.e. the caller
+/// asked for `route_profile="coding"` (or set `caller`/`app` to "coding"/"ava_coder").
+/// The 6 surgical coding tools live behind that surface and 4 of them
+/// (edit_file/write_file/cargo_check/cargo_test) are Critical risk.
+fn is_coding_surface(params: &GenerateTextParams) -> bool {
+    let is_coding = |value: &str| matches!(value.trim(), "coding" | "ava_coder");
+    params
+        .route_profile
+        .as_deref()
+        .map(is_coding)
+        .unwrap_or(false)
+        || params.caller.as_deref().map(is_coding).unwrap_or(false)
+        || is_coding(&params.app)
+}
+
 async fn send_ipc_generate(params: &GenerateTextParams) -> String {
-    let permissions = if params.permissions.is_empty() {
-        json!(["all"])
+    // Base permission set requested by the MCP client.
+    let mut perms: Vec<String> = if params.permissions.is_empty() {
+        vec!["all".to_string()]
     } else {
-        json!(params.permissions)
+        params.permissions.clone()
     };
+
+    // Coding surface: mirror `bin/claude.rs --coding`. The `all` wildcard grants
+    // Low/High-risk tools but NOT Critical ones, and the 6 coding tools include 4
+    // Critical (edit_file/write_file/cargo_check/cargo_test). Without `unsafe_all`
+    // the agentic loop offers the tools but execution is denied → the model reports
+    // "permission restrictions" and never completes (the observed Bug 2). Grant the
+    // explicit coding tools + `unsafe_all` so `route_profile="coding"` works out of
+    // the box from any MCP client, not just the SSH `claude --coding` path. Only
+    // fires when the caller explicitly opted into the coding surface (no regression
+    // for generic requests).
+    if is_coding_surface(params) {
+        for tool in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "grep_search",
+            "glob_search",
+            "cargo_check",
+            "cargo_test",
+            "unsafe_all",
+        ] {
+            if !perms.iter().any(|existing| existing == tool) {
+                perms.push(tool.to_string());
+            }
+        }
+    }
+    let permissions = json!(perms);
+
     let mut inner = json!({
         "prompt": params.prompt,
         "persona_path": if params.persona_path.is_empty() { serde_json::Value::Null } else { json!(params.persona_path) },
@@ -243,6 +287,11 @@ async fn send_ipc_generate(params: &GenerateTextParams) -> String {
         .filter(|value| !value.is_empty())
     {
         inner["caller"] = json!(caller);
+    } else if is_coding_surface(params) {
+        // Coding surface without an explicit caller: default it so the coding tools'
+        // `allowed_callers` gating and `is_coding_context` resolve to the coding
+        // persona (mirrors `bin/claude.rs` setting `app="coding"`).
+        inner["caller"] = json!("coding");
     }
 
     let payload = json!({
