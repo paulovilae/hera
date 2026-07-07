@@ -84,6 +84,14 @@ pub struct ParsedPayload {
     pub context_budget: ContextBudget,
     /// reasoning_effort hint derived from query difficulty (low/medium/high).
     pub reasoning_effort: String,
+    /// Tool names the caller declares MUST be called successfully before the
+    /// agentic loop is allowed to close with a plain-text answer (e.g.
+    /// `["write_file"]` for a "read the app, write SPEC.md" job). Empty by
+    /// default — most callers don't need this contract. See the hard-gate in
+    /// `agentic_loop::run_agentic_loop`, added after observing the local model
+    /// declare a long read-only exploration "done" without ever writing the
+    /// file it was explicitly asked to produce.
+    pub required_tools: Vec<String>,
 }
 
 pub fn apply_runtime_preflight(
@@ -804,6 +812,15 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
     };
 
     let persona_drift = persona_path != route_profile.persona_path;
+    let required_tools: Vec<String> = payload
+        .get("required_tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
 
     ParsedPayload {
         prompt,
@@ -827,6 +844,7 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         context_budget,
         // Refined by difficulty classification in prepare_runtime_execution_context.
         reasoning_effort: "medium".to_string(),
+        required_tools,
     }
 }
 

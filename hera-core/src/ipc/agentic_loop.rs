@@ -292,6 +292,18 @@ pub async fn run_agentic_loop(
     // work has been verified green, without firing on a model that merely runs a
     // verification BEFORE editing (e.g. a project that already compiles).
     let mut ever_edited = false;
+    // Required-tools hard gate: caller declared (via `required_tools` on the
+    // payload) that specific tools MUST succeed before the loop is allowed to
+    // close with a plain answer. Diagnosed gap: the local model sometimes
+    // explores a task extensively (20+ read/grep/glob calls) and then declares
+    // itself "done" with a text-only answer, never having called the write it
+    // was explicitly asked to perform — no amount of prompt wording reliably
+    // prevented this. Unlike the verify gate above (opt-in, unproven), this one
+    // has an explicit caller-declared contract, so it defaults ON whenever
+    // `required_tools` is non-empty.
+    let mut required_tools_done: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut required_tool_nudged = false;
 
     for iter in 0..max {
         // Per-iteration START log + registry update — this is what kills the
@@ -343,6 +355,60 @@ pub async fn run_agentic_loop(
 
         let calls = extract_tool_calls(&content, &choice.message.tool_calls);
         if calls.is_empty() {
+            // Required-tools hard gate: the model wants to give a plain answer,
+            // but the caller declared a tool (e.g. write_file) that MUST succeed
+            // first and it never did. Nudge once, explicitly naming the missing
+            // tool(s) — then give up with a distinct stop_reason so the caller
+            // (which should verify the actual artifact, e.g. checking the file
+            // exists — never trust stop_reason alone) can tell "declared done
+            // without doing it" apart from a normal "done".
+            let missing_required: Vec<&String> = parsed
+                .required_tools
+                .iter()
+                .filter(|required| !required_tools_done.contains(*required))
+                .collect();
+            if !missing_required.is_empty() && !required_tool_nudged {
+                required_tool_nudged = true;
+                let missing_list = missing_required
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::info!(
+                    "🔁 [Hera Loop] required-tools gate fired at iter {} — missing: {}",
+                    iter,
+                    missing_list
+                );
+                req.messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Text(content),
+                });
+                req.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: MessageContent::Text(format!(
+                        "Your task is NOT complete: you must call the following tool(s) before finishing: {missing_list}. Do not explain or summarize — emit the <tool_call> for it now, with the actual content/arguments needed."
+                    )),
+                });
+                continue;
+            }
+            if !missing_required.is_empty() {
+                tracing::warn!(
+                    "🔁 [Hera Loop] required-tools gate: giving up after nudge, still missing: {}",
+                    missing_required
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return AgenticLoopOutcome {
+                    result_text: content,
+                    model: last_model,
+                    origin: last_origin,
+                    executed_calls_json,
+                    iterations: iter + 1,
+                    stop_reason: "required_tool_missing",
+                };
+            }
             // Verify-before-done gate: the model is trying to finish, but it
             // edited files and never confirmed they build/pass. Nudge it once to
             // run a verification before accepting the answer. This targets the
@@ -410,6 +476,11 @@ pub async fn run_agentic_loop(
         let round_verified_green = round_passed_tests(&summary.executed_results);
         if round_did_edit(&summary.executed_results) {
             ever_edited = true;
+        }
+        for (name, success) in &summary.executed_results {
+            if *success && parsed.required_tools.iter().any(|required| required == name) {
+                required_tools_done.insert(name.clone());
+            }
         }
         edited_pending = update_edited_pending(edited_pending, &summary.executed_results);
         executed_calls_json.extend(summary.executed_calls_json);
@@ -632,6 +703,14 @@ mod tests {
             persona_drift: false,
             context_budget: context_budget_for_mode("standard", false),
             reasoning_effort: "medium".to_string(),
+            required_tools: Vec::new(),
+        }
+    }
+
+    fn test_parsed_with_required_tools(required_tools: Vec<&str>) -> ParsedPayload {
+        ParsedPayload {
+            required_tools: required_tools.into_iter().map(String::from).collect(),
+            ..test_parsed()
         }
     }
 
@@ -743,6 +822,36 @@ mod tests {
         // is denied (empty permissions) so it is not counted in executed_calls_json.
         assert!(outcome.executed_calls_json.is_empty());
         assert!(outcome.result_text.contains("conclusion"));
+    }
+
+    #[tokio::test]
+    async fn required_tools_gate_nudges_then_gives_up_if_never_called() {
+        // The model never emits a tool call, twice in a row (a text-only
+        // "exploration then done" pattern). required_tools=["write_file"] means
+        // the loop must NOT accept the first plain answer — it nudges once, and
+        // only gives up (with a distinct stop_reason) if the model still never
+        // calls the required tool.
+        let engine: Arc<dyn LLMEngine + Send + Sync> = Arc::new(ScriptedEngine::new(vec![
+            "Here is my summary of the app, no file written.",
+            "I have finished analyzing the app.",
+        ]));
+        let parsed = test_parsed_with_required_tools(vec!["write_file"]);
+        let outcome = run_agentic_loop(&engine, base_request(), &parsed, None).await;
+        assert_eq!(outcome.stop_reason, "required_tool_missing");
+        // 2 generations happened (the nudge bought it a second try) — proves the
+        // gate did not accept the first plain answer as "done".
+        assert_eq!(outcome.iterations, 2);
+    }
+
+    #[tokio::test]
+    async fn required_tools_gate_is_inert_when_not_declared() {
+        // Same script as above, but no required_tools declared: normal "done"
+        // behaviour on the very first plain answer, unaffected by the new gate.
+        let engine: Arc<dyn LLMEngine + Send + Sync> =
+            Arc::new(ScriptedEngine::new(vec!["Just an answer, no tools."]));
+        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed(), None).await;
+        assert_eq!(outcome.stop_reason, "done");
+        assert_eq!(outcome.iterations, 1);
     }
 
     #[tokio::test]
