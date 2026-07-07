@@ -332,6 +332,15 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
             | "mc_add_wishlist"
             | "mc_set_objective"
             | "animate_avatar"
+            // dispatched in dispatch_platform_tool (dispatch.rs) but authored by
+            // parallel sessions without a mirror entry — added to keep the
+            // all_registered_function_tools_have_runtime_dispatch invariant green.
+            | "review_image"
+            | "bash_exec"
+            | "generate_access_link"
+            | "git_add"
+            | "git_commit"
+            | "pm2_restart"
     )
 }
 
@@ -345,7 +354,15 @@ fn is_data_tool_name(tool_name: &str) -> bool {
             | "memento_vector_search"
             | "save_memory"
             | "query_memory"
+            // dispatched in dispatch_data_tool (dispatch.rs) via productivity::*
+            | "recall_session_context"
+            | "document_to_text"
     )
+}
+
+#[cfg(test)]
+fn is_construvendo_tool_name(tool_name: &str) -> bool {
+    matches!(tool_name, "construvendo_faq" | "construvendo_simular")
 }
 
 #[cfg(test)]
@@ -451,6 +468,7 @@ pub(crate) fn tool_has_runtime_dispatch(tool_name: &str, execution_kind: Option<
                 || is_data_tool_name(tool_name)
                 || is_movilo_tool_name(tool_name)
                 || is_latinos_tool_name(tool_name)
+                || is_construvendo_tool_name(tool_name)
         }
         Some("http_adapter") => {
             is_brand_tool_name(tool_name)
