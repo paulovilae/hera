@@ -24,5 +24,4 @@ export CUDA_VISIBLE_DEVICES="${GPU_TARGET}"
     --steps 8 \
     --cfg-scale 1.0 \
     --lora-model-dir /home/paulo/models/image-stack/loras \
-    --vae-on-cpu \
     --fa
