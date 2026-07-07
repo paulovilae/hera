@@ -128,6 +128,12 @@ impl LLMEngine for RouterEngine {
         let local_req = prepare_local_request(&req);
         let cloud_req = prepare_cloud_request(&req);
         let cloud_allowed = cloud_fallback_allowed(&req);
+        // Preserve the real reason the local tiers failed. When cloud failover is
+        // disallowed (the default sovereign policy) we surface THIS instead of a
+        // misleading "cloud fallback disallowed" message — the local engine is the
+        // actual fault, not the cloud policy (Bug 3: intermittent "LLM request
+        // failed" on standard+tools requests when the local backend errors).
+        let mut last_local_error: Option<InferenceError> = None;
 
         // Background admission lane: take an immediately-free primary slot or
         // skip outright — no wait, no secondary/tertiary/cloud failover. See
@@ -170,6 +176,7 @@ impl LLMEngine for RouterEngine {
                                 "⚠️ Primary sovereign execution failed: {:?}. Attempting standby failover...",
                                 e
                             );
+                            last_local_error = Some(e);
                         }
                     }
                 }
@@ -215,6 +222,7 @@ impl LLMEngine for RouterEngine {
                             "⚠️ Secondary sovereign execution failed: {:?}. Attempting tertiary failover...",
                             e
                         );
+                        last_local_error = Some(e);
                     }
                 }
             }
@@ -238,6 +246,7 @@ impl LLMEngine for RouterEngine {
                             "⚠️ Tertiary sovereign execution failed: {:?}. Attempting cloud failover...",
                             e
                         );
+                        last_local_error = Some(e);
                     }
                 }
             }
@@ -268,6 +277,18 @@ impl LLMEngine for RouterEngine {
         }
 
         if !cloud_allowed && (provider == "auto" || provider == "gemini" || provider == "cloud") {
+            // If a local tier actually ran and failed, surface THAT — the operator
+            // needs the real fault, not a message that blames the (correctly
+            // disabled) cloud policy. Only when no local attempt was made (e.g.
+            // provider explicitly "gemini"/"cloud") is the policy message accurate.
+            if let Some(local_err) = last_local_error {
+                return Err(InferenceError::ExecutionFailed(format!(
+                    "Sovereign local inference failed and cloud failover is disabled \
+                     (HERA_ALLOW_CLOUD_FALLBACK not set). Local engine error: {local_err}. \
+                     Fix the local model backend, or set HERA_ALLOW_CLOUD_FALLBACK=1 to permit \
+                     cloud failover."
+                )));
+            }
             return Err(InferenceError::ExecutionFailed(
                 "External cloud fallback is disallowed by current sovereign policy.".to_string(),
             ));
@@ -290,6 +311,9 @@ impl LLMEngine for RouterEngine {
         let local_req = prepare_local_request(&req);
         let cloud_req = prepare_cloud_request(&req);
         let cloud_allowed = cloud_fallback_allowed(&req);
+        // See generate_content: preserve the real local failure so a disallowed
+        // cloud failover surfaces the actual fault, not the cloud-policy message.
+        let mut last_local_error: Option<InferenceError> = None;
 
         // Background admission lane — see the equivalent branch in
         // `generate_content` / `is_background_priority`. Streaming background
@@ -358,6 +382,7 @@ impl LLMEngine for RouterEngine {
                                 "⚠️ Primary sovereign streaming failed: {:?}. Attempting standby failover...",
                                 e
                             );
+                            last_local_error = Some(e);
                         }
                     }
                 }
@@ -399,6 +424,7 @@ impl LLMEngine for RouterEngine {
                             "⚠️ Secondary sovereign streaming failed: {:?}. Attempting tertiary failover...",
                             e
                         );
+                        last_local_error = Some(e);
                     }
                 }
             }
@@ -418,6 +444,7 @@ impl LLMEngine for RouterEngine {
                             "⚠️ Tertiary sovereign streaming failed: {:?}. Attempting cloud failover...",
                             e
                         );
+                        last_local_error = Some(e);
                     }
                 }
             }
@@ -448,6 +475,14 @@ impl LLMEngine for RouterEngine {
         }
 
         if !cloud_allowed && (provider == "auto" || provider == "gemini" || provider == "cloud") {
+            if let Some(local_err) = last_local_error {
+                return Err(InferenceError::ExecutionFailed(format!(
+                    "Sovereign local streaming failed and cloud failover is disabled \
+                     (HERA_ALLOW_CLOUD_FALLBACK not set). Local engine error: {local_err}. \
+                     Fix the local model backend, or set HERA_ALLOW_CLOUD_FALLBACK=1 to permit \
+                     cloud failover."
+                )));
+            }
             return Err(InferenceError::ExecutionFailed(
                 "External cloud fallback is disallowed by current sovereign policy.".to_string(),
             ));
