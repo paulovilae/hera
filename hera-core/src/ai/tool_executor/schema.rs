@@ -306,6 +306,8 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
             | "run_code"
             | "web_scraper"
             | "write_file"
+            | "write_workspace_file"
+            | "finish_bootstrap"
             | "spline_interact"
             | "desktop_click"
             | "desktop_type"

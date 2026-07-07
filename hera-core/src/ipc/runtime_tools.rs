@@ -77,6 +77,16 @@ pub fn contextualize_tool_call(
             &parsed.app_name
         })
     });
+    if !parsed.persona_path.is_empty() {
+        // Trusted server-side value. INSERT (overwrite) rather than entry().or_insert so a
+        // bot cannot spoof its workspace target via a model-supplied `_persona_path`.
+        // Consumed by the character-workspace tools to confine writes to the bot's own
+        // Agents/workspaces/{name}/ directory.
+        object.insert(
+            "_persona_path".to_string(),
+            serde_json::json!(parsed.persona_path),
+        );
+    }
 
     crate::ai::tool_executor::ToolCall {
         name: tool_call.name.clone(),

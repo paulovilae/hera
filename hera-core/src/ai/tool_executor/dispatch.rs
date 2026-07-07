@@ -228,6 +228,8 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "run_code" => platform::execute_run_code(call).await,
         "web_scraper" => platform::execute_web_scraper(call).await,
         "write_file" => platform::execute_write_file(call).await,
+        "write_workspace_file" => platform::execute_write_workspace_file(call).await,
+        "finish_bootstrap" => platform::execute_finish_bootstrap(call).await,
         "edit_file" => coding::execute_edit_file(call).await,
         "grep_search" => coding::execute_grep_search(call).await,
         "glob_search" => coding::execute_glob_search(call).await,
