@@ -183,6 +183,22 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
         } else {
             text.trim()
         };
+        // A weak local model sometimes drops the <tool_call> wrapper entirely and
+        // just fences the JSON like a normal answer (```json\n{...}\n```). Without
+        // this strip, `starts_with('{')` below is false (the text starts with the
+        // fence marker) and the whole call is silently dropped, surfacing to the
+        // caller as a "final answer" that is actually an unexecuted tool call.
+        // Observed 2026-07-07: hera_compile.sh on Consulting-rust got exactly this
+        // shape back verbatim instead of a real cargo_check run.
+        let stripped = stripped
+            .strip_prefix("```json")
+            .or_else(|| stripped.strip_prefix("```"))
+            .map(|rest| rest.trim_start())
+            .unwrap_or(stripped);
+        let stripped = stripped
+            .strip_suffix("```")
+            .map(|rest| rest.trim_end())
+            .unwrap_or(stripped);
         if stripped.starts_with('{') {
             let mut brace_count = 0;
             let mut end_idx = 0;
@@ -590,5 +606,35 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("cartera")
         );
+    }
+
+    #[test]
+    fn parses_bare_json_fenced_tool_call_without_wrapper_tags() {
+        // Regression for 2026-07-07: a weak local model dropped the <tool_call>
+        // wrapper and just fenced the JSON like a normal markdown answer. Before
+        // the fix, `starts_with('{')` failed (text started with the fence marker)
+        // and the call was silently dropped — the caller saw the raw JSON as a
+        // "final answer" instead of an executed tool.
+        let text = "```json\n{\"name\":\"cargo_check\",\"arguments\":{\"path\":\"/mnt/workspace/Programs/apps/OS/Apps/Consulting-rust\"}}\n```";
+
+        let calls = parse_tool_calls(text);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "cargo_check");
+        assert_eq!(
+            calls[0]
+                .arguments
+                .get("path")
+                .and_then(|value| value.as_str()),
+            Some("/mnt/workspace/Programs/apps/OS/Apps/Consulting-rust")
+        );
+    }
+
+    #[test]
+    fn parses_bare_json_fence_without_language_tag() {
+        let text = "```\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"/x\"}}\n```";
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
     }
 }
