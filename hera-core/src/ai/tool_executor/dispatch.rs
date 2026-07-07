@@ -3,8 +3,9 @@
 use serde_json::Value;
 
 use crate::ai::tools::{
-    apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding, data, email_imap,
-    geo, infra_health, infra_smoke, mission_control, platform, productivity, storage,
+    apps_construvendo, apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding,
+    data, deploy, email_imap, geo, infra_health, infra_smoke, mission_control, platform,
+    productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -60,6 +61,82 @@ pub(super) fn tool_error_envelope(call: &ToolCall, error: &str, duration_ms: u12
     })
 }
 
+/// Monotonic sequence stamped on each durable tool-call record. Ordering within
+/// a trace is authoritative via the row `id`; this is a cheap secondary hint.
+static TOOL_CALL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Preview budget for durable per-tool-call telemetry (args + result).
+const TOOL_TELEMETRY_PREVIEW_CHARS: usize = 2000;
+
+/// Context keys injected by `contextualize_tool_call` (ipc/runtime_tools.rs).
+/// Stripped from the args preview so the durable record shows the tool's real
+/// arguments, not Hera's routing plumbing.
+const INJECTED_CONTEXT_KEYS: &[&str] = &[
+    "trace_id",
+    "session_id",
+    "chat_id",
+    "app",
+    "app_name",
+    "caller",
+    "route_profile",
+];
+
+/// Emit one durable per-tool-call record to Memento (best-effort, fire-and-forget).
+///
+/// This lives inside `execute_tool` — the single function every execution path
+/// funnels through (fast-path query planner, streaming, retry, parsed-tool loop,
+/// direct `execute_tool` IPC) — so no path can silently skip telemetry the way
+/// the earlier ipc-loop-only instrumentation let `memento_query`'s fast-path do.
+/// Correlation keys ride in `call.arguments` (injected by contextualize_tool_call);
+/// direct/un-contextualized calls simply log with empty keys.
+fn emit_tool_call_telemetry(
+    call: &ToolCall,
+    result_output: &str,
+    duration_ms: u128,
+    success: bool,
+    error: Option<&str>,
+) {
+    let obj = call.arguments.as_object();
+    let get = |key: &str| -> String {
+        obj.and_then(|map| map.get(key))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let app_id = {
+        let app = get("app");
+        if app.is_empty() { get("app_name") } else { app }
+    };
+
+    // Strip Hera-injected context keys from the args preview.
+    let clean_args = match obj {
+        Some(map) => {
+            let filtered: serde_json::Map<String, Value> = map
+                .iter()
+                .filter(|(key, _)| !INJECTED_CONTEXT_KEYS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            Value::Object(filtered).to_string()
+        }
+        None => call.arguments.to_string(),
+    };
+
+    let seq = TOOL_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::ipc::helpers::spawn_log_tool_call(
+        get("trace_id"),
+        get("session_id"),
+        app_id,
+        get("route_profile"),
+        seq,
+        call.name.clone(),
+        crate::ipc::helpers::telemetry_preview(&clean_args, TOOL_TELEMETRY_PREVIEW_CHARS),
+        crate::ipc::helpers::telemetry_preview(result_output, TOOL_TELEMETRY_PREVIEW_CHARS),
+        duration_ms as u64,
+        success,
+        error.map(|message| message.to_string()),
+    );
+}
+
 /// Execute a tool call using existing Hera infrastructure.
 /// Returns a ToolResult with the output string.
 pub async fn execute_tool(call: &ToolCall) -> ToolResult {
@@ -73,13 +150,9 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
             "Caller '{}' is not allowed to execute tool '{}'.",
             caller, tool_name
         );
-        audit_tool_execution(
-            call,
-            false,
-            start.elapsed().as_millis(),
-            false,
-            Some(&error),
-        );
+        let elapsed = start.elapsed().as_millis();
+        audit_tool_execution(call, false, elapsed, false, Some(&error));
+        emit_tool_call_telemetry(call, &error, elapsed, false, Some(&error));
         return ToolResult {
             name: tool_name,
             success: false,
@@ -90,12 +163,18 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
     let timeout = std::time::Duration::from_millis(tool_timeout_ms(&call.name));
     match tokio::time::timeout(timeout, execute_tool_inner(call)).await {
         Ok(result) => {
-            audit_tool_execution(
+            let elapsed = start.elapsed().as_millis();
+            audit_tool_execution(call, result.success, elapsed, false, None);
+            emit_tool_call_telemetry(
                 call,
+                &result.output,
+                elapsed,
                 result.success,
-                start.elapsed().as_millis(),
-                false,
-                None,
+                if result.success {
+                    None
+                } else {
+                    Some(result.output.as_str())
+                },
             );
             result
         }
@@ -109,7 +188,9 @@ pub async fn execute_tool(call: &ToolCall) -> ToolResult {
                 "Error: Tool execution timed out after {} ms.",
                 timeout.as_millis()
             );
-            audit_tool_execution(call, false, start.elapsed().as_millis(), true, Some(&error));
+            let elapsed = start.elapsed().as_millis();
+            audit_tool_execution(call, false, elapsed, true, Some(&error));
+            emit_tool_call_telemetry(call, &error, elapsed, false, Some(&error));
             ToolResult {
                 name: tool_name,
                 success: false,
@@ -169,6 +250,9 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "read_notes" => productivity::execute_read_notes(call).await,
         "list_image_loras" => platform::execute_list_image_loras(call).await,
         "corporate_research" => platform::execute_corporate_research(call).await,
+        "git_add" => deploy::execute_git_add(call).await,
+        "git_commit" => deploy::execute_git_commit(call).await,
+        "pm2_restart" => deploy::execute_pm2_restart(call).await,
         _ => return None,
     };
     Some(result)
@@ -211,6 +295,8 @@ async fn dispatch_metadata_tool(call: &ToolCall) -> Option<ToolResult> {
             } else if let Some(result) = dispatch_data_tool(call).await {
                 Some(result)
             } else if let Some(result) = dispatch_movilo_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_construvendo_tool(call).await {
                 Some(result)
             } else {
                 dispatch_latinos_tool(call).await
@@ -313,6 +399,15 @@ async fn dispatch_movilo_tool(call: &ToolCall) -> Option<ToolResult> {
         "movilo_get_plans" => apps_movilo::execute_movilo_get_plans(call).await,
         "movilo_check_affiliation" => apps_movilo::execute_movilo_check_affiliation(call).await,
         "movilo_validate_qr" => apps_movilo::execute_movilo_validate_qr(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_construvendo_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "construvendo_faq" => apps_construvendo::execute_construvendo_faq(call).await,
+        "construvendo_simular" => apps_construvendo::execute_construvendo_simular(call).await,
         _ => return None,
     };
     Some(result)

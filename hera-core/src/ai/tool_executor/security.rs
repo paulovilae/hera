@@ -25,7 +25,10 @@ pub(crate) fn tool_risk_level(tool_name: &str) -> ToolRiskLevel {
         | "execute_workflow"
         | "dispatch_email"
         | "bind_telegram_workspace"
-        | "edit_app_theme" => ToolRiskLevel::High,
+        | "edit_app_theme"
+        | "git_add"
+        | "git_commit"
+        | "pm2_restart" => ToolRiskLevel::High,
         _ => ToolRiskLevel::Low,
     }
 }
@@ -37,6 +40,16 @@ pub(super) fn parse_tool_risk_level(value: &str) -> Option<ToolRiskLevel> {
         "critical" => Some(ToolRiskLevel::Critical),
         _ => None,
     }
+}
+
+/// Public predicate for external crates (e.g. the `hera_mcp` MCP bridge binary, which is a
+/// separate crate from `hera_core` even though it lives in the same package — `pub(crate)`
+/// items on `tool_risk_level`/`ToolRiskLevel` are not visible across that boundary). Exposes
+/// only a boolean so callers can gate on "is this tool Critical-risk" without reaching into
+/// the crate-internal risk enum. Additive-only: does not change `tool_risk_level`,
+/// `caller_allowed_for_tool`, or `permissions_allow_tool`.
+pub fn tool_is_critical(tool_name: &str) -> bool {
+    matches!(tool_risk_level(tool_name), ToolRiskLevel::Critical)
 }
 
 pub(crate) fn tool_timeout_ms(tool_name: &str) -> u64 {

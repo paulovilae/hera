@@ -1,4 +1,4 @@
-use hera_core::ai::tool_executor::{ToolCall, execute_tool, hera_tool_schemas};
+use hera_core::ai::tool_executor::{ToolCall, execute_tool, hera_tool_schemas, tool_is_critical};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -11,7 +11,27 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-const HERA_SOCKET: &str = "/tmp/hera-core.sock";
+/// Override with `HERA_SOCKET_PATH` to point this MCP bridge at a forwarded socket
+/// (e.g. an SSH-tunneled path to a remote node's real hera-core) instead of a local
+/// daemon — useful when the local machine only runs a lightweight fallback instance.
+fn hera_socket_path() -> String {
+    std::env::var("HERA_SOCKET_PATH").unwrap_or_else(|_| "/tmp/hera-core.sock".to_string())
+}
+
+/// Gate for the 6 coding agentic-loop tools (edit_file, write_file, grep_search, glob_search,
+/// cargo_check, cargo_test) exposed over MCP. OFF by default — an external MCP client gets
+/// filesystem write + arbitrary cargo execution on this box the moment it can reach this
+/// bridge, so these tools (and any Critical-risk tool reachable via the generic
+/// `execute_tool` passthrough below) require an explicit opt-in per host.
+fn coding_tools_enabled() -> bool {
+    std::env::var("HERA_MCP_CODING_TOOLS").ok().as_deref() == Some("1")
+}
+
+const CODING_TOOLS_DISABLED_MSG: &str =
+    "Refused: coding tools are disabled on this Hera MCP bridge. Set HERA_MCP_CODING_TOOLS=1 \
+     in the environment running hera_mcp to enable edit_file/write_file/grep_search/\
+     glob_search/cargo_check/cargo_test (directly or via execute_tool for any Critical-risk \
+     tool).";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GenerateTextParams {
@@ -52,6 +72,11 @@ struct ExecuteToolParams {
     #[schemars(description = "Arguments to pass to the tool (key-value pairs)")]
     #[serde(default)]
     arguments: std::collections::HashMap<String, serde_json::Value>,
+    #[schemars(
+        description = "Optional caller identity used for tool allowed_callers gating (e.g. \"coding\" / \"ava_coder\"). Default None applies caller=\"external_mcp\"."
+    )]
+    #[serde(default)]
+    caller: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -68,6 +93,67 @@ struct SpawnParallelAgentsParams {
     agents: Vec<String>,
     #[schemars(description = "Prompt sent to each agent")]
     prompt: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EditFileParams {
+    #[schemars(description = "Absolute or relative path to the existing file to edit")]
+    path: String,
+    #[schemars(
+        description = "Exact text to replace, copied verbatim from the file (include enough surrounding context to be unique)"
+    )]
+    old_string: String,
+    #[schemars(description = "Replacement text")]
+    new_string: String,
+    #[schemars(
+        description = "Replace every occurrence of old_string instead of requiring a single unique match. Defaults to false."
+    )]
+    #[serde(default)]
+    replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct WriteFileParams {
+    #[schemars(description = "Absolute or relative path to the file to create or overwrite")]
+    path: String,
+    #[schemars(description = "Full text content to write into the file")]
+    content: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GrepSearchParams {
+    #[schemars(description = "A Rust regular expression to match against each line")]
+    pattern: String,
+    #[schemars(description = "Optional directory or file to search under. Defaults to the current directory.")]
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GlobSearchParams {
+    #[schemars(description = "Glob pattern, e.g. '**/*.rs', 'src/*.toml', '**/handler_*.rs'")]
+    pattern: String,
+    #[schemars(description = "Optional base directory to search under. Defaults to the current directory.")]
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CargoCheckParams {
+    #[schemars(description = "REQUIRED. Absolute path to the Rust project directory (where Cargo.toml lives)")]
+    path: String,
+    #[schemars(description = "Max seconds to wait for the build. Defaults to 180, max 600.")]
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CargoTestParams {
+    #[schemars(description = "REQUIRED. Absolute path to the Rust project directory (where Cargo.toml lives)")]
+    path: String,
+    #[schemars(description = "Max seconds to wait. Defaults to 180, max 600.")]
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -164,7 +250,8 @@ async fn send_ipc_generate(params: &GenerateTextParams) -> String {
         "payload": inner,
     });
 
-    match UnixStream::connect(HERA_SOCKET).await {
+    let socket_path = hera_socket_path();
+    match UnixStream::connect(&socket_path).await {
         Ok(mut stream) => {
             let msg_bytes = payload.to_string();
             if let Err(error) = stream.write_all(msg_bytes.as_bytes()).await {
@@ -190,7 +277,7 @@ async fn send_ipc_generate(params: &GenerateTextParams) -> String {
         }
         Err(error) => format!(
             "Cannot connect to Hera daemon at {}. Is it running? Error: {}",
-            HERA_SOCKET, error
+            socket_path, error
         ),
     }
 }
@@ -219,6 +306,16 @@ impl HeraMcp {
         description = "Execute any existing Hera tool by exact name with a JSON arguments object. This reuses Hera's canonical tool executor rather than reimplementing tool logic."
     )]
     async fn execute_tool(&self, Parameters(params): Parameters<ExecuteToolParams>) -> String {
+        // Retroactive gate: this generic passthrough can already reach the 6 coding tools
+        // (and any other Critical-risk tool) today — every Critical tool JSON lists
+        // "external_mcp" in allowed_callers, and this bridge defaults the caller to exactly
+        // that, so `caller_allowed_for_tool` trivially passes. Without this check, adding
+        // typed wrappers below with their own gate would be security theater: the same
+        // capability stays reachable unguarded through this method. Non-Critical tools
+        // (e.g. memento_query, grep_search) are unaffected.
+        if tool_is_critical(&params.name) && !coding_tools_enabled() {
+            return CODING_TOOLS_DISABLED_MSG.to_string();
+        }
         let raw = serde_json::Value::Object(params.arguments.into_iter().collect());
         // Unwrap double-serialized args: some MCP clients (or intermediate layers) encode the
         // arguments object as a JSON string. When the resulting object has exactly one entry
@@ -238,6 +335,26 @@ impl HeraMcp {
             }
         } else {
             raw
+        };
+        // Inject caller into arguments._hera.caller so tool_executor::security
+        // can gate allowed_callers. Default "external_mcp" for MCP clients.
+        let caller = params
+            .caller
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "external_mcp".to_string());
+        let arguments = match arguments {
+            serde_json::Value::Object(mut map) => {
+                let hera_entry = map
+                    .entry("_hera".to_string())
+                    .or_insert_with(|| json!({}));
+                if let serde_json::Value::Object(hera_map) = hera_entry {
+                    hera_map
+                        .entry("caller".to_string())
+                        .or_insert_with(|| json!(caller));
+                }
+                serde_json::Value::Object(map)
+            }
+            other => other,
         };
         let call = ToolCall {
             name: params.name,
@@ -276,6 +393,122 @@ impl HeraMcp {
         };
         let result = execute_tool(&call).await;
         result.output
+    }
+
+    #[tool(
+        description = "Surgically edit an existing file by replacing an exact block of text (Hera's edit_file tool). DISABLED unless HERA_MCP_CODING_TOOLS=1 is set on this bridge."
+    )]
+    async fn edit_file(&self, Parameters(params): Parameters<EditFileParams>) -> String {
+        if !coding_tools_enabled() {
+            return CODING_TOOLS_DISABLED_MSG.to_string();
+        }
+        let call = ToolCall {
+            name: "edit_file".to_string(),
+            arguments: json!({
+                "path": params.path,
+                "old_string": params.old_string,
+                "new_string": params.new_string,
+                "replace_all": params.replace_all.unwrap_or(false),
+                "_hera": {"caller": "external_mcp"},
+            }),
+        };
+        execute_tool(&call).await.output
+    }
+
+    #[tool(
+        description = "Create a new file or completely overwrite an existing file (Hera's write_file tool). DISABLED unless HERA_MCP_CODING_TOOLS=1 is set on this bridge."
+    )]
+    async fn write_file(&self, Parameters(params): Parameters<WriteFileParams>) -> String {
+        if !coding_tools_enabled() {
+            return CODING_TOOLS_DISABLED_MSG.to_string();
+        }
+        let call = ToolCall {
+            name: "write_file".to_string(),
+            arguments: json!({
+                "path": params.path,
+                "content": params.content,
+                "_hera": {"caller": "external_mcp"},
+            }),
+        };
+        execute_tool(&call).await.output
+    }
+
+    #[tool(
+        description = "Search the file tree for lines matching a regular expression (Hera's grep_search tool). DISABLED unless HERA_MCP_CODING_TOOLS=1 is set on this bridge."
+    )]
+    async fn grep_search(&self, Parameters(params): Parameters<GrepSearchParams>) -> String {
+        if !coding_tools_enabled() {
+            return CODING_TOOLS_DISABLED_MSG.to_string();
+        }
+        let call = ToolCall {
+            name: "grep_search".to_string(),
+            arguments: json!({
+                "pattern": params.pattern,
+                "path": params.path.unwrap_or_default(),
+                "_hera": {"caller": "external_mcp"},
+            }),
+        };
+        execute_tool(&call).await.output
+    }
+
+    #[tool(
+        description = "Find files whose path matches a glob pattern (Hera's glob_search tool). DISABLED unless HERA_MCP_CODING_TOOLS=1 is set on this bridge."
+    )]
+    async fn glob_search(&self, Parameters(params): Parameters<GlobSearchParams>) -> String {
+        if !coding_tools_enabled() {
+            return CODING_TOOLS_DISABLED_MSG.to_string();
+        }
+        let call = ToolCall {
+            name: "glob_search".to_string(),
+            arguments: json!({
+                "pattern": params.pattern,
+                "path": params.path.unwrap_or_default(),
+                "_hera": {"caller": "external_mcp"},
+            }),
+        };
+        execute_tool(&call).await.output
+    }
+
+    #[tool(
+        description = "Run 'cargo check' on a Rust project and return structured compiler errors (Hera's cargo_check tool). DISABLED unless HERA_MCP_CODING_TOOLS=1 is set on this bridge."
+    )]
+    async fn cargo_check(&self, Parameters(params): Parameters<CargoCheckParams>) -> String {
+        if !coding_tools_enabled() {
+            return CODING_TOOLS_DISABLED_MSG.to_string();
+        }
+        let mut arguments = json!({
+            "path": params.path,
+            "_hera": {"caller": "external_mcp"},
+        });
+        if let Some(timeout_seconds) = params.timeout_seconds {
+            arguments["timeout_seconds"] = json!(timeout_seconds);
+        }
+        let call = ToolCall {
+            name: "cargo_check".to_string(),
+            arguments,
+        };
+        execute_tool(&call).await.output
+    }
+
+    #[tool(
+        description = "Run 'cargo test' on a Rust project and return a pass/fail summary (Hera's cargo_test tool). DISABLED unless HERA_MCP_CODING_TOOLS=1 is set on this bridge."
+    )]
+    async fn cargo_test(&self, Parameters(params): Parameters<CargoTestParams>) -> String {
+        if !coding_tools_enabled() {
+            return CODING_TOOLS_DISABLED_MSG.to_string();
+        }
+        let mut arguments = json!({
+            "path": params.path,
+            "_hera": {"caller": "external_mcp"},
+        });
+        if let Some(timeout_seconds) = params.timeout_seconds {
+            arguments["timeout_seconds"] = json!(timeout_seconds);
+        }
+        let call = ToolCall {
+            name: "cargo_test".to_string(),
+            arguments,
+        };
+        execute_tool(&call).await.output
     }
 
     #[tool(

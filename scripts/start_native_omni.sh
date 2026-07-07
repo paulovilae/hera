@@ -15,10 +15,30 @@ OMNI_PORT="${IMAGINEOS_OMNI_PORT:-8080}"
 OMNI_HOST="${IMAGINEOS_OMNI_HOST:-127.0.0.1}"
 OMNI_GPU_LAYERS="${IMAGINEOS_OMNI_GPU_LAYERS:-99}"
 OMNI_MAIN_GPU="${IMAGINEOS_OMNI_MAIN_GPU:-0}"
-OMNI_CTX_SIZE="${IMAGINEOS_OMNI_CTX_SIZE:-32768}"
+OMNI_CTX_SIZE="${IMAGINEOS_OMNI_CTX_SIZE:-131072}"
 OMNI_BATCH_SIZE="${IMAGINEOS_OMNI_BATCH_SIZE:-512}"
 OMNI_THREADS="${IMAGINEOS_OMNI_THREADS:-8}"
 OMNI_REASONING="${IMAGINEOS_OMNI_REASONING:-off}"
+# Concurrency/backpressure fix (2026-07-05, docs/HERA_CONCURRENCY_BACKPRESSURE.md):
+# infrastructure for pinning --parallel explicitly, DEFAULTED BACK TO AUTO (-1).
+#
+# INCIDENT (2026-07-05, same session): pinning --parallel 4 here while leaving
+# --ctx-size at 32768 silently divides the context pool across slots — per-slot
+# usable context collapsed to 32768/4=8192 tokens, and real "standard"/"heavy"
+# budget-mode requests (recursive memory + tool schemas routinely ~11K tokens)
+# started failing with `exceed_context_size_error`. Caught live in production
+# within minutes via a direct MCP smoke-test call. Auto (-1) does NOT divide
+# ctx-size the same way (verified: auto picked 4 slots with n_ctx=131072 EACH
+# in /props before this incident) — so auto is the known-good state.
+#
+# Do NOT re-pin --parallel without ALSO raising --ctx-size so that
+# ctx-size / OMNI_PARALLEL_SLOTS still leaves an adequate per-slot budget
+# (the platform is calibrated for ~131K effective tokens per request — see
+# "Context budget calibration" in Hera/CLAUDE.md). hera-core's router.rs
+# semaphore (HERA_PRIMARY_ENGINE_SLOTS, default 4) does not depend on this flag
+# being pinned — it only needs a reasonable estimate of real concurrent
+# capacity, and 4 is what auto already resolves to on this box.
+OMNI_PARALLEL_SLOTS="${IMAGINEOS_OMNI_PARALLEL_SLOTS:--1}"
 
 deadline=$((SECONDS + WAIT_TIMEOUT_SECONDS))
 while [ ! -f "$MODEL_FILE" ] || { [ -n "$MMPROJ_FILE" ] && [ ! -f "$MMPROJ_FILE" ]; }; do
@@ -64,6 +84,7 @@ args=(
     --ctx-size "$OMNI_CTX_SIZE" \
     --batch-size "$OMNI_BATCH_SIZE" \
     --threads "$OMNI_THREADS" \
+    --parallel "$OMNI_PARALLEL_SLOTS" \
     --reasoning "$OMNI_REASONING" \
     --flash-attn on \
     --cache-type-k "$OMNI_KV_CACHE_TYPE_K" \

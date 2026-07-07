@@ -261,6 +261,13 @@ pub async fn run_agentic_loop(
     mut status_stream: Option<&mut UnixStream>,
 ) -> AgenticLoopOutcome {
     let max = max_iters();
+    // Wave 3 observability (docs/HERA_OBSERVABILITY_WAVE3_INFLIGHT.md): a long
+    // loop previously emitted nothing until it finished, indistinguishable from
+    // a hang from outside. `loop_started` anchors the elapsed time in the
+    // per-iteration log lines below; `trace_id` keys the in-flight registry so
+    // `hera_inflight` can report iteration/tool progress while this runs.
+    let loop_started = std::time::Instant::now();
+    let trace_id = parsed.trace_id.clone();
     let mut req = base_request;
     // Temperature policy: the loop is now enabled platform-wide so that ANY
     // tool-using bot gains iterative tool use + self-correction of failed
@@ -287,6 +294,17 @@ pub async fn run_agentic_loop(
     let mut ever_edited = false;
 
     for iter in 0..max {
+        // Per-iteration START log + registry update — this is what kills the
+        // "looks hung" problem: `pm2 logs hera-core` now shows the loop
+        // advancing instead of going silent until the terminal state.
+        tracing::info!(
+            "🔁 [Hera] iter {}/{} tool=- elapsed={}ms",
+            iter + 1,
+            max,
+            loop_started.elapsed().as_millis()
+        );
+        super::inflight::set_iteration(&trace_id, (iter + 1) as u32, max as u32);
+
         let resp = match engine.generate_content(req.clone()).await {
             Ok(resp) => resp,
             Err(error) => {
@@ -370,6 +388,20 @@ pub async fn run_agentic_loop(
             calls.len(),
             if no_progress { " (repeat — closing)" } else { "" }
         );
+
+        let tool_names = calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::info!(
+            "🔁 [Hera] iter {}/{} tool={} elapsed={}ms",
+            iter + 1,
+            max,
+            tool_names,
+            loop_started.elapsed().as_millis()
+        );
+        super::inflight::set_tool(&trace_id, Some(tool_names.as_str()));
 
         let summary = execute_parsed_tool_calls(&calls, parsed, status_stream.as_deref_mut()).await;
         // A verification (cargo_check/cargo_test/pytest) that succeeded this round
@@ -631,6 +663,8 @@ mod tests {
             tool_choice: None,
             reasoning_effort: None,
             response_format: None,
+            app: None,
+            priority: None,
         }
     }
 

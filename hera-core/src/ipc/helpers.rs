@@ -891,7 +891,15 @@ pub async fn save_chat_turn_event(
     }
     // Fire-and-forget KG extraction: assistant turns carry most relational signal.
     // User turns are skipped to avoid noise from questions without factual content.
-    if role == "assistant" && content.len() > 80 {
+    //
+    // GATE on a non-empty app_id. Without it this self-amplified into a runaway:
+    // the extraction's OWN `generate` call (which carries no app_id) produced a
+    // JSON turn that handler_generate saved as another assistant turn, which
+    // re-spawned extraction — a loop bounded only by 30B throughput (~1 every
+    // 3.7 s, saturating the GPU 24/7 with unattributed inference). Internal /
+    // anonymous generations (app_id == "") have no place in the per-app KG
+    // anyway, so only extract for turns that belong to a real app.
+    if role == "assistant" && content.len() > 80 && !app_id.trim().is_empty() {
         let (uid, aid, text) = (user_id.clone(), app_id.clone(), content.clone());
         tokio::spawn(async move {
             extract_and_save_kg_triples(&uid, &aid, &text).await;
@@ -924,6 +932,7 @@ async fn extract_and_save_kg_triples(user_id: &str, app_id: &str, text: &str) {
             "temperature": 0.1,
             "context_budget_mode": "lightweight",
             "response_format": {"type": "json_object"},
+            "priority": "background",
         }
     });
 
@@ -1078,6 +1087,64 @@ pub async fn report_recall_feedback(
     let _ = call_memento("recall_feedback", payload).await;
 }
 
+/// Which node this Hera process runs on (genesis / anchor / ...), for telemetry.
+/// Node identity for telemetry: `HERA_NODE_ALIAS` overrides, else `HOSTNAME`,
+/// else the kernel hostname (`/etc/hostname`), else "unknown".
+///
+/// HOSTNAME is a shell var and is often NOT exported into the pm2 process env,
+/// so it can't be the only fallback — that left telemetry rows with an empty
+/// `node`. The `/etc/hostname` read lets every node self-identify with no config.
+pub fn hera_node() -> String {
+    if let Ok(alias) = std::env::var("HERA_NODE_ALIAS") {
+        if !alias.trim().is_empty() {
+            return alias.trim().to_string();
+        }
+    }
+    if let Ok(host) = std::env::var("HOSTNAME") {
+        if !host.trim().is_empty() {
+            return host.trim().to_string();
+        }
+    }
+    if let Ok(host) = std::fs::read_to_string("/etc/hostname") {
+        let host = host.trim();
+        if !host.is_empty() {
+            return host.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Mint a trace id for requests that arrive without one (MCP / direct callers).
+/// Every request should be correlatable across usage + tool-call telemetry and
+/// the `/ops/hera/trace/<id>` timeline — an empty trace_id makes a request
+/// invisible to that join. Format: `hera-<node>-<nanos>-<counter>` (no external
+/// dep; the atomic counter disambiguates ids minted within the same nanosecond).
+pub fn mint_trace_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("hera-{}-{:x}-{:x}", hera_node(), nanos, seq)
+}
+
+/// Char-safe truncation for telemetry previews of tool args/results. Larger cap
+/// than the 160-char prompt preview (tool payloads are structured), but still
+/// bounded so a giant SQL result or file blob can't bloat the row. Not a
+/// redaction layer — secret-bearing args are only length-limited here.
+pub fn telemetry_preview(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > max_chars {
+        let mut s: String = trimmed.chars().take(max_chars).collect();
+        s.push('…');
+        s
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Fire-and-forget: records a usage event in Memento after each generate call.
 /// Fails silently — never blocks or panics the generate path.
 pub fn spawn_log_usage(
@@ -1091,6 +1158,7 @@ pub fn spawn_log_usage(
     total_tokens: u32,
     is_cloud: bool,
     latency_ms: u64,
+    trace_id: String,
 ) {
     tokio::spawn(async move {
         let payload = serde_json::json!({
@@ -1103,10 +1171,52 @@ pub fn spawn_log_usage(
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
             "is_cloud": is_cloud,
-            "latency_ms": latency_ms
+            "latency_ms": latency_ms,
+            "trace_id": trace_id,
+            "node": hera_node()
         });
         if call_memento("hera_log_usage", payload).await.is_none() {
             tracing::debug!("[Hera Usage] log_usage failed or timed out (best-effort)");
+        }
+    });
+}
+
+/// Fire-and-forget: records one per-tool-call telemetry row in Memento.
+/// This is the durable per-tool grain that was previously discarded — the
+/// data (name + args + result + success) already exists in memory at the tool
+/// execution site; this persists it keyed by `trace_id`. Best-effort, never
+/// blocks the tool path.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_log_tool_call(
+    trace_id: String,
+    session_id: String,
+    app_id: String,
+    route_profile: String,
+    seq: u32,
+    tool_name: String,
+    args_preview: String,
+    result_preview: String,
+    duration_ms: u64,
+    success: bool,
+    error: Option<String>,
+) {
+    tokio::spawn(async move {
+        let payload = serde_json::json!({
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "app_id": app_id,
+            "route_profile": route_profile,
+            "node": hera_node(),
+            "seq": seq,
+            "tool_name": tool_name,
+            "args_preview": args_preview,
+            "result_preview": result_preview,
+            "duration_ms": duration_ms,
+            "success": success,
+            "error": error
+        });
+        if call_memento("hera_log_tool_call", payload).await.is_none() {
+            tracing::debug!("[Hera Tool Telemetry] log_tool_call failed or timed out (best-effort)");
         }
     });
 }

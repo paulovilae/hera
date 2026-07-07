@@ -148,8 +148,8 @@ pub async fn prepare_runtime_execution_context(
     {
         let route = parsed.route_profile_id.as_str();
         let app = parsed.app_name.as_str();
-        let is_coding = route == "coding" || route == "ava_coder"
-            || app == "coding" || app.contains("coder");
+        let is_coding =
+            route == "coding" || route == "ava_coder" || app == "coding" || app.contains("coder");
         if is_coding && parsed.reasoning_effort == "low" {
             parsed.reasoning_effort = "medium".to_string();
         }
@@ -250,14 +250,28 @@ pub async fn prepare_chat_request(
     }
 
     if let Some(req) = &mut chat_req {
+        // Cost-safety gate (Capa 3): stamp the authoritative resolved app
+        // name, overriding whatever the raw payload deserialized (or didn't)
+        // into `app` — `router::cloud_fallback_allowed` uses this for the
+        // app→never_external policy lookup.
+        req.app = Some(parsed.app_name.clone());
         // Frame B1: apply the difficulty-derived reasoning effort unless the
         // caller set one explicitly.
         if req.reasoning_effort.is_none() {
             req.reasoning_effort = Some(parsed.reasoning_effort.clone());
         }
         apply_history_budget(req, &parsed.context_budget);
-        let user_id = canonicalize_user_id(&parsed.sender_name, &parsed.chat_id, &parsed.session_id);
-        compress_if_needed(req, engine, &parsed.context_budget, &parsed.session_id, &user_id, &parsed.app_id).await;
+        let user_id =
+            canonicalize_user_id(&parsed.sender_name, &parsed.chat_id, &parsed.session_id);
+        compress_if_needed(
+            req,
+            engine,
+            &parsed.context_budget,
+            &parsed.session_id,
+            &user_id,
+            &parsed.app_id,
+        )
+        .await;
     }
 
     chat_req
@@ -543,6 +557,18 @@ pub fn context_budget_for_mode(mode: &str, lightweight_mode: bool) -> ContextBud
     }
 
     match mode {
+        "lightweight" => ContextBudget {
+            mode: "lightweight".to_string(),
+            include_memory: false,
+            include_tool_schemas: false,
+            include_db_schema: false,
+            allow_tools: false,
+            max_memory_chars: 0,
+            max_tool_schema_chars: 0,
+            max_db_schema_chars: 0,
+            max_history_messages: 6,
+            compression_trigger_tokens: 12_000,
+        },
         "minimal" => ContextBudget {
             mode: "minimal".to_string(),
             include_memory: true,
@@ -587,12 +613,20 @@ fn parse_context_budget(payload: &serde_json::Value, lightweight_mode: bool) -> 
         .get("context_budget_mode")
         .and_then(|value| value.as_str());
     let mode = explicit_mode
-        .unwrap_or(if lightweight_mode { "lightweight" } else { "standard" })
+        .unwrap_or(if lightweight_mode {
+            "lightweight"
+        } else {
+            "standard"
+        })
         .trim()
         .to_ascii_lowercase();
     // When the caller explicitly requested a budget mode, don't let lightweight detection
     // override it — the caller knows what they need (e.g. MCP with permissions: ["all"]).
-    let effective_lightweight = if explicit_mode.is_some() { false } else { lightweight_mode };
+    let effective_lightweight = if explicit_mode.is_some() {
+        false
+    } else {
+        lightweight_mode
+    };
     let mut budget = context_budget_for_mode(&mode, effective_lightweight);
 
     if let Some(overrides) = payload
@@ -746,7 +780,14 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         .trim()
         .to_ascii_lowercase();
 
-    let trace_id = extract_optional_string(payload, "trace_id");
+    let trace_id = {
+        let provided = extract_optional_string(payload, "trace_id");
+        if provided.is_empty() {
+            super::helpers::mint_trace_id()
+        } else {
+            provided
+        }
+    };
     let session_id = extract_optional_string(payload, "session_id");
     let chat_id = extract_optional_string(payload, "chat_id");
     let app_id = extract_optional_string(payload, "app_id");
@@ -807,7 +848,13 @@ fn current_bogota_date() -> String {
     // Weekday: 1970-01-01 (day 0) was Thursday → (days+4) mod 7, 0 = Sunday.
     let wd = (days + 4).rem_euclid(7) as usize;
     let names = [
-        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
     ];
     // Civil date from day count (Howard Hinnant's algorithm).
     let z = days + 719_468;
@@ -871,7 +918,13 @@ pub async fn build_full_system_prompt(
             );
             (recursive, semantic, rag_pinned, rag_retrieved, attribution)
         } else {
-            (String::new(), String::new(), String::new(), String::new(), None)
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+            )
         };
     // Frame E (prompt caching): persona + memento_ctx is the stable head of the
     // prompt. Per-turn memory (recursive_ctx + semantic_ctx) is appended AT THE
@@ -905,13 +958,14 @@ pub async fn build_full_system_prompt(
         )
     };
 
-    let think_directive = if lightweight_mode || budget.allow_tools {
+    let lightweight_prompt = lightweight_mode || budget.mode == "lightweight";
+    let think_directive = if lightweight_prompt || budget.allow_tools {
         // When tools are enabled: skip chain-of-thought — go straight to tool call
         "\n\nRespond naturally and briefly. Do not use <think> tags."
     } else {
         "\n\nCRITICAL INSTRUCTION (INFERENCE-TIME RECALL): Before providing your final answer, you MUST systematically write out your internal reasoning step-by-step within <think> and </think> tags. Use this space to explore associations, reverse the question context, and search your internal knowledge to maximize factual recall. Do not output the final answer until after the </think> tag."
     };
-    let json_directive = if lightweight_mode {
+    let json_directive = if lightweight_prompt || !budget.allow_tools {
         ""
     } else {
         "\nCRITICAL TOOL RULE: If you decide to execute a tool, your ENTIRE response MUST be EXACTLY this format, with NO conversational text: <tool_call>{\"name\": \"function_name\", \"arguments\": {\"arg1\": \"val\"}}</tool_call>"
@@ -957,6 +1011,8 @@ pub async fn build_full_system_prompt(
         )
     };
 
+    let fable5_autonomy_directives = "\n\nADVANCED AUTONOMY RULES:\n1. PROGRESS VERIFICATION: Before reporting progress, audit each claim against a tool result from this session. Only report work you can point to evidence for. If something is not yet verified, say so explicitly. Report outcomes faithfully: if tests fail, say so with the output. If a step was skipped, state that. When something is done and verified, state it plainly without hedging.\n2. PROACTIVITY CONSTRAINT: When the user is describing a problem, asking a question, or thinking out loud rather than requesting a change, the deliverable is your assessment. Report your findings and stop. Do not apply a fix until asked. Before running a command that changes system state, confirm that the evidence actually supports that specific action.\n3. FINAL RESPONSE: For your final response after this task: state the outcome first, then the key supporting details. Do not include working abbreviations, internal labels, or arrow chains in the user-facing output. Users need the outcome, the evidence, the risks if any, and the next step.\n4. DELEGATION: Delegate independent subtasks to sub-agents (via spawn_parallel_agents) and continue working while they run. Each sub-agent should receive a specific, bounded scope and explicit success criteria. Synthesize results only after all have reported. If a sub-agent fails, report that clearly rather than inferring what would have been found.";
+
     // Frame E: build the prompt in two halves so engines can KV-cache the prefix.
     //
     //   stable_prefix = persona + app-static memento_ctx + tool/db schemas +
@@ -969,7 +1025,7 @@ pub async fn build_full_system_prompt(
     // can mark the boundary. Putting dynamic memory AT THE END keeps cache hits
     // stable across turns even as memory grows.
     let stable_prefix = format!(
-        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}{}{}",
+        "{}\n\nCRITICAL RULE: DO NOT use tools to answer general conversational or conceptual questions like 'explain X' or 'what is Y'. If the user asks for an explanation or text-based answer, DO NOT build scripts or charts unless explicitly asked. ONLY use tools when the user explicitly requests code execution, file reading, or specific outputs.\n\n{}{}{}{}{}{}{}{}{}",
         base_system_prompt,
         schemas,
         db_schema_ctx,
@@ -978,6 +1034,7 @@ pub async fn build_full_system_prompt(
         language_directive,
         date_directive,
         runtime_context_directive,
+        fable5_autonomy_directives,
         rag_pinned_ctx
     );
     let dynamic_suffix = format!("{}{}{}", recursive_ctx, semantic_ctx, rag_retrieved_ctx);
@@ -1030,6 +1087,8 @@ pub fn build_new_chat_request(prompt: &str, system_prompt: String) -> ChatReques
         tool_choice: None,
         reasoning_effort: None,
         response_format: None,
+        app: None,
+        priority: None,
     }
 }
 
@@ -1072,7 +1131,7 @@ pub fn inject_system_prompt(req: &mut ChatRequest, full_system_prompt: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{latest_user_message_text, parse_payload};
+    use super::{context_budget_for_mode, latest_user_message_text, parse_payload};
 
     #[test]
     fn parse_payload_uses_latest_user_even_if_not_last_message() {
@@ -1119,6 +1178,17 @@ mod tests {
             latest_user_message_text(&payload).as_deref(),
             Some("/restart imaginclaw")
         );
+    }
+
+    #[test]
+    fn explicit_lightweight_budget_disables_context_expansion() {
+        let budget = context_budget_for_mode("lightweight", false);
+
+        assert_eq!(budget.mode, "lightweight");
+        assert!(!budget.include_memory);
+        assert!(!budget.include_tool_schemas);
+        assert!(!budget.include_db_schema);
+        assert!(!budget.allow_tools);
     }
 }
 
@@ -1239,7 +1309,11 @@ pub async fn compress_if_needed(
                     // without re-reading all turns (cross-session continuity).
                     if !user_id.is_empty() {
                         let summary_owned = summary_txt.clone();
-                        let (uid, aid, sid) = (user_id.to_string(), app_id.to_string(), session_id.to_string());
+                        let (uid, aid, sid) = (
+                            user_id.to_string(),
+                            app_id.to_string(),
+                            session_id.to_string(),
+                        );
                         tokio::spawn(async move {
                             save_session_summary(&uid, &aid, &sid, &summary_owned).await;
                         });

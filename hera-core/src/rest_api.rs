@@ -21,7 +21,10 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 use crate::ai::{ChatMessage, ChatRequest, ContentPart, ImageUrlContent, MessageContent};
-use crate::ipc::{IpcState, helpers::estimate_tokens};
+use crate::ipc::{
+    IpcState,
+    helpers::{estimate_tokens, fetch_recursive_context, fetch_semantic_memories},
+};
 
 const LOCAL_CONTEXT_SOFT_LIMIT: usize = 24_000;
 const LOCAL_CHAR_SOFT_LIMIT: usize = 24_000;
@@ -155,6 +158,8 @@ pub async fn serve_rest_api(port: u16, ipc: IpcState) {
         .route("/v1/messages", post(handle_messages))
         .route("/v1/messages/count_tokens", post(handle_count_tokens))
         .route("/v1/models", get(handle_models))
+        .route("/v1/embeddings", post(handle_embeddings))
+        .route("/v1/memento/recall", post(handle_memento_recall))
         .with_state(state)
         .layer(cors);
 
@@ -446,6 +451,168 @@ async fn handle_models() -> Json<ModelListResponse> {
     })
 }
 
+/// OpenAI-compatible `/v1/embeddings` request. Accepts a single string or a
+/// batch, matching the shape OpenAI-compatible clients (e.g. OpenClaw's
+/// `openai-compatible` embedding provider) already send.
+#[derive(Debug, Deserialize)]
+struct EmbeddingsRequest {
+    #[serde(default)]
+    model: Option<String>,
+    input: EmbeddingsInput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbeddingsInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingsResponse {
+    object: &'static str,
+    data: Vec<EmbeddingDatum>,
+    model: String,
+    usage: EmbeddingsUsage,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingDatum {
+    object: &'static str,
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingsUsage {
+    prompt_tokens: u32,
+    total_tokens: u32,
+}
+
+/// Turns text(s) into vectors using Hera's local candle BERT embedder
+/// (the same model backing Memento `semantic_recall`), exposed over HTTP in
+/// OpenAI's `/v1/embeddings` shape so any OpenAI-compatible client can reuse
+/// it instead of standing up its own embedding stack.
+async fn handle_embeddings(Json(payload): Json<EmbeddingsRequest>) -> Response {
+    let texts: Vec<String> = match payload.input {
+        EmbeddingsInput::One(text) => vec![text],
+        EmbeddingsInput::Many(texts) => texts,
+    };
+    if texts.is_empty() || texts.iter().all(|t| t.trim().is_empty()) {
+        return api_error(StatusCode::BAD_REQUEST, "embeddings: empty 'input'").into_response();
+    }
+
+    #[cfg(feature = "embeddings")]
+    {
+        let model_name = payload
+            .model
+            .clone()
+            .unwrap_or_else(|| "hera-local-embed".to_string());
+        let prompt_tokens: u32 = texts.iter().map(|t| (t.len() as u32 / 4).max(1)).sum();
+        let texts_for_task = texts.clone();
+        let result =
+            tokio::task::spawn_blocking(move || crate::ai::embeddings::embed_texts(&texts_for_task))
+                .await;
+        match result {
+            Ok(Ok(vectors)) => {
+                let data = vectors
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, embedding)| EmbeddingDatum {
+                        object: "embedding",
+                        index,
+                        embedding,
+                    })
+                    .collect();
+                let response = EmbeddingsResponse {
+                    object: "list",
+                    data,
+                    model: model_name,
+                    usage: EmbeddingsUsage {
+                        prompt_tokens,
+                        total_tokens: prompt_tokens,
+                    },
+                };
+                (StatusCode::OK, Json(response)).into_response()
+            }
+            Ok(Err(e)) => {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("embed failed: {e}"))
+                    .into_response()
+            }
+            Err(e) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("embed task join error: {e}"),
+            )
+            .into_response(),
+        }
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "embeddings feature not compiled into this Hera build",
+        )
+        .into_response()
+    }
+}
+
+/// Read-only recall request against Memento's shared scoped_memory brain.
+/// Mirrors exactly what `prepare_runtime_execution_context` already injects
+/// into every chat turn's prompt (recursive scoped-memory + semantic cosine
+/// recall) — no write path is exposed here, this is recall-only by
+/// construction (it only calls `recall_recursive_context`/`semantic_recall`).
+#[derive(Debug, Deserialize)]
+struct MementoRecallRequest {
+    user_id: String,
+    #[serde(default)]
+    app_id: String,
+    #[serde(default)]
+    session_id: String,
+    /// Optional free-text query for cosine semantic recall. When omitted, only
+    /// the recursive scoped-memory context (summaries/durable facts/recent
+    /// events) is returned.
+    #[serde(default)]
+    query: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MementoRecallResponse {
+    recursive_context: String,
+    semantic_context: String,
+}
+
+async fn handle_memento_recall(Json(payload): Json<MementoRecallRequest>) -> Response {
+    if payload.user_id.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "memento recall: missing 'user_id'")
+            .into_response();
+    }
+
+    let recursive_context =
+        fetch_recursive_context(&payload.user_id, &payload.app_id, &payload.session_id).await;
+
+    let semantic_context = if payload.query.trim().is_empty() {
+        String::new()
+    } else {
+        let (fragment, _attribution) = fetch_semantic_memories(
+            &payload.user_id,
+            &payload.app_id,
+            &payload.session_id,
+            &payload.query,
+        )
+        .await;
+        fragment
+    };
+
+    (
+        StatusCode::OK,
+        Json(MementoRecallResponse {
+            recursive_context,
+            semantic_context,
+        }),
+    )
+        .into_response()
+}
+
 fn anthropic_to_chat_request(payload: &AnthropicMessageRequest) -> Result<ChatRequest, String> {
     let mut messages = Vec::new();
 
@@ -490,10 +657,12 @@ fn anthropic_to_chat_request(payload: &AnthropicMessageRequest) -> Result<ChatRe
         provider: None,
         stream: payload.stream,
         nsfw: None,
-        tools: payload.tools.clone(),
+        tools: payload.tools.clone().map(anthropic_tools_to_openai),
         tool_choice: payload.tool_choice.clone(),
         reasoning_effort: None,
         response_format: None,
+        app: None,
+        priority: None,
     })
 }
 
@@ -534,11 +703,54 @@ fn anthropic_count_to_chat_request(payload: CountTokensRequest) -> Result<ChatRe
         provider: None,
         stream: Some(false),
         nsfw: None,
-        tools: payload.tools,
+        tools: payload.tools.map(anthropic_tools_to_openai),
         tool_choice: None,
         reasoning_effort: None,
         response_format: None,
+        app: None,
+        priority: None,
     })
+}
+
+/// Converts Anthropic Messages API tool definitions
+/// (`{"name","description","input_schema"}`, no `type` key) into the OpenAI
+/// function-calling shape (`{"type":"function","function":{"name","description","parameters"}}`)
+/// that the local llama.cpp-backed engine (`ai::openai_compat::OpenAICompatEngine`,
+/// see `ai::tool_executor::schema::hera_tool_schemas` for the canonical shape Hera
+/// itself already emits) requires. Without this, any Anthropic-format client that
+/// sends tools (e.g. OpenClaw, Claude Code) gets a 500 "Failed to parse tools:
+/// Missing tool type" from the local engine on every turn that carries tools,
+/// which exhausts the local/secondary/tertiary tiers and surfaces as
+/// "External cloud fallback is disallowed by current sovereign policy."
+/// Already-OpenAI-shaped entries (containing a top-level "type") pass through
+/// unchanged, so this is safe to call even if a future caller sends OpenAI shape.
+fn anthropic_tools_to_openai(tools: Vec<Value>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .map(|tool| {
+            if tool.get("type").is_some() {
+                // Already OpenAI-shaped (or a built-in tool type) — leave as-is.
+                return tool;
+            }
+            let Some(obj) = tool.as_object() else {
+                return tool;
+            };
+            let name = obj.get("name").cloned().unwrap_or(Value::Null);
+            let description = obj.get("description").cloned().unwrap_or(Value::Null);
+            let parameters = obj
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            })
+        })
+        .collect()
 }
 
 fn anthropic_content_to_parts(content: &AnthropicContent) -> Result<MessageContent, String> {
@@ -857,6 +1069,26 @@ fn trim_message_content(message: &mut ChatMessage, trim_chars: usize) {
     }
 }
 
+fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
 fn compact_text(text: &str, trim_chars: usize) -> String {
     if text.len() <= trim_chars + 512 {
         return text.to_string();
@@ -866,6 +1098,9 @@ fn compact_text(text: &str, trim_chars: usize) -> String {
     let head = keep / 2;
     let tail = keep.saturating_sub(head);
     let tail_start = text.len().saturating_sub(tail);
+
+    let head = floor_char_boundary(text, head);
+    let tail_start = ceil_char_boundary(text, tail_start);
 
     format!(
         "{}\n\n[... context trimmed by Hera for local model limits ...]\n\n{}",
@@ -999,6 +1234,8 @@ mod tests {
             tool_choice: None,
             reasoning_effort: None,
             response_format: None,
+            app: None,
+            priority: None,
         };
 
         let resp = crate::ai::ChatResponse {

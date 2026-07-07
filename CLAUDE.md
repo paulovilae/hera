@@ -125,6 +125,11 @@ Four-tier fallback chain:
 
 Cloud is **failover only**. This is a non-negotiable platform rule (sovereign-first).
 
+**Cost-safety gate (Capa 3, `ai/cloud_budget.rs` + `ai/router.rs` + `ai/openai_compat.rs`)** — see [docs/HERA_CLOUD_COST_SAFETY.md](../docs/HERA_CLOUD_COST_SAFETY.md) for the full incident/design writeup. Three independent, default-safe gates sit at the router's cloud chokepoint (covers the B3 escalation too, since it reuses `RouterEngine`):
+1. Rate limit + daily token budget (`HERA_CLOUD_MAX_CALLS_PER_WINDOW`, `HERA_CLOUD_MAX_TOKENS_PER_DAY`).
+2. Free-tier model enforcement for OpenRouter — rejects non-`:free` models unless `HERA_ALLOW_PAID_CLOUD_MODELS` is set.
+3. App→never_external mapping (`ChatRequest.app` + `Apps/OS-v3/registry/app_cloud_policy.yaml`) — `legal`/`memento` are hardcoded-never-external regardless of workload-class inference.
+
 ---
 
 ## Memory & context pipeline (frames C1 + A + E)

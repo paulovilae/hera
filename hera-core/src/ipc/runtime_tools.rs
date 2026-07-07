@@ -1,11 +1,16 @@
 use super::context::ParsedPayload;
-use super::helpers::{fetch_single_app_schema_json, infer_origin_from_model};
+use super::helpers::{
+    fetch_single_app_schema_json, infer_origin_from_model, spawn_log_tool_call, telemetry_preview,
+};
 use super::types::IpcResponse;
 use crate::ai::{ChatMessage, ChatRequest, LLMEngine, MessageContent};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+
+/// Max chars kept for a tool arg/result preview in durable telemetry.
+const TOOL_PREVIEW_CHARS: usize = 2000;
 
 pub struct ToolExecutionSummary {
     pub execution_outputs: String,
@@ -50,6 +55,11 @@ pub fn contextualize_tool_call(
             .entry("trace_id".to_string())
             .or_insert_with(|| serde_json::json!(parsed.trace_id));
     }
+    if !parsed.route_profile_id.is_empty() {
+        object
+            .entry("route_profile".to_string())
+            .or_insert_with(|| serde_json::json!(parsed.route_profile_id));
+    }
     if !parsed.session_id.is_empty() {
         object
             .entry("session_id".to_string())
@@ -84,11 +94,20 @@ pub async fn execute_parsed_tool_calls(
     let mut executed_tool_count = 0usize;
     let mut executed_results: Vec<(String, bool)> = Vec::new();
 
-    for call in parsed_calls {
+    for (seq, call) in parsed_calls.iter().enumerate() {
+        let args_preview = telemetry_preview(&call.arguments.to_string(), TOOL_PREVIEW_CHARS);
+
         if let Some(stream) = status_stream.as_deref_mut() {
+            // Enriched live event: the chat frontend ignores the extra fields
+            // (backward-compatible), while an ops subscriber can now show
+            // trace_id + what the tool received, not just its name.
             let status_msg = IpcResponse {
                 status: "tool_status".to_string(),
-                data: serde_json::json!({"name": call.name.clone()}),
+                data: serde_json::json!({
+                    "name": call.name.clone(),
+                    "trace_id": parsed.trace_id.clone(),
+                    "args_preview": args_preview.clone(),
+                }),
             };
             let mut str_msg = serde_json::to_string(&status_msg).unwrap();
             str_msg.push('\n');
@@ -97,6 +116,9 @@ pub async fn execute_parsed_tool_calls(
 
         if crate::ai::tool_executor::permissions_allow_tool(&parsed.permissions, &call.name) {
             let contextual_call = contextualize_tool_call(call, parsed);
+            // Durable per-tool-call telemetry is emitted inside `execute_tool`
+            // itself (the universal chokepoint) so the fast-path, streaming and
+            // retry paths are covered too — not just this parsed-loop.
             let tool_res = crate::ai::tool_executor::execute_tool(&contextual_call).await;
             executed_tool_count += 1;
             execution_outputs.push_str(&format!("\n\n{}", tool_res.output));
@@ -115,6 +137,21 @@ pub async fn execute_parsed_tool_calls(
                 call.name
             ));
             executed_results.push((call.name.clone(), false));
+
+            // Record the denied attempt too — a spike of these is a signal.
+            spawn_log_tool_call(
+                parsed.trace_id.clone(),
+                parsed.session_id.clone(),
+                parsed.app_name.clone(),
+                parsed.route_profile_id.clone(),
+                seq as u32,
+                call.name.clone(),
+                args_preview,
+                String::new(),
+                0,
+                false,
+                Some("denied by permissions".to_string()),
+            );
         }
     }
 
@@ -548,6 +585,8 @@ App: {}{}{}{}\nSchema:\n{}",
         tool_choice: None,
         reasoning_effort: Some("medium".to_string()),
         response_format: None,
+        app: None,
+        priority: None,
     };
 
     let resp = engine.generate_content(req).await.ok()?;
@@ -628,6 +667,8 @@ pub async fn summarize_tool_output_for_user(
         tool_choice: None,
         reasoning_effort: Some("low".to_string()),
         response_format: None,
+        app: None,
+        priority: None,
     };
 
     let resp = engine.generate_content(req).await.ok()?;
@@ -814,6 +855,8 @@ mod tests {
             tool_choice: None,
             reasoning_effort: None,
             response_format: None,
+            app: None,
+            priority: None,
         }
     }
 

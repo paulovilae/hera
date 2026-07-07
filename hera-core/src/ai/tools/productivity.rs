@@ -8,7 +8,7 @@ use crate::ai::tool_executor::{ToolCall, ToolResult};
 
 const MEMENTO_SOCK: &str = "/tmp/memento.sock";
 pub(crate) const IMAP_CONF: &str = "/home/paulo/.config/imagineos/secrets/imap.conf";
-const IMAP_CONF_SECONDARY: &str = "/home/paulo/.config/imagineos/secrets/imap-secondary.conf";
+
 const CALENDAR_CONF: &str = "/home/paulo/.config/imagineos/secrets/calendar.conf";
 const NOTES_DIR: &str = "/home/paulo/Notes";
 

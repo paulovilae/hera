@@ -5,10 +5,11 @@ use super::context::{
     prepare_runtime_execution_context, prepare_tool_result_followup_request,
 };
 use super::helpers::{
-    RuntimePromotionContext, canonicalize_user_id, infer_origin_from_model,
+    RuntimePromotionContext, canonicalize_user_id, hera_node, infer_origin_from_model,
     record_observation_and_promote_runtime_hint, record_runtime_observation, report_recall_feedback,
     save_chat_turn_event, spawn_log_usage,
 };
+use super::inflight;
 use super::llm_audit::append_llm_audit_event;
 use super::runtime_tools::{
     FollowupStrategy, contextualize_tool_call, execute_parsed_tool_calls, execute_tool_followup,
@@ -217,6 +218,16 @@ pub async fn handle_generate(
 
     // 5. Generate
     if let Some(req) = chat_req.clone() {
+        // Wave 3 in-flight registry: insert right before the real generation
+        // attempt (fast-path/schema-planner short-circuits above never reach
+        // here — they're cheap and don't need liveness tracking). Every return
+        // from this point on must `inflight::remove` on its way out.
+        inflight::insert(
+            &parsed.trace_id,
+            &parsed.app_name,
+            &parsed.route_profile_id,
+            &hera_node(),
+        );
         let est_tokens = super::helpers::estimate_tokens(&req);
         tracing::info!(
             "📡 [Hera Generate] Starting inference for app='{}' — {} msgs, ~{} tokens (lightweight_mode={})",
@@ -338,8 +349,10 @@ pub async fn handle_generate(
                 0,
                 response_origin.contains("cloud"),
                 duration_ms,
+                parsed.trace_id.clone(),
             );
 
+            inflight::remove(&parsed.trace_id);
             return HandlerOutcome::Result {
                 result_text,
                 origin: response_origin,
@@ -606,11 +619,33 @@ pub async fn handle_generate(
                 }
 
                 // Path B — usage logging (best-effort, fire-and-forget).
+                //
+                // resp.usage is normally populated correctly here (llama-server's
+                // OpenAI-compatible response includes a real `usage` object, and
+                // openai_compat.rs/gemini.rs both map it into ChatUsage — verified
+                // live 2026-07-05 via a direct curl to :8080). It can still be
+                // `None` for response shapes that don't carry it (e.g. a B3 cloud
+                // escalation reuses the ORIGINAL local resp_usage, not resp2's —
+                // a separate known gap, not fixed here). Rather than log a hard
+                // 0/0/0 (which silently undercounts real spend/local-compute use
+                // in hera_usage_events), fall back to the same cheap char/4
+                // estimate already computed for the audit event (`est_tokens`)
+                // for the prompt side, and estimate completion tokens the same
+                // way from the final result_text. Approximate, but far closer
+                // to reality than zero, and free (no extra engine round-trip).
                 {
-                    let prompt_tokens = resp_usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
-                    let completion_tokens =
-                        resp_usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
-                    let total_tokens = resp_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+                    let (prompt_tokens, completion_tokens, total_tokens) = match &resp_usage {
+                        Some(usage) => (
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.total_tokens,
+                        ),
+                        None => {
+                            let est_prompt = est_tokens as u32;
+                            let est_completion = (result_text.len() / 4) as u32;
+                            (est_prompt, est_completion, est_prompt + est_completion)
+                        }
+                    };
                     spawn_log_usage(
                         parsed.app_name.clone(),
                         canonicalize_user_id(
@@ -626,9 +661,11 @@ pub async fn handle_generate(
                         total_tokens,
                         response_origin.contains("cloud"),
                         duration_ms,
+                        parsed.trace_id.clone(),
                     );
                 }
 
+                inflight::remove(&parsed.trace_id);
                 return HandlerOutcome::Result {
                     result_text,
                     origin: response_origin,
@@ -662,6 +699,7 @@ pub async fn handle_generate(
                 );
                 append_llm_audit_event(&outcome.audit_event);
                 let _ = record_runtime_observation(outcome.observation_payload).await;
+                inflight::remove(&parsed.trace_id);
                 return HandlerOutcome::Result {
                     result_text: format!("Error: {}", error_text),
                     origin: "offline".to_string(),

@@ -6,8 +6,13 @@
 
 use crate::ai::{ChatRequest, ChatResponse, InferenceError, LLMEngine};
 use serde::Deserialize;
-use std::sync::Arc;
-use std::{fs, path::{Path, PathBuf}};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 pub struct RouterEngine {
@@ -48,6 +53,74 @@ impl RouterEngine {
     }
 }
 
+/// Concurrency admission control (Hera concurrency/backpressure fix, 2026-07-05).
+///
+/// `hera-core` used to forward every concurrent `generate` request straight onto
+/// the single GPU `llama-server` (:8080) with NO admission control — under load
+/// (real bots + background derivation + agentic loops + `spawn_parallel_agents`
+/// fan-out, which self-connects back through this same IPC `generate` path)
+/// requests piled up, tail latency hit 49s, and clients timed out mid-flight
+/// ("Failed to write IPC response: Broken pipe (os error 32)"). See
+/// docs/HERA_CONCURRENCY_BACKPRESSURE.md for the full diagnosis.
+///
+/// Verified live on genesis (2026-07-05): the omni server's own `/props` reports
+/// `total_slots: 4` (llama-server auto-picked N=4 for `--parallel -1`).
+/// `Hera/scripts/start_native_omni.sh` now pins `--parallel` explicitly via
+/// `IMAGINEOS_OMNI_PARALLEL_SLOTS` (default 4) so the real backend slot count
+/// stays deterministic across restarts — keep `HERA_PRIMARY_ENGINE_SLOTS` (below)
+/// equal to that value; they are two separate processes/env domains so nothing
+/// enforces the equality automatically.
+///
+/// This semaphore bounds how many requests may be in-flight against the PRIMARY
+/// engine at once. Excess requests wait up to
+/// `HERA_PRIMARY_ENGINE_ACQUIRE_TIMEOUT_SECS` (default 8s) for a free slot; if
+/// none frees up in time, the primary attempt is treated exactly like a
+/// primary-engine error and the existing secondary/tertiary/cloud failover chain
+/// takes over — a fast, honest failover beats a silent 49s stall that
+/// broken-pipes the caller.
+///
+/// Two-lane priority (2026-07-06, closes item 3 of
+/// docs/HERA_CONCURRENCY_BACKPRESSURE.md): `ChatRequest.priority ==
+/// Some("background")` (see `is_background_priority`) skips the wait/failover
+/// path entirely — it takes an immediately-free slot via `try_acquire_owned`
+/// or is skipped outright, never queuing behind interactive chat and never
+/// spilling onto secondary/tertiary/cloud compute. Wired today at the one
+/// known internal fire-and-forget caller, `ipc::helpers::save_chat_turn_event`'s
+/// KG-triple extraction. Known remaining scope limit: Memento's own
+/// session/room/project summary derivation calls Hera `generate` over its own
+/// IPC path (not through this Rust caller), so it isn't tagged `background`
+/// yet — a follow-up needs to thread `"priority": "background"` into that
+/// call from the Memento side.
+fn primary_engine_semaphore() -> Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let slots = std::env::var("HERA_PRIMARY_ENGINE_SLOTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4);
+        Arc::new(Semaphore::new(slots))
+    })
+    .clone()
+}
+
+fn primary_engine_acquire_timeout() -> Duration {
+    let secs = std::env::var("HERA_PRIMARY_ENGINE_ACQUIRE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(8);
+    Duration::from_secs(secs)
+}
+
+/// `req.priority == Some("background")` marks fire-and-forget internal work
+/// (KG-triple extraction from `ipc::helpers::save_chat_turn_event`, future
+/// memory-derivation callers) that must never queue for a primary-engine slot
+/// behind interactive chat, and must never spill onto secondary/tertiary/cloud
+/// compute either — see docs/HERA_CONCURRENCY_BACKPRESSURE.md item 3.
+fn is_background_priority(req: &ChatRequest) -> bool {
+    req.priority.as_deref() == Some("background")
+}
+
 #[async_trait::async_trait]
 impl LLMEngine for RouterEngine {
     async fn generate_content(&self, req: ChatRequest) -> Result<ChatResponse, InferenceError> {
@@ -56,6 +129,20 @@ impl LLMEngine for RouterEngine {
         let cloud_req = prepare_cloud_request(&req);
         let cloud_allowed = cloud_fallback_allowed(&req);
 
+        // Background admission lane: take an immediately-free primary slot or
+        // skip outright — no wait, no secondary/tertiary/cloud failover. See
+        // `is_background_priority`.
+        if is_background_priority(&req) {
+            let primary_req = with_endpoint_override(local_req.clone(), "HERA_PRIMARY_OMNI_URL");
+            return match primary_engine_semaphore().try_acquire_owned() {
+                Ok(_permit) => self.primary_engine.generate_content(primary_req).await,
+                Err(_) => Err(InferenceError::ExecutionFailed(
+                    "Background-priority request skipped: primary engine saturated (no free slot)."
+                        .to_string(),
+                )),
+            };
+        }
+
         // Priority 1-3: Sovereign AI execution across owned compute
         if provider == "auto" || provider == "local" || provider == "local_direct" {
             let primary_req = with_endpoint_override(local_req.clone(), "HERA_PRIMARY_OMNI_URL");
@@ -63,25 +150,57 @@ impl LLMEngine for RouterEngine {
                 "🕯️ Routing inference execution via Primary Sovereign Engine (model='{}')...",
                 primary_req.model
             );
-            match self.primary_engine.generate_content(primary_req).await {
-                Ok(response) => {
-                    info!("✅ Primary sovereign execution successful");
-                    return Ok(response);
-                }
-                Err(e) => {
-                    if provider == "local_direct" {
-                        return Err(e); // Hard fail if local is strictly requested
+            let permit = tokio::time::timeout(
+                primary_engine_acquire_timeout(),
+                primary_engine_semaphore().acquire_owned(),
+            )
+            .await;
+            match permit {
+                Ok(Ok(_permit)) => {
+                    match self.primary_engine.generate_content(primary_req).await {
+                        Ok(response) => {
+                            info!("✅ Primary sovereign execution successful");
+                            return Ok(response);
+                        }
+                        Err(e) => {
+                            if provider == "local_direct" {
+                                return Err(e); // Hard fail if local is strictly requested
+                            }
+                            warn!(
+                                "⚠️ Primary sovereign execution failed: {:?}. Attempting standby failover...",
+                                e
+                            );
+                        }
                     }
+                }
+                Ok(Err(_closed)) => {
                     warn!(
-                        "⚠️ Primary sovereign execution failed: {:?}. Attempting standby failover...",
-                        e
+                        "⚠️ Primary engine semaphore closed unexpectedly; treating as saturated."
                     );
+                    if provider == "local_direct" {
+                        return Err(InferenceError::ExecutionFailed(
+                            "Primary sovereign engine unavailable (semaphore closed).".to_string(),
+                        ));
+                    }
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "⚠️ Primary sovereign engine saturated (all slots busy for {:?}) — failing over instead of queuing further...",
+                        primary_engine_acquire_timeout()
+                    );
+                    if provider == "local_direct" {
+                        return Err(InferenceError::ExecutionFailed(
+                            "Primary sovereign engine busy (backend saturated); local_direct disallows failover.".to_string(),
+                        ));
+                    }
                 }
             }
 
             if let Some(secondary_engine) = &self.secondary_engine {
-                let secondary_req =
-                    with_explicit_endpoint(local_req.clone(), std::env::var("HERA_SECONDARY_OMNI_URL").ok());
+                let secondary_req = with_explicit_endpoint(
+                    local_req.clone(),
+                    std::env::var("HERA_SECONDARY_OMNI_URL").ok(),
+                );
                 info!("🕯️ Routing inference execution via Secondary Sovereign Engine...");
                 match secondary_engine.generate_content(secondary_req).await {
                     Ok(response) => {
@@ -101,8 +220,10 @@ impl LLMEngine for RouterEngine {
             }
 
             if let Some(tertiary_engine) = &self.tertiary_engine {
-                let tertiary_req =
-                    with_explicit_endpoint(local_req.clone(), std::env::var("HERA_TERTIARY_OMNI_URL").ok());
+                let tertiary_req = with_explicit_endpoint(
+                    local_req.clone(),
+                    std::env::var("HERA_TERTIARY_OMNI_URL").ok(),
+                );
                 info!("🕯️ Routing inference execution via Tertiary Sovereign Engine...");
                 match tertiary_engine.generate_content(tertiary_req).await {
                     Ok(response) => {
@@ -124,6 +245,12 @@ impl LLMEngine for RouterEngine {
 
         // Priority 4: Commercial cloud failover
         if (provider == "auto" || provider == "gemini" || provider == "cloud") && cloud_allowed {
+            if let Err(reason) = crate::ai::cloud_budget::check_and_record_cloud_call(
+                crate::ai::cloud_budget::estimate_tokens(&cloud_req),
+            ) {
+                warn!("🛑 Cloud call denied by cost-safety gate: {}", reason);
+                return Err(InferenceError::ExecutionFailed(reason));
+            }
             info!("☁️ Re-routing inference execution onto Cloud MultiModal Engine...");
             match self.cloud_engine.generate_content(cloud_req).await {
                 Ok(response) => {
@@ -164,28 +291,104 @@ impl LLMEngine for RouterEngine {
         let cloud_req = prepare_cloud_request(&req);
         let cloud_allowed = cloud_fallback_allowed(&req);
 
+        // Background admission lane — see the equivalent branch in
+        // `generate_content` / `is_background_priority`. Streaming background
+        // callers are not expected in practice today, but the semantics must
+        // match: an immediately-free slot or an outright skip, never a wait
+        // and never secondary/tertiary/cloud failover.
+        if is_background_priority(&req) {
+            let primary_req = with_endpoint_override(local_req.clone(), "HERA_PRIMARY_OMNI_URL");
+            return match primary_engine_semaphore().try_acquire_owned() {
+                Ok(owned_permit) => {
+                    let inner_rx = self.primary_engine.generate_stream(primary_req).await?;
+                    let mut inner_rx = inner_rx;
+                    let (tx, rx) = tokio::sync::mpsc::channel(32);
+                    tokio::spawn(async move {
+                        let _permit = owned_permit;
+                        while let Some(item) = inner_rx.recv().await {
+                            if tx.send(item).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    Ok(rx)
+                }
+                Err(_) => Err(InferenceError::ExecutionFailed(
+                    "Background-priority stream skipped: primary engine saturated (no free slot)."
+                        .to_string(),
+                )),
+            };
+        }
+
         if provider == "auto" || provider == "local" || provider == "local_direct" {
             let primary_req = with_endpoint_override(local_req.clone(), "HERA_PRIMARY_OMNI_URL");
             info!(
                 "🕯️ Routing STREAMING inference via Primary Sovereign Engine (model='{}')...",
                 primary_req.model
             );
-            match self.primary_engine.generate_stream(primary_req).await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => {
-                    if provider == "local_direct" {
-                        return Err(e);
+            let permit = tokio::time::timeout(
+                primary_engine_acquire_timeout(),
+                primary_engine_semaphore().acquire_owned(),
+            )
+            .await;
+            match permit {
+                Ok(Ok(owned_permit)) => {
+                    match self.primary_engine.generate_stream(primary_req).await {
+                        Ok(mut inner_rx) => {
+                            // Hold the slot permit for the WHOLE stream lifetime, not just
+                            // admission — a streaming generation still occupies a real GPU
+                            // slot until its last token, so release-on-admission would
+                            // undercount true concurrency.
+                            let (tx, rx) = tokio::sync::mpsc::channel(32);
+                            tokio::spawn(async move {
+                                let _permit = owned_permit; // dropped (released) when this task ends
+                                while let Some(item) = inner_rx.recv().await {
+                                    if tx.send(item).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                            return Ok(rx);
+                        }
+                        Err(e) => {
+                            if provider == "local_direct" {
+                                return Err(e);
+                            }
+                            warn!(
+                                "⚠️ Primary sovereign streaming failed: {:?}. Attempting standby failover...",
+                                e
+                            );
+                        }
                     }
+                }
+                Ok(Err(_closed)) => {
                     warn!(
-                        "⚠️ Primary sovereign streaming failed: {:?}. Attempting standby failover...",
-                        e
+                        "⚠️ Primary engine semaphore closed unexpectedly; treating as saturated."
                     );
+                    if provider == "local_direct" {
+                        return Err(InferenceError::ExecutionFailed(
+                            "Primary sovereign engine unavailable (semaphore closed).".to_string(),
+                        ));
+                    }
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        "⚠️ Primary sovereign engine saturated (all slots busy for {:?}) — failing over instead of queuing further...",
+                        primary_engine_acquire_timeout()
+                    );
+                    if provider == "local_direct" {
+                        return Err(InferenceError::ExecutionFailed(
+                            "Primary sovereign engine busy (backend saturated); local_direct disallows failover.".to_string(),
+                        ));
+                    }
                 }
             }
 
             if let Some(secondary_engine) = &self.secondary_engine {
-                let secondary_req =
-                    with_explicit_endpoint(local_req.clone(), std::env::var("HERA_SECONDARY_OMNI_URL").ok());
+                let secondary_req = with_explicit_endpoint(
+                    local_req.clone(),
+                    std::env::var("HERA_SECONDARY_OMNI_URL").ok(),
+                );
                 match secondary_engine.generate_stream(secondary_req).await {
                     Ok(stream) => return Ok(stream),
                     Err(e) => {
@@ -201,8 +404,10 @@ impl LLMEngine for RouterEngine {
             }
 
             if let Some(tertiary_engine) = &self.tertiary_engine {
-                let tertiary_req =
-                    with_explicit_endpoint(local_req.clone(), std::env::var("HERA_TERTIARY_OMNI_URL").ok());
+                let tertiary_req = with_explicit_endpoint(
+                    local_req.clone(),
+                    std::env::var("HERA_TERTIARY_OMNI_URL").ok(),
+                );
                 match tertiary_engine.generate_stream(tertiary_req).await {
                     Ok(stream) => return Ok(stream),
                     Err(e) => {
@@ -219,6 +424,15 @@ impl LLMEngine for RouterEngine {
         }
 
         if (provider == "auto" || provider == "gemini" || provider == "cloud") && cloud_allowed {
+            if let Err(reason) = crate::ai::cloud_budget::check_and_record_cloud_call(
+                crate::ai::cloud_budget::estimate_tokens(&cloud_req),
+            ) {
+                warn!(
+                    "🛑 Cloud streaming call denied by cost-safety gate: {}",
+                    reason
+                );
+                return Err(InferenceError::ExecutionFailed(reason));
+            }
             info!(
                 "☁️ Re-routing STREAMING inference onto Cloud MultiModal Engine (model='{}')...",
                 cloud_req.model
@@ -259,6 +473,23 @@ struct WorkloadPolicyEntry {
 #[derive(Debug, Deserialize)]
 struct WorkloadPolicy {
     class: String,
+    cloud_fallback: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AppCloudPolicyFile {
+    #[serde(default)]
+    app_cloud_policies: Vec<AppCloudPolicyEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppCloudPolicyEntry {
+    policy: AppCloudPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppCloudPolicy {
+    app: String,
     cloud_fallback: String,
 }
 
@@ -364,6 +595,21 @@ fn cloud_fallback_allowed(req: &ChatRequest) -> bool {
         return false;
     }
 
+    // Cost-safety gate (Capa 3), app→never_external: takes precedence over
+    // the workload-class inference below, which only looks at request SHAPE
+    // (image present? stt/tts model? max_tokens/model name?) and — as of
+    // this writing — never actually emits "stateful" for a normal chat
+    // request. Compliance-sensitive apps (legal/judicial data, Memento's
+    // cross-app memory store) must never leave sovereign compute regardless
+    // of what the classifier concludes about THIS particular message.
+    // Registry-driven (`Apps/OS-v3/registry/app_cloud_policy.yaml`) so new
+    // apps can be added without a rebuild.
+    if let Some(app_name) = req.app.as_deref() {
+        if app_cloud_fallback_policy(app_name).as_deref() == Some("never_external") {
+            return false;
+        }
+    }
+
     match inferred_workload_class(req).as_deref() {
         Some("stateful") => false,
         Some(class_name) => workload_cloud_fallback_policy(class_name)
@@ -378,10 +624,9 @@ fn inferred_workload_class(req: &ChatRequest) -> Option<String> {
         return Some("speech".to_string());
     }
     let has_image = req.messages.iter().any(|message| match &message.content {
-        crate::ai::MessageContent::Parts(parts) => parts.iter().any(|part| matches!(
-            part,
-            crate::ai::ContentPart::ImageUrl { .. }
-        )),
+        crate::ai::MessageContent::Parts(parts) => parts
+            .iter()
+            .any(|part| matches!(part, crate::ai::ContentPart::ImageUrl { .. })),
         _ => false,
     });
     if has_image || req.vision_model.is_some() {
@@ -395,16 +640,70 @@ fn inferred_workload_class(req: &ChatRequest) -> Option<String> {
 
 fn workload_cloud_fallback_policy(class_name: &str) -> Option<String> {
     let registry_dir = locate_os_v3_registry_dir()?;
-    let file = load_yaml::<WorkloadPolicyFile>(&registry_dir.join("workload_policies.yaml")).ok()?;
+    let file =
+        load_yaml::<WorkloadPolicyFile>(&registry_dir.join("workload_policies.yaml")).ok()?;
     file.workload_policies
         .into_iter()
         .find(|entry| entry.policy.class == class_name)
         .map(|entry| entry.policy.cloud_fallback)
 }
 
+/// Looks up the never_external policy for `app_name`. Distinguishes two
+/// silent-failure shapes that previously collapsed into the same `None`
+/// (which `cloud_fallback_allowed` treats as "not never_external" and falls
+/// through to workload-class inference, i.e. cloud-allowed by default):
+///
+/// - **App simply not listed** in `app_cloud_policy.yaml` — expected for most
+///   apps, stays silent, no warning needed.
+/// - **Registry unreachable** (dir not found, file missing, or unparseable)
+///   — a config/deploy problem that would silently fail-open the
+///   compliance-sensitive never_external gate (legal/Memento) on a node
+///   with cloud enabled. This now logs a `warn!` so it shows up in
+///   `pm2 logs hera-core` instead of vanishing (Capa 3 hardening gap,
+///   see docs/HERA_CLOUD_COST_SAFETY.md).
+fn app_cloud_fallback_policy(app_name: &str) -> Option<String> {
+    let registry_dir = match locate_os_v3_registry_dir() {
+        Some(dir) => dir,
+        None => {
+            warn!(
+                "⚠️ app_cloud_policy lookup for app='{}' failed: OS-v3 registry dir not found — never_external gate cannot see this app on this node; falling through to workload-class inference.",
+                app_name
+            );
+            return None;
+        }
+    };
+    let policy_path = registry_dir.join("app_cloud_policy.yaml");
+    if !policy_path.exists() {
+        warn!(
+            "⚠️ app_cloud_policy lookup for app='{}' failed: {} does not exist — never_external gate cannot see this app; falling through to workload-class inference.",
+            app_name,
+            policy_path.display()
+        );
+        return None;
+    }
+    let file = match load_yaml::<AppCloudPolicyFile>(&policy_path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!(
+                "⚠️ app_cloud_policy lookup for app='{}' failed to parse {}: {:?} — never_external gate cannot see this app; falling through to workload-class inference.",
+                app_name,
+                policy_path.display(),
+                error
+            );
+            return None;
+        }
+    };
+    file.app_cloud_policies
+        .into_iter()
+        .find(|entry| entry.policy.app.eq_ignore_ascii_case(app_name))
+        .map(|entry| entry.policy.cloud_fallback)
+}
+
 fn current_network_mode() -> Option<String> {
     let registry_dir = locate_os_v3_registry_dir()?;
-    let nodes = load_yaml::<NodeRegistryFile>(&registry_dir.join("nodes.yaml")).ok()?.nodes;
+    let nodes = load_yaml::<NodeRegistryFile>(&registry_dir.join("nodes.yaml"))
+        .ok()?
+        .nodes;
     let profiles = load_yaml::<NetworkProfileFile>(&registry_dir.join("network_profiles.yaml"))
         .ok()?
         .network_profiles;
@@ -464,7 +763,12 @@ fn current_node_alias(nodes: &[NodeEntry]) -> Option<String> {
     }
 
     let hostname = std::env::var("HOSTNAME").ok()?;
-    nodes.iter()
-        .find(|node| node.profile.hostname == hostname || node.profile.alias == hostname || node.id == hostname)
+    nodes
+        .iter()
+        .find(|node| {
+            node.profile.hostname == hostname
+                || node.profile.alias == hostname
+                || node.id == hostname
+        })
         .map(|node| node.id.clone())
 }
