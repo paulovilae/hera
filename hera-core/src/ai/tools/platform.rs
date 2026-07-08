@@ -876,9 +876,13 @@ pub(crate) async fn execute_generate_access_link(call: &ToolCall) -> ToolResult 
         .unwrap_or_else(|_| "http://127.0.0.1:5177".to_string());
     let endpoint = format!("{}/api/auth/magic-link/create", os_v3_url);
 
+    let admin_email = std::env::var("OS_ADMIN_EMAIL")
+        .unwrap_or_else(|_| "admin@localhost".to_string());
+    let admin_name = std::env::var("OS_ADMIN_NAME")
+        .unwrap_or_else(|_| "Admin".to_string());
     let body = serde_json::json!({
-        "email": "vilapaulo@gmail.com",
-        "name": "Paulo",
+        "email": admin_email,
+        "name": admin_name,
         "redirect": redirect,
         "admin": true
     });
