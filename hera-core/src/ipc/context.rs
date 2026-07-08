@@ -109,7 +109,27 @@ pub fn apply_runtime_preflight(
             .get("recommended_budget_mode")
             .and_then(|value| value.as_str())
     {
-        parsed.context_budget = context_budget_for_mode(mode, lightweight_mode);
+        let candidate_budget = context_budget_for_mode(mode, lightweight_mode);
+        // Anti-inflation downgrades from Memento (e.g. a known `prompt_inflation` /
+        // `tool_schema_inflation` regression) must never silently strand a caller
+        // that declared `required_tools` — that contract is enforced by the
+        // agentic-loop hard-gate (`agentic_loop::run_agentic_loop`), which can
+        // only run when `allow_tools` is true. Downgrading to a tools-disabled
+        // budget here would mean the model never gets a chance to call the
+        // required tool, and the hard-gate never fires either — the request
+        // just silently produces a plain-text answer with no file written
+        // (root cause of the 2026-07-08 consulting_spec_gen SPEC.md incidents).
+        if !candidate_budget.allow_tools && !parsed.required_tools.is_empty() {
+            tracing::warn!(
+                app = %parsed.app_name,
+                route_profile = %parsed.route_profile_id,
+                required_tools = ?parsed.required_tools,
+                recommended_mode = %mode,
+                "Memento runtime preflight recommended a tools-disabling budget downgrade, but required_tools is non-empty — ignoring the downgrade"
+            );
+        } else {
+            parsed.context_budget = candidate_budget;
+        }
     }
 
     if let Some(warnings) = preflight.get("warnings").and_then(|value| value.as_array()) {
@@ -1149,7 +1169,9 @@ pub fn inject_system_prompt(req: &mut ChatRequest, full_system_prompt: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{context_budget_for_mode, latest_user_message_text, parse_payload};
+    use super::{
+        apply_runtime_preflight, context_budget_for_mode, latest_user_message_text, parse_payload,
+    };
 
     #[test]
     fn parse_payload_uses_latest_user_even_if_not_last_message() {
@@ -1207,6 +1229,57 @@ mod tests {
         assert!(!budget.include_tool_schemas);
         assert!(!budget.include_db_schema);
         assert!(!budget.allow_tools);
+    }
+
+    #[test]
+    fn apply_runtime_preflight_ignores_tools_disabling_downgrade_when_required_tools_present() {
+        let payload = serde_json::json!({
+            "prompt": "lee el app y escribe SPEC.md",
+            "app": "consulting_spec_gen",
+            "route_profile": "coding",
+            "required_tools": ["write_file"]
+        });
+        let mut parsed = parse_payload(&payload);
+        parsed.context_budget = context_budget_for_mode("heavy", false);
+        assert!(!parsed.required_tools.is_empty());
+        assert!(parsed.context_budget.allow_tools);
+
+        // Simulates Memento's fetch_runtime_preflight reporting a known
+        // prompt_inflation/tool_schema_inflation regression for this app/route.
+        let preflight = serde_json::json!({
+            "recommended_budget_mode": "lightweight",
+            "warnings": ["known_regression: prompt_inflation"]
+        });
+
+        apply_runtime_preflight(&mut parsed, Some(&preflight), false, false);
+
+        assert!(
+            parsed.context_budget.allow_tools,
+            "a caller with non-empty required_tools must keep tools enabled so the \
+             agentic-loop hard-gate can still run"
+        );
+        assert_ne!(parsed.context_budget.mode, "lightweight");
+    }
+
+    #[test]
+    fn apply_runtime_preflight_still_downgrades_when_required_tools_is_empty() {
+        let payload = serde_json::json!({
+            "prompt": "hola, como estas",
+            "app": "some_chatty_app",
+            "route_profile": "standard"
+        });
+        let mut parsed = parse_payload(&payload);
+        parsed.context_budget = context_budget_for_mode("heavy", false);
+        assert!(parsed.required_tools.is_empty());
+
+        let preflight = serde_json::json!({
+            "recommended_budget_mode": "lightweight"
+        });
+
+        apply_runtime_preflight(&mut parsed, Some(&preflight), false, false);
+
+        assert_eq!(parsed.context_budget.mode, "lightweight");
+        assert!(!parsed.context_budget.allow_tools);
     }
 }
 

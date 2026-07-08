@@ -23,6 +23,13 @@ const WATCHDOG_LOG: &str = "/home/paulo/Programs/apps/OS/Apps/OS-v3/storage/logs
 const TICK_INTERVAL_SECS: u64 = 60;
 /// Max consecutive auto-restart attempts per service before escalating
 const MAX_AUTO_RESTARTS: u32 = 3;
+/// PM2 ecosystem config used to re-register deleted bundle services
+const ECOSYSTEM_CONFIG: &str = "/home/paulo/Programs/apps/OS/ecosystem.config.cjs";
+
+/// Ava bundle services that must always be registered in PM2.
+/// A rogue `pm2 delete` on any of these is auto-healed within one watchdog tick.
+const REQUIRED_BUNDLE_SERVICES: &[&str] =
+    &["imaginclaw", "hera-core", "memento-node", "sentinel", "argus"];
 
 /// In-memory state for tracking restart attempts per service
 struct WatchdogState {
@@ -84,6 +91,9 @@ async fn watchdog_tick(state: &mut WatchdogState) -> Result<(), String> {
 
     // ── 1. Check PM2 services ──
     check_pm2_services(state, &mut emergencies);
+
+    // ── 1b. Ensure required bundle services are registered (catches pm2 delete) ──
+    check_required_bundle_services(state, &mut emergencies);
 
     // ── 2. Check disk space ──
     check_disk_space(&mut emergencies);
@@ -266,6 +276,82 @@ fn check_pm2_services(state: &mut WatchdogState, emergencies: &mut Vec<Emergency
                     action_taken: "logged warning".to_string(),
                 });
             }
+        }
+    }
+}
+
+/// Ensure all required Ava bundle services are registered in PM2.
+/// `check_pm2_services` handles errored/stopped (they still appear in jlist).
+/// This function handles DELETED services (absent from jlist entirely).
+fn check_required_bundle_services(state: &mut WatchdogState, emergencies: &mut Vec<Emergency>) {
+    let output = match std::process::Command::new("pm2").arg("jlist").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    let procs: Vec<Value> = match serde_json::from_str(&out_str) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let registered: std::collections::HashSet<String> = procs
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    for &svc in REQUIRED_BUNDLE_SERVICES {
+        if registered.contains(svc) {
+            continue;
+        }
+
+        let attempt_key = format!("__missing__{}", svc);
+        let attempt_count = state.restart_counts.entry(attempt_key).or_insert(0);
+
+        if *attempt_count < MAX_AUTO_RESTARTS {
+            let result = std::process::Command::new("pm2")
+                .args(["start", ECOSYSTEM_CONFIG, "--only", svc])
+                .output();
+
+            *attempt_count += 1;
+
+            match result {
+                Ok(r) if r.status.success() => {
+                    emergencies.push(Emergency {
+                        severity: Severity::AutoHealed,
+                        category: "BUNDLE_SERVICE_RESTORED".to_string(),
+                        service: svc.to_string(),
+                        message: format!(
+                            "Bundle service '{}' was DELETED from PM2 — re-registered and started (attempt {}/{})",
+                            svc, attempt_count, MAX_AUTO_RESTARTS
+                        ),
+                        action_taken: format!("pm2 start {} --only {}", ECOSYSTEM_CONFIG, svc),
+                    });
+                }
+                _ => {
+                    emergencies.push(Emergency {
+                        severity: Severity::Critical,
+                        category: "BUNDLE_SERVICE_MISSING".to_string(),
+                        service: svc.to_string(),
+                        message: format!(
+                            "Bundle service '{}' MISSING from PM2, re-registration FAILED (attempt {}/{})",
+                            svc, attempt_count, MAX_AUTO_RESTARTS
+                        ),
+                        action_taken: "pm2 start failed".to_string(),
+                    });
+                }
+            }
+        } else {
+            emergencies.push(Emergency {
+                severity: Severity::Critical,
+                category: "BUNDLE_SERVICE_MISSING".to_string(),
+                service: svc.to_string(),
+                message: format!(
+                    "Bundle service '{}' MISSING from PM2 — {} re-registration attempts exhausted — NEEDS HUMAN INTERVENTION",
+                    svc, MAX_AUTO_RESTARTS
+                ),
+                action_taken: "exhausted auto-restart retries".to_string(),
+            });
         }
     }
 }
