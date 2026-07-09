@@ -481,31 +481,37 @@ impl Hera {
         Ok(truncated)
     }
 
-    /// Web search. Prefers a self-hosted SearXNG instance (sovereign, no API
+    /// Web search. Prefers self-hosted SearXNG instances (sovereign, no API
     /// key, aggregates many engines, not blocked by datacenter-IP anomaly
-    /// detection). Falls back to scraping DuckDuckGo Lite directly if SearXNG
-    /// is not configured or returns nothing.
+    /// detection). Falls back to scraping DuckDuckGo Lite directly if every
+    /// SearXNG is unset/down.
     ///
-    /// Configure via `HERA_SEARXNG_URL` (e.g. `http://10.100.0.2:8088` from an
-    /// edge node over WireGuard, or `http://localhost:8088` on the host node).
-    /// Without it, behaviour is the legacy DDG scrape — which is blocked from
-    /// GCP/datacenter IPs (returns DuckDuckGo's "anomaly" page → no results).
+    /// `HERA_SEARXNG_URL` may be a comma-separated list of bases tried in
+    /// order until one returns results (e.g. genesis primary, laptop failover:
+    /// `http://100.74.176.21:8088,http://127.0.0.1:8088`). Without it, or if
+    /// every instance is exhausted, behaviour is the legacy DDG scrape — which
+    /// is blocked from GCP/datacenter IPs (returns DuckDuckGo's "anomaly" page
+    /// → no results).
     pub async fn native_web_search(&self, query: &str) -> Result<String> {
-        if let Ok(base) = std::env::var("HERA_SEARXNG_URL") {
-            let base = base.trim_end_matches('/');
-            if !base.is_empty() {
+        if let Ok(raw) = std::env::var("HERA_SEARXNG_URL") {
+            for base in raw.split(',') {
+                let base = base.trim().trim_end_matches('/');
+                if base.is_empty() {
+                    continue;
+                }
                 match self.searxng_search(base, query).await {
                     Ok(results) if !results.is_empty() => {
                         return Ok(results.join("\n---\n"));
                     }
                     Ok(_) => {
-                        tracing::warn!("SearXNG returned 0 results for '{}', falling back to DDG", query);
+                        tracing::warn!("SearXNG {} returned 0 results for '{}', trying next", base, query);
                     }
                     Err(e) => {
-                        tracing::warn!("SearXNG search failed ({}), falling back to DDG", e);
+                        tracing::warn!("SearXNG {} failed ({}), trying next", base, e);
                     }
                 }
             }
+            tracing::warn!("all SearXNG instances exhausted for '{}', falling back to DDG", query);
         }
         self.duckduckgo_scrape(query).await
     }
