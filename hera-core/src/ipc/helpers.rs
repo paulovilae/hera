@@ -214,6 +214,68 @@ pub async fn save_agent_run_summary(payload: serde_json::Value) {
     let _ = call_memento("save_agent_run_summary", payload).await;
 }
 
+/// Persist one pass of a `delegate_task` goal-loop as a durable `open_loop`
+/// scoped_memory row. Fire-and-forget (errors only log). The registry that
+/// tracks live delegate runs is in-memory only, so a `hera-core` restart would
+/// silently drop the loop's progress; this row survives the restart and lets a
+/// future turn recall "goal X was pursued, pass N/M, verdict …". Reuses the same
+/// Memento `save_scoped_memory` action + payload shape as `save_chat_turn_event`
+/// (memory_type `open_loop` is one of the durable types the self-editing
+/// `save_memory` tool already emits) so no new Memento surface is introduced.
+#[allow(clippy::too_many_arguments)]
+pub async fn save_open_loop_memory(
+    app_id: String,
+    session_id: String,
+    run_id: String,
+    goal: String,
+    pass: u32,
+    max_passes: u32,
+    satisfied: bool,
+    verdict_reason: String,
+    result_summary: String,
+) {
+    if goal.trim().is_empty() {
+        return;
+    }
+    let user_id = if !session_id.trim().is_empty() {
+        format!("session:{session_id}")
+    } else if !app_id.trim().is_empty() {
+        format!("app:{app_id}")
+    } else {
+        "anonymous".to_string()
+    };
+    // Store the structured state AS the content (compact JSON) so a restart can
+    // parse it back, while still being human-readable in Memento.
+    let content = serde_json::json!({
+        "run_id": run_id,
+        "goal": goal,
+        "pass": pass,
+        "max_passes": max_passes,
+        "satisfied": satisfied,
+        "verdict": if satisfied { "SATISFIED" } else { "CONTINUE" },
+        "reason": verdict_reason,
+        "result_summary": result_summary,
+    })
+    .to_string();
+    let payload = serde_json::json!({
+        "user_id": user_id,
+        "tenant_id": "default",
+        "app_id": app_id,
+        "session_id": session_id,
+        "scope": "personal",
+        "source": "hera_goal_loop",
+        "memory_type": "open_loop",
+        "content": content,
+        "tags": ["goal_loop", if satisfied { "satisfied" } else { "continue" }],
+        "auto_derive": false,
+    });
+    if let Some(resp) = call_memento("save_scoped_memory", payload).await
+        && let Some(err) = resp.get("error").and_then(|v| v.as_str())
+    {
+        tracing::warn!("save_open_loop_memory failed: {}", err);
+    }
+}
+
 fn learned_hint_in_cooldown(preflight: &serde_json::Value) -> bool {
     preflight
         .get("learned_hints")
