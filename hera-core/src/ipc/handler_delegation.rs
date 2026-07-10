@@ -238,6 +238,13 @@ fn get_run(run_id: &str) -> Option<AgentRunRecord> {
         .and_then(|registry| registry.get(run_id).cloned())
 }
 
+/// True if the run has been cancelled (terminal). The goal loop polls this
+/// between passes so a `cancel_agent_run` mid-flight actually STOPS the loop
+/// instead of aborting only the current pass's agents and re-spawning the next.
+fn run_is_cancelled(run_id: &str) -> bool {
+    get_run(run_id).is_some_and(|record| record.status == "cancelled")
+}
+
 /// Run one delegation pass (all agents in parallel) to completion.
 ///
 /// `intermediate` is set by the goal loop: when true, the pass finalizes to the
@@ -358,6 +365,13 @@ async fn spawn_delegate_run(
     }
 
     update_run(&run_id, |item| {
+        // A concurrent cancel_agent_run may have set the terminal `cancelled`
+        // status while these agents were in flight — never clobber it back to
+        // evaluating/completed, or the goal loop would treat the pass as normal
+        // and re-spawn the next one.
+        if item.status == "cancelled" {
+            return;
+        }
         item.status = if intermediate {
             "evaluating".to_string()
         } else {
@@ -557,8 +571,31 @@ async fn run_goal_loop(request: DelegateTaskRequest, run_id: String) -> AgentRun
     let mut last_reason = String::new();
 
     for pass in 1..=max_passes {
+        // Honour a cancel that arrived between passes: stop before spawning more work.
+        if run_is_cancelled(&run_id) {
+            tracing::info!(
+                "🎯 [Hera goal-loop] run {} cancelled before pass {} — stopping",
+                run_id,
+                pass
+            );
+            break;
+        }
+
         let pass_request = build_pass_request(&request, &goal, &accumulated_context, pass);
-        let record = spawn_delegate_run(pass_request, Some(run_id.clone()), true).await;        let aggregate = record.aggregate_result.clone().unwrap_or_default();
+        let record = spawn_delegate_run(pass_request, Some(run_id.clone()), true).await;
+
+        // A cancel during the pass leaves the run terminal (see spawn_delegate_run's
+        // finalize guard); do not evaluate the goal or loop again.
+        if run_is_cancelled(&run_id) {
+            tracing::info!(
+                "🎯 [Hera goal-loop] run {} cancelled during pass {} — stopping",
+                run_id,
+                pass
+            );
+            break;
+        }
+
+        let aggregate = record.aggregate_result.clone().unwrap_or_default();
         let any_failed = record
             .agents
             .iter()
@@ -978,16 +1015,32 @@ pub async fn handle_cancel_agent_run(
         return HandlerOutcome::DirectResponse;
     }
 
-    let mut cancelled = false;
+    // Abort the CURRENT pass's agent tasks if one is executing right now. A
+    // handle exists only while a pass runs; a goal-loop run sitting between
+    // passes (judging the goal) has none — which is exactly why marking the
+    // registry below must not depend on this.
+    let mut aborted = false;
     if let Ok(mut handles) = run_handles().lock()
         && let Some(handle) = handles.remove(&run_id)
     {
         for abort in handle.abort_handles {
             abort.abort();
         }
-        cancelled = true;
+        aborted = true;
     }
-    if cancelled {
+
+    // Mark the run cancelled in the registry whenever it exists and is not
+    // already terminal — independent of whether a pass was mid-flight. The
+    // goal-loop supervisor polls `run_is_cancelled` between passes and stops,
+    // so a cancel that lands during the judging window now actually STOPS the
+    // loop instead of returning "not found" and letting the next pass spawn.
+    let marked = get_run(&run_id).is_some_and(|record| {
+        !matches!(
+            record.status.as_str(),
+            "completed" | "failed" | "cancelled" | "goal_unmet"
+        )
+    });
+    if marked {
         update_run(&run_id, |record| {
             record.status = "cancelled".to_string();
             for agent in &mut record.agents {
@@ -997,6 +1050,10 @@ pub async fn handle_cancel_agent_run(
                 }
             }
         });
+    }
+
+    let cancelled = marked || aborted;
+    if cancelled {
         if let Some(record) = get_run(&run_id) {
             persist_run_summary(&record).await;
         }
@@ -1282,5 +1339,49 @@ mod goal_loop_tests {
         assert!(prompt.starts_with("original prompt"));
         assert!(prompt.contains("why it failed"));
         assert_eq!(p2.wait_for_completion, Some(true));
+    }
+
+    fn insert_test_run(run_id: &str, status: &str) {
+        let record = AgentRunRecord {
+            run_id: run_id.to_string(),
+            app: "test".to_string(),
+            trace_id: String::new(),
+            session_id: String::new(),
+            chat_id: String::new(),
+            goal: "test goal".to_string(),
+            strategy: "goal_loop".to_string(),
+            status: status.to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            route_profile: "goal_loop".to_string(),
+            agent_specs: Vec::new(),
+            agents: Vec::new(),
+            aggregate_result: None,
+            recommendation: None,
+            goal_passes: None,
+            goal_judge_reason: None,
+        };
+        run_registry()
+            .lock()
+            .expect("registry lock")
+            .insert(run_id.to_string(), record);
+    }
+
+    #[test]
+    fn run_is_cancelled_only_true_for_cancelled_status() {
+        // Unknown run → not cancelled (the goal loop must not stop on a typo).
+        assert!(!run_is_cancelled("goal-loop-test-missing"));
+
+        // A live run is not cancelled; flipping the registry status to
+        // "cancelled" is exactly the signal the goal loop polls between passes.
+        insert_test_run("goal-loop-test-running", "running");
+        assert!(!run_is_cancelled("goal-loop-test-running"));
+
+        insert_test_run("goal-loop-test-cancelled", "cancelled");
+        assert!(run_is_cancelled("goal-loop-test-cancelled"));
+
+        // A different terminal state is NOT cancelled — only an explicit cancel stops the loop.
+        insert_test_run("goal-loop-test-completed", "completed");
+        assert!(!run_is_cancelled("goal-loop-test-completed"));
     }
 }
