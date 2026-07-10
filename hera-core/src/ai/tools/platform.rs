@@ -22,6 +22,34 @@ const HOME_ROOT: &str = "/home/paulo";
 const TMP_ROOT: &str = "/tmp";
 const SMARTOS_ROUTER_URL: &str = "http://127.0.0.1:3000";
 
+// Hard-blocked regardless of caller/permissions/route_profile — root confinement
+// alone still lets edit_file/write_file reach secrets or corrupt a repo's .git
+// (writing into .git broke a repo via Syncthing before; see
+// reference_git_empty_object_corruption_syncthing). These are never legitimate
+// edit/write targets for any Hera tool, so they are checked here, at the single
+// choke point every fs tool resolves through, instead of trusted to prompt text.
+const FORBIDDEN_PATH_PREFIXES: &[&str] = &[
+    "/home/paulo/.config/imagineos/secrets",
+    "/home/paulo/.ssh",
+];
+
+fn is_forbidden_path(candidate: &Path) -> bool {
+    if FORBIDDEN_PATH_PREFIXES
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix))
+    {
+        return true;
+    }
+    // Blocks any `.git` directory anywhere in the tree (OS root's own .git,
+    // and every submodule's/nested repo's .git), not just the OS root's.
+    candidate.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name) if name == ".git"
+        )
+    })
+}
+
 pub(crate) fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<PathBuf, String> {
     let raw = Path::new(path);
     let candidate = if raw.exists() {
@@ -37,6 +65,13 @@ pub(crate) fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<Pat
                 .ok_or_else(|| "Path must include a file name".to_string())?,
         )
     };
+
+    if is_forbidden_path(&candidate) {
+        return Err(format!(
+            "Path '{}' is a hard-blocked Hera path (secrets or .git internals) and cannot be accessed by any tool.",
+            path
+        ));
+    }
 
     // Allow OS root (both symlink and canonical paths), home dir, and /tmp
     let in_os_root = candidate.starts_with(OS_ROOT) || candidate.starts_with(OS_ROOT_ALT);
