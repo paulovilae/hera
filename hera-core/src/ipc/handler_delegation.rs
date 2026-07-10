@@ -558,8 +558,7 @@ async fn run_goal_loop(request: DelegateTaskRequest, run_id: String) -> AgentRun
 
     for pass in 1..=max_passes {
         let pass_request = build_pass_request(&request, &goal, &accumulated_context, pass);
-        let record = spawn_delegate_run(pass_request, Some(run_id.clone()), true).await;
-        let aggregate = record.aggregate_result.clone().unwrap_or_default();
+        let record = spawn_delegate_run(pass_request, Some(run_id.clone()), true).await;        let aggregate = record.aggregate_result.clone().unwrap_or_default();
         let any_failed = record
             .agents
             .iter()
@@ -785,8 +784,7 @@ pub async fn handle_delegate_task(
     background_payload.wait_for_completion = Some(true);
     let background_run_id = run_id.clone();
     tokio::spawn(async move {
-        let _ = spawn_delegate_run(background_payload, Some(background_run_id), false).await;
-    });
+        let _ = spawn_delegate_run(background_payload, Some(background_run_id), false).await;    });
 
     send_ipc_response(
         stream,
