@@ -42,7 +42,7 @@ const VERIFY_TOOLS: &[&str] = &["cargo_check", "cargo_test", "pytest"];
 /// Tools whose green result is a STRONG signal the task is actually done (tests
 /// pass, not merely compiles). Only these trigger the efficiency early-close, so
 /// "verified" never fires on `cargo_check` alone (compiles ≠ correct).
-const VERIFY_CLOSE_TOOLS: &[&str] = &["cargo_test", "pytest"];
+pub const VERIFY_CLOSE_TOOLS: &[&str] = &["cargo_test", "pytest"];
 
 /// Outcome of a full agentic loop run.
 pub struct AgenticLoopOutcome {
