@@ -1268,6 +1268,41 @@ pub(crate) async fn execute_corporate_research(call: &ToolCall) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use crate::ai::tool_executor::parse_tool_calls;
+    use super::is_forbidden_path;
+    use std::path::Path;
+
+    #[test]
+    fn test_forbidden_secrets_path() {
+        assert!(is_forbidden_path(Path::new(
+            "/home/paulo/.config/imagineos/secrets/postgres-password"
+        )));
+    }
+
+    #[test]
+    fn test_forbidden_ssh_path() {
+        assert!(is_forbidden_path(Path::new("/home/paulo/.ssh/id_rsa")));
+    }
+
+    #[test]
+    fn test_forbidden_git_at_os_root() {
+        assert!(is_forbidden_path(Path::new(
+            "/home/paulo/Programs/apps/OS/.git/config"
+        )));
+    }
+
+    #[test]
+    fn test_forbidden_git_in_nested_submodule() {
+        assert!(is_forbidden_path(Path::new(
+            "/home/paulo/Programs/apps/OS/Hera/.git/HEAD"
+        )));
+    }
+
+    #[test]
+    fn test_allowed_normal_path_not_forbidden() {
+        assert!(!is_forbidden_path(Path::new(
+            "/home/paulo/Programs/apps/OS/Hera/hera-core/src/ai/tools/platform.rs"
+        )));
+    }
 
     #[test]
     fn test_parse_tool_call() {
