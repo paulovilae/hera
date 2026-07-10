@@ -6,6 +6,7 @@
 pub mod apps_construvendo;
 pub mod apps_latinos;
 pub mod apps_movilo;
+pub mod apps_shop;
 pub mod apps_vetra;
 pub mod brand_studio;
 pub mod build_feedback;

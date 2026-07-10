@@ -3,9 +3,9 @@
 use serde_json::Value;
 
 use crate::ai::tools::{
-    apps_construvendo, apps_latinos, apps_movilo, apps_vetra, brand_studio, build_feedback, coding,
-    data, deploy, email_imap, geo, infra_health, infra_smoke, mission_control, platform,
-    productivity, storage,
+    apps_construvendo, apps_latinos, apps_movilo, apps_shop, apps_vetra, brand_studio,
+    build_feedback, coding, data, deploy, email_imap, geo, infra_health, infra_smoke,
+    mission_control, platform, productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -290,6 +290,8 @@ async fn dispatch_metadata_tool(call: &ToolCall) -> Option<ToolResult> {
         "direct_rust" => {
             if let Some(result) = dispatch_platform_tool(call).await {
                 Some(result)
+            } else if let Some(result) = dispatch_shop_tool(call).await {
+                Some(result)
             } else if let Some(result) = dispatch_infra_tool(call).await {
                 Some(result)
             } else if let Some(result) = dispatch_vetra_tool(call).await {
@@ -306,6 +308,8 @@ async fn dispatch_metadata_tool(call: &ToolCall) -> Option<ToolResult> {
         }
         "http_adapter" => {
             if let Some(result) = dispatch_brand_tool(call).await {
+                Some(result)
+            } else if let Some(result) = dispatch_shop_tool(call).await {
                 Some(result)
             } else if let Some(result) = dispatch_vetra_tool(call).await {
                 Some(result)
@@ -390,6 +394,23 @@ async fn dispatch_vetra_tool(call: &ToolCall) -> Option<ToolResult> {
         "get_map_route" => apps_vetra::execute_get_map_route(call).await,
         "execute_workflow" => apps_vetra::execute_workflow(call).await,
         "bind_telegram_workspace" => apps_vetra::execute_bind_telegram_workspace(call).await,
+        _ => return None,
+    };
+    Some(result)
+}
+
+async fn dispatch_shop_tool(call: &ToolCall) -> Option<ToolResult> {
+    let result = match call.name.as_str() {
+        "list_products" => apps_shop::execute_list_products(call).await,
+        "create_product" => apps_shop::execute_create_product(call).await,
+        "update_inventory" => apps_shop::execute_update_inventory(call).await,
+        "shop_create_order" => apps_shop::execute_shop_create_order(call).await,
+        "shop_check_inventory" => apps_shop::execute_shop_check_inventory(call).await,
+        "abandoned_cart_to_lead" => apps_shop::execute_abandoned_cart_to_lead(call).await,
+        "generate_product_description" => {
+            apps_shop::execute_generate_product_description(call).await
+        }
+        "suggest_seo_meta" => apps_shop::execute_suggest_seo_meta(call).await,
         _ => return None,
     };
     Some(result)
