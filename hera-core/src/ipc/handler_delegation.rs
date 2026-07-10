@@ -238,9 +238,18 @@ fn get_run(run_id: &str) -> Option<AgentRunRecord> {
         .and_then(|registry| registry.get(run_id).cloned())
 }
 
+/// Run one delegation pass (all agents in parallel) to completion.
+///
+/// `intermediate` is set by the goal loop: when true, the pass finalizes to the
+/// NON-terminal `evaluating` status instead of `completed`, so a client polling
+/// `await_agent_run` keeps waiting while the goal is judged and (possibly) more
+/// passes run — otherwise it would catch the transient per-pass `completed` and
+/// return a false "done" mid-loop. Classic single-pass callers pass false and
+/// get the unchanged terminal `completed`.
 async fn spawn_delegate_run(
     request: DelegateTaskRequest,
     existing_run_id: Option<String>,
+    intermediate: bool,
 ) -> AgentRunRecord {
     let run_id = existing_run_id.unwrap_or_else(new_run_id);
     let app = request.app.clone().unwrap_or_else(|| "unknown".to_string());
@@ -349,7 +358,11 @@ async fn spawn_delegate_run(
     }
 
     update_run(&run_id, |item| {
-        item.status = "completed".to_string();
+        item.status = if intermediate {
+            "evaluating".to_string()
+        } else {
+            "completed".to_string()
+        };
         item.aggregate_result = Some(summarize_run(item));
         item.recommendation = derive_recommendation(item);
     });
@@ -545,8 +558,7 @@ async fn run_goal_loop(request: DelegateTaskRequest, run_id: String) -> AgentRun
 
     for pass in 1..=max_passes {
         let pass_request = build_pass_request(&request, &goal, &accumulated_context, pass);
-        let record = spawn_delegate_run(pass_request, Some(run_id.clone())).await;
-        let aggregate = record.aggregate_result.clone().unwrap_or_default();
+        let record = spawn_delegate_run(pass_request, Some(run_id.clone()), true).await;        let aggregate = record.aggregate_result.clone().unwrap_or_default();
         let any_failed = record
             .agents
             .iter()
@@ -749,7 +761,7 @@ pub async fn handle_delegate_task(
     }
 
     if wait {
-        let record = spawn_delegate_run(payload, None).await;
+        let record = spawn_delegate_run(payload, None, false).await;
         send_ipc_response(
             stream,
             &IpcResponse {
@@ -772,8 +784,7 @@ pub async fn handle_delegate_task(
     background_payload.wait_for_completion = Some(true);
     let background_run_id = run_id.clone();
     tokio::spawn(async move {
-        let _ = spawn_delegate_run(background_payload, Some(background_run_id)).await;
-    });
+        let _ = spawn_delegate_run(background_payload, Some(background_run_id), false).await;    });
 
     send_ipc_response(
         stream,
@@ -1076,7 +1087,7 @@ pub async fn handle_resume_agent_run(
     };
 
     if payload.wait_for_completion == Some(true) {
-        let resumed = spawn_delegate_run(payload, Some(run_id)).await;
+        let resumed = spawn_delegate_run(payload, Some(run_id), false).await;
         send_ipc_response(
             stream,
             &IpcResponse {
@@ -1100,7 +1111,7 @@ pub async fn handle_resume_agent_run(
     });
     let background_run_id = run_id.clone();
     tokio::spawn(async move {
-        let _ = spawn_delegate_run(payload, Some(background_run_id)).await;
+        let _ = spawn_delegate_run(payload, Some(background_run_id), false).await;
     });
     let resumed = get_run(&run_id).unwrap_or(record);
     send_ipc_response(

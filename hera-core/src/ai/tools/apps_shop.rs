@@ -18,6 +18,29 @@ fn base_url() -> String {
 
 const HERA_SOCKET: &str = "/tmp/hera-core.sock";
 
+/// Shared secret de plataforma para autenticar la llamada de servicio Hera→app. El endpoint
+/// `/api/engines/*` del app exige el header `X-OS-Service-Token` (mismo mecanismo que
+/// `require_service_token` en OS-v3 y el que ya mandan `os_auth_kit::pqr`/`email`). Se lee de
+/// `OS_AUTH_SHARED_SECRET` o `_FILE` (seteado para hera-core en `ecosystem.config.cjs`). `None`
+/// si falta → la app responde 401 (fail-closed), preferible a mutar la tienda sin auth.
+fn service_token() -> Option<String> {
+    if let Ok(v) = std::env::var("OS_AUTH_SHARED_SECRET") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    if let Ok(path) = std::env::var("OS_AUTH_SHARED_SECRET_FILE") {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 /// Pretty-print de un `View` JSON devuelto por el engine para el output del tool.
 fn pretty(json: &Value) -> String {
     serde_json::to_string_pretty(json).unwrap_or_else(|_| json.to_string())
@@ -28,7 +51,11 @@ fn pretty(json: &Value) -> String {
 async fn call_shop_action(action: &str, body: Value) -> Result<Value, String> {
     let url = format!("{}/api/engines/shop/action/{}", base_url(), action);
     let client = reqwest::Client::new();
-    match client.post(&url).json(&body).send().await {
+    let mut req = client.post(&url).json(&body);
+    if let Some(tok) = service_token() {
+        req = req.header("X-OS-Service-Token", tok);
+    }
+    match req.send().await {
         Ok(resp) if resp.status().is_success() => resp
             .json::<Value>()
             .await
