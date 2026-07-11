@@ -95,6 +95,42 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
     }
 }
 
+/// Extract lyrics from free-text prompt and return (style_prompt, lyrics).
+/// Handles: "letra: ...", "lyrics: ...", "que diga: ...", "[Verso]...", "[Verse]..."
+/// The style portion (without the lyrics clause) is returned as the prompt for the enhancer.
+fn split_lyrics_from_prompt(text: &str) -> (String, Option<String>) {
+    let lower = text.to_lowercase();
+
+    // Explicit "letra:" / "lyrics:" / "que diga:" delimiter — everything after is lyrics
+    for marker in &["letra:", "lyrics:", "que diga:", "que diga "] {
+        if let Some(pos) = lower.find(marker) {
+            let style = text[..pos].trim().to_string();
+            let raw_lyrics = text[pos + marker.len()..].trim().to_string();
+            if !raw_lyrics.is_empty() {
+                let lyrics = raw_lyrics
+                    .trim_matches(|c| c == '"' || c == '\'' || c == '\u{201c}' || c == '\u{201d}')
+                    .trim()
+                    .to_string();
+                return (if style.is_empty() { "music".to_string() } else { style }, Some(lyrics));
+            }
+        }
+    }
+    // Structural markers anywhere in the text indicate lyric content inline
+    if lower.contains("[verso]") || lower.contains("[coro]")
+        || lower.contains("[verse]") || lower.contains("[chorus]")
+        || lower.contains("[bridge]") || lower.contains("[puente]")
+    {
+        // Everything before the first structural marker = style hint; rest = lyrics
+        let structural = ["[verso]", "[coro]", "[verse]", "[chorus]", "[bridge]", "[puente]"];
+        if let Some(first) = structural.iter().filter_map(|m| lower.find(m)).min() {
+            let style = text[..first].trim().to_string();
+            let lyrics = text[first..].trim().to_string();
+            return (if style.is_empty() { "music".to_string() } else { style }, Some(lyrics));
+        }
+    }
+    (text.to_string(), None)
+}
+
 /// Parse "60 segundos", "30 seconds", "45s", "2 minutos", "2 minutes" from free text.
 fn extract_duration_from_text(text: &str) -> Option<u32> {
     let lower = text.to_lowercase();
@@ -143,15 +179,19 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
         // Fallback: extract "N segundos" / "N seconds" / "Ns" from the prompt text
         // when the model absorbed duration into text rather than as a parameter.
         .or_else(|| extract_duration_from_text(prompt));
+    // Prefer explicit `lyrics` param; fall back to extracting from the raw prompt text
+    // (local model often absorbs user-provided lyrics into the style description).
+    let (style_prompt, extracted_lyrics) = split_lyrics_from_prompt(prompt);
     let lyrics = call
         .arguments
         .get("lyrics")
         .and_then(|l| l.as_str())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .or(extracted_lyrics);
 
-    // Automatic prompt enhancement (no user-facing toggle) — same silent-by-default
-    // treatment images give their LoRA auto-router, tuned for music instead.
-    let enhanced_prompt = enhance_music_prompt(prompt).await;
+    // Send only the style portion to the enhancer so lyrics don't get re-absorbed.
+    let prompt_for_enhancer = if lyrics.is_some() { &style_prompt } else { prompt };
+    let enhanced_prompt = enhance_music_prompt(prompt_for_enhancer).await;
 
     let hera = hera_execution_agent();
     match hera.generate_music(&enhanced_prompt, duration, lyrics).await {
