@@ -100,10 +100,44 @@ pub(crate) async fn execute_index_code_graph(call: &ToolCall) -> ToolResult {
 /// `query_code_graph` — consulta el knowledge graph de código ya indexado en
 /// Memento (kg_entity/kg_relation, scope collection="code_graph"). Wrapper
 /// delgado sobre las acciones IPC `kg_graph`/`kg_neighbors`/`kg_centrality`/
-/// `kg_path`/`kg_communities` (ya expuestas también vía MCP en
-/// `Memento/src/bin/memento_mcp.rs`) — mismo motor, dos superficies.
+/// `kg_path`/`kg_communities`/`kg_semantic_search` (ya expuestas también vía
+/// MCP en `Memento/src/bin/memento_mcp.rs`) — mismo motor, dos superficies.
 pub(crate) async fn execute_query_code_graph(call: &ToolCall) -> ToolResult {
     let query_type = arg_str(call, "query_type");
+
+    // semantic_search es distinto de los demás query_type: el payload que
+    // Memento espera (`kg_semantic_search`) lleva `query_embedding: [f32]`,
+    // no los ids/hops de graph/neighbors/etc. — el embedding se calcula acá
+    // mismo, in-process (candle BERT vía `embed_text_local`), nunca en Memento.
+    if query_type == "semantic_search" {
+        let query = arg_str(call, "query");
+        if query.trim().is_empty() {
+            return err(
+                call,
+                "query_type=semantic_search requiere 'query': el texto a buscar semánticamente en el grafo de código.",
+            );
+        }
+        let Some(embedding) = crate::ipc::helpers::embed_text_local(query) else {
+            return err(
+                call,
+                "No se pudo generar el embedding local para 'query' (modelo de embeddings no disponible en este nodo — requiere el feature `embeddings`).",
+            );
+        };
+        let mut payload = serde_json::json!({
+            "collection": "code_graph",
+            "query_embedding": embedding,
+        });
+        for key in ["app_id", "top"] {
+            if let Some(v) = call.arguments.get(key) {
+                payload[key] = v.clone();
+            }
+        }
+        return match crate::ipc::helpers::call_memento_action("kg_semantic_search", payload).await {
+            Some(resp) => ok(call, true, resp.to_string()),
+            None => err(call, "No se pudo conectar a Memento (/tmp/memento.sock). ¿Está corriendo memento-node?"),
+        };
+    }
+
     let action = match query_type {
         "graph" => "kg_graph",
         "neighbors" => "kg_neighbors",
@@ -114,7 +148,7 @@ pub(crate) async fn execute_query_code_graph(call: &ToolCall) -> ToolResult {
             return err(
                 call,
                 format!(
-                    "query_type inválido: '{other}'. Usa uno de: graph, neighbors, centrality, path, communities."
+                    "query_type inválido: '{other}'. Usa uno de: graph, neighbors, centrality, path, communities, semantic_search."
                 ),
             )
         }
