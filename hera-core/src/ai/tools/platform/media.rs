@@ -95,6 +95,40 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
     }
 }
 
+/// Parse "60 segundos", "30 seconds", "45s", "2 minutos", "2 minutes" from free text.
+fn extract_duration_from_text(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    // "2 minutos" / "2 minutes" → seconds
+    let minute_pat = ["minuto", "minutos", "minute", "minutes", "min"];
+    for pat in &minute_pat {
+        if let Some(pos) = lower.find(pat) {
+            let before = lower[..pos].trim_end();
+            if let Some(n) = before.split_whitespace().next_back().and_then(|s| s.parse::<u32>().ok()) {
+                return Some((n * 60).clamp(10, 120));
+            }
+        }
+    }
+    // "60 segundos" / "60 seconds" / "60s"
+    let sec_pat = ["segundo", "segundos", "second", "seconds"];
+    for pat in &sec_pat {
+        if let Some(pos) = lower.find(pat) {
+            let before = lower[..pos].trim_end();
+            if let Some(n) = before.split_whitespace().next_back().and_then(|s| s.parse::<u32>().ok()) {
+                return Some(n.clamp(10, 120));
+            }
+        }
+    }
+    // bare "60s" (digit immediately followed by 's')
+    for word in lower.split_whitespace() {
+        if word.ends_with('s') {
+            if let Ok(n) = word[..word.len()-1].parse::<u32>() {
+                if n >= 10 { return Some(n.clamp(10, 120)); }
+            }
+        }
+    }
+    None
+}
+
 pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
     let prompt = call
         .arguments
@@ -105,7 +139,10 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
         .arguments
         .get("duration")
         .and_then(|d| d.as_u64())
-        .map(|d| d as u32);
+        .map(|d| d as u32)
+        // Fallback: extract "N segundos" / "N seconds" / "Ns" from the prompt text
+        // when the model absorbed duration into text rather than as a parameter.
+        .or_else(|| extract_duration_from_text(prompt));
     let lyrics = call
         .arguments
         .get("lyrics")
