@@ -28,7 +28,7 @@ VACE_MODEL_ID = "Wan-AI/Wan2.1-VACE-1.3B-Diffusers"
 T2V_CACHE_DIR = "/data/models/wan2.1"
 VACE_CACHE_DIR = "/data/models/wan2.1-vace"
 OUTPUT_DIR = "/tmp/imagineos-canvas"
-PORT = 8091
+PORT = int(os.environ.get("CANVAS_PORT", "8092"))
 GPU_DEVICE = 1  # Physical GPU 1
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_DEVICE)

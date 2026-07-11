@@ -10,6 +10,14 @@ fn draw_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string())
 }
 
+/// Returns the Canvas video generation base URL.
+/// Override with HERA_VIDEO_URL (e.g. if Canvas moves nodes or ports).
+/// Default: 127.0.0.1:8092 (Canvas Wan2.1, GPU1). GLiNER NER occupies :8091.
+fn video_url() -> String {
+    std::env::var("HERA_VIDEO_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8092".to_string())
+}
+
 /// Display name of the active image backend, reported to callers so UIs never
 /// hardcode the engine. Set HERA_DRAW_MODEL when you swap the draw model.
 fn draw_model() -> String {
@@ -407,7 +415,7 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
     }
 
     let result_text = match client
-        .post("http://127.0.0.1:8091/v1/video/generate")
+        .post(format!("{}/v1/video/generate", video_url()))
         .json(&canvas_payload)
         .send()
         .await
