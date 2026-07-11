@@ -301,6 +301,7 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
             | "cargo_check"
             | "cargo_test"
             | "pytest"
+            | "index_code_graph"
             | "ask_user"
             | "get_system_time"
             | "run_code"

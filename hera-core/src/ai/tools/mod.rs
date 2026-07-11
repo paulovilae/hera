@@ -10,6 +10,7 @@ pub mod apps_shop;
 pub mod apps_vetra;
 pub mod brand_studio;
 pub mod build_feedback;
+pub mod code_graph;
 pub mod coding;
 pub mod data;
 pub mod deploy;

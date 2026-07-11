@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::ai::tools::{
     apps_construvendo, apps_latinos, apps_movilo, apps_shop, apps_vetra, brand_studio,
-    build_feedback, coding, data, deploy, email_imap, geo, infra_health, infra_smoke,
+    build_feedback, code_graph, coding, data, deploy, email_imap, geo, infra_health, infra_smoke,
     mission_control, platform, productivity, storage,
 };
 
@@ -238,6 +238,7 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "cargo_test" => build_feedback::execute_cargo_test(call).await,
         "cargo_build_release" => build_feedback::execute_cargo_build_release(call).await,
         "pytest" => build_feedback::execute_pytest(call).await,
+        "index_code_graph" => code_graph::execute_index_code_graph(call).await,
         "generate_access_link" => platform::execute_generate_access_link(call).await,
         "spline_interact" => platform::execute_spline_interact(call).await,
         "desktop_click" => platform::execute_desktop_click(call).await,
