@@ -1286,6 +1286,163 @@ pub(crate) async fn execute_read_pm2_logs(call: &ToolCall) -> ToolResult {
     }
 }
 
+/// Unified cluster snapshot tool — merges data from all 4 infra tables.
+///
+/// Sources:
+///   Table 1 (Nodes):    Argus state JSON (Argus/var/argus/cluster-state.json) + hardware from /api/recommended-variant
+///   Table 2 (Apps):     scripts/gen_app_table.py --json (parses ecosystem.cjs + config/*.yaml)
+///   Table 3 (DBs):      derived from Table 2 db_name field
+///   Table 4 (Services): etc/services.toml (parsed inline — fields: id, pm2_name, port, consumers, preferred_nodes)
+pub(crate) async fn execute_cluster_snapshot(call: &ToolCall) -> ToolResult {
+    let table_filter = call.arguments.get("table")
+        .and_then(|v| v.as_str())
+        .unwrap_or("all");
+
+    let mut result = serde_json::Map::new();
+
+    // ── Table 1: Nodes (from Argus persisted state JSON + hardware endpoint) ──
+    if table_filter == "all" || table_filter == "nodes" {
+        let argus_state_paths = [
+            "Argus/var/argus/cluster-state.json",
+            "../Argus/var/argus/cluster-state.json",
+        ];
+        let mut nodes_json = serde_json::Value::Null;
+        for p in &argus_state_paths {
+            if let Ok(raw) = tokio::fs::read_to_string(p).await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    nodes_json = v;
+                    break;
+                }
+            }
+        }
+        // Also pull live hardware from Argus health port (no auth required)
+        let hw: serde_json::Value = async {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(4))
+                .build()
+                .unwrap_or_default();
+            let res = client.get("http://127.0.0.1:3006/api/recommended-variant").send().await.ok()?;
+            res.json::<serde_json::Value>().await.ok()
+        }.await.unwrap_or_default();
+        result.insert("nodes".into(), serde_json::json!({
+            "argus_cluster_state": nodes_json,
+            "local_hardware": hw,
+        }));
+    }
+
+    // ── Table 2 + Table 3: Apps + DBs (from gen_app_table.py) ──
+    if table_filter == "all" || table_filter == "apps" || table_filter == "databases" {
+        let script_paths = [
+            "scripts/gen_app_table.py",
+            "../scripts/gen_app_table.py",
+        ];
+        let mut apps_json: serde_json::Value = serde_json::json!([]);
+        for p in &script_paths {
+            if std::path::Path::new(p).exists() {
+                if let Ok(out) = tokio::process::Command::new("python3")
+                    .args([p, "--json"])
+                    .output()
+                    .await
+                {
+                    if out.status.success() {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                            apps_json = v;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if table_filter == "all" || table_filter == "apps" {
+            result.insert("apps".into(), apps_json.clone());
+        }
+        if table_filter == "all" || table_filter == "databases" {
+            let mut seen = std::collections::HashSet::new();
+            let dbs: Vec<serde_json::Value> = apps_json.as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|row| {
+                    let db = row.get("db_name")?.as_str()?;
+                    if db == "unknown" || !seen.insert(db.to_string()) { return None; }
+                    Some(serde_json::json!({
+                        "db_name": db,
+                        "owner_app": row.get("app_id"),
+                        "host": row.get("nodes").and_then(|n| n.as_array()).and_then(|a| a.first()).unwrap_or(&serde_json::Value::Null),
+                        "port": 5432,
+                        "replication": "streaming→anchor",
+                    }))
+                })
+                .collect();
+            result.insert("databases".into(), serde_json::Value::Array(dbs));
+        }
+    }
+
+    // ── Table 4: Services (from etc/services.toml, parsed inline) ──
+    if table_filter == "all" || table_filter == "services" {
+        let toml_paths = [
+            "etc/services.toml",
+            "../etc/services.toml",
+        ];
+        let mut services: Vec<serde_json::Value> = vec![];
+        for p in &toml_paths {
+            if let Ok(raw) = tokio::fs::read_to_string(p).await {
+                let mut current: serde_json::Map<String, serde_json::Value> = Default::default();
+                for line in raw.lines() {
+                    let t = line.trim();
+                    if t == "[[services]]" {
+                        if !current.is_empty() {
+                            services.push(serde_json::Value::Object(current.clone()));
+                        }
+                        current = Default::default();
+                        continue;
+                    }
+                    if t.starts_with("[[") { continue; } // variants
+                    if t.is_empty() || t.starts_with('#') { continue; }
+                    if let Some((k, v)) = t.split_once('=') {
+                        let key = k.trim();
+                        // Strip inline TOML comments (everything after first unquoted #)
+                        let v_clean = if let Some(hash_pos) = v.find(" #").or_else(|| v.find("\t#")) {
+                            &v[..hash_pos]
+                        } else { v };
+                        let val = v_clean.trim().trim_matches('"');
+                        match key {
+                            "id" | "type" | "pm2_name" | "expose" | "health" => {
+                                current.insert(key.to_string(), val.into());
+                            }
+                            "port" | "priority" => {
+                                if let Ok(n) = val.parse::<i64>() {
+                                    current.insert(key.to_string(), n.into());
+                                }
+                            }
+                            "preferred_nodes" | "secondary_nodes" | "consumers" | "needs_companions" | "needs_other" => {
+                                let nodes: Vec<&str> = val.split('"')
+                                    .filter(|s| !s.is_empty() && !s.contains('[') && !s.contains(']') && !s.contains(','))
+                                    .collect();
+                                current.insert(key.to_string(), serde_json::json!(nodes));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !current.is_empty() {
+                    services.push(serde_json::Value::Object(current));
+                }
+                break;
+            }
+        }
+        result.insert("services".into(), serde_json::Value::Array(services));
+    }
+
+    let output = serde_json::to_string_pretty(&serde_json::Value::Object(result))
+        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output,
+    }
+}
+
 pub(crate) async fn execute_query_federation_state(call: &ToolCall) -> ToolResult {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

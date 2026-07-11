@@ -361,6 +361,7 @@ async fn dispatch_infra_tool(call: &ToolCall) -> Option<ToolResult> {
         "caddy_domain_manager" => infra_health::execute_caddy_domain_manager(call).await,
         "provision_subdomain" => infra_health::execute_provision_subdomain(call).await,
         "query_federation_state" => infra_health::execute_query_federation_state(call).await,
+        "cluster_snapshot" => infra_health::execute_cluster_snapshot(call).await,
         "system_status" => infra_health::execute_system_status(call).await,
         "diagnose_services" => infra_health::execute_diagnose_services(call).await,
         "service_restart" => infra_health::execute_service_restart(call).await,
