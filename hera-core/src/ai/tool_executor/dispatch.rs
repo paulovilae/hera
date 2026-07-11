@@ -431,6 +431,7 @@ async fn dispatch_construvendo_tool(call: &ToolCall) -> Option<ToolResult> {
     let result = match call.name.as_str() {
         "construvendo_faq" => apps_construvendo::execute_construvendo_faq(call).await,
         "construvendo_simular" => apps_construvendo::execute_construvendo_simular(call).await,
+        "construvendo_calificar" => apps_construvendo::execute_construvendo_calificar(call).await,
         _ => return None,
     };
     Some(result)

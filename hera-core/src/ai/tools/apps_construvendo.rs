@@ -134,6 +134,89 @@ pub(crate) async fn execute_construvendo_simular(call: &ToolCall) -> ToolResult 
     }
 }
 
+/// `construvendo_calificar` → GET /api/calificar?presupuesto=&visita=&canal=
+/// Devuelve la calificación determinística del lead + una guía corta de qué
+/// hacer con ella. Solo cálculo (no persiste). Texto seguro para VIS.
+pub(crate) async fn execute_construvendo_calificar(call: &ToolCall) -> ToolResult {
+    // Presupuesto opcional: acepta número o string con separadores.
+    let presupuesto = call
+        .arguments
+        .get("presupuesto")
+        .and_then(|v| v.as_f64())
+        .or_else(|| {
+            call.arguments
+                .get("presupuesto")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.replace(['.', ',', '$', ' '], "").parse::<f64>().ok())
+        });
+    let visita = call
+        .arguments
+        .get("visita")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let canal = call
+        .arguments
+        .get("canal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("whatsapp")
+        .to_string();
+
+    let mut query: Vec<(String, String)> = vec![
+        ("visita".to_string(), visita.to_string()),
+        ("canal".to_string(), canal),
+    ];
+    if let Some(p) = presupuesto {
+        query.push(("presupuesto".to_string(), p.to_string()));
+    }
+
+    let url = format!("{}/api/calificar", base_url());
+    let client = reqwest::Client::new();
+    match client.get(&url).query(&query).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(json) => ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: format_calificacion(&json),
+            },
+            Err(e) => ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("No pude leer la calificación: {e}"),
+            },
+        },
+        Ok(resp) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("El servicio de calificación respondió con error: {}", resp.status()),
+        },
+        Err(e) => ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("No pude calificar al cliente ahora mismo: {e}"),
+        },
+    }
+}
+
+/// Traduce la respuesta JSON de calificación en una guía corta y accionable para
+/// Marina, sin exponer el score numérico interno ni presentar VIS como inversión.
+fn format_calificacion(json: &serde_json::Value) -> String {
+    let nivel = json.get("calificacion").and_then(|v| v.as_str()).unwrap_or("");
+    let unidades = json.get("unidades_al_alcance").and_then(|v| v.as_u64()).unwrap_or(0);
+    let visita = json.get("visita_agendada").and_then(|v| v.as_bool()).unwrap_or(false);
+    match nivel {
+        "caliente" => "Calificación: CALIENTE — hay unidades a su alcance y ya agendó visita. Cliente listo: acompáñalo al siguiente paso (separación) con un asesor.".to_string(),
+        "tibio" if !visita => format!(
+            "Calificación: TIBIO — {unidades} unidades caben en su presupuesto, pero aún no agenda visita. Invítalo con calidez a agendar una visita a sala de ventas: eso es lo que falta para avanzar."
+        ),
+        "tibio" => format!(
+            "Calificación: TIBIO — {unidades} unidades a su alcance. Mantén el interés y acércalo a un asesor para concretar."
+        ),
+        "frio" => "Calificación: FRÍO — aún no sabemos su presupuesto mensual. Pregúntale con naturalidad cuánto podría destinar al mes para poder mostrarle qué apartamento le alcanza (usa el simulador).".to_string(),
+        "descalificado" => "Calificación: fuera de alcance por ahora — con el presupuesto indicado no alcanza ni la unidad más accesible. Sé amable y honesto: ofrece hablar con un asesor por alternativas o dejar sus datos para futuras opciones. NUNCA lo presiones ni prometas algo que no cabe.".to_string(),
+        _ => "No pude interpretar la calificación. Pídele al cliente su presupuesto mensual y si desea agendar una visita.".to_string(),
+    }
+}
+
 /// Formatea la respuesta del simulador en texto corto y presentable (COP con
 /// separador de miles). Recordatorio VIS: es plan de compra de vivienda.
 fn format_simulacion(json: &serde_json::Value) -> String {

@@ -362,7 +362,10 @@ fn is_data_tool_name(tool_name: &str) -> bool {
 
 #[cfg(test)]
 fn is_construvendo_tool_name(tool_name: &str) -> bool {
-    matches!(tool_name, "construvendo_faq" | "construvendo_simular")
+    matches!(
+        tool_name,
+        "construvendo_faq" | "construvendo_simular" | "construvendo_calificar"
+    )
 }
 
 #[cfg(test)]
