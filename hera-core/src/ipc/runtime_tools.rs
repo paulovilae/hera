@@ -38,9 +38,29 @@ pub fn contextualize_tool_call(
     parsed: &ParsedPayload,
 ) -> crate::ai::tool_executor::ToolCall {
     let mut arguments = tool_call.arguments.clone();
+    if !arguments.is_object() {
+        // A weak local model occasionally emits `arguments` as a JSON-encoded
+        // string, an array, or a bare scalar instead of an object. This used
+        // to `.expect()` here and crash the whole tokio worker (panic in
+        // runtime_tools.rs), taking down hera-core and cascading into
+        // dependent pm2 services (e.g. dccolombia-blog-weekly hitting its
+        // auto-restart cap). Recover instead: try string-encoded JSON, else
+        // fall back to an empty object so the call still executes.
+        let recovered = arguments
+            .as_str()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|v| v.is_object());
+        tracing::warn!(
+            "⚠️ [Hera] Tool call '{}' arguments not an object ({}), {}",
+            tool_call.name,
+            arguments,
+            if recovered.is_some() { "recovered from string" } else { "coercing to empty object" }
+        );
+        arguments = recovered.unwrap_or_else(|| serde_json::json!({}));
+    }
     let object = arguments
         .as_object_mut()
-        .expect("tool call arguments should always be an object");
+        .expect("arguments guaranteed to be an object by the coercion above");
 
     if !parsed.app_name.is_empty() {
         object
