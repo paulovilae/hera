@@ -12,7 +12,7 @@ use tracing::info;
 /// raw prompt on any failure so a slow/unavailable brain never blocks generation.
 async fn enhance_music_prompt(raw_prompt: &str) -> String {
     let persona = "You are a music producer AI. Given a short brief idea, expand it into \
-        a single detailed prompt for a text-to-music model (MusicGen). Describe genre, \
+        a single detailed prompt for a text-to-music model (ACE-Step). Describe genre, \
         instruments, mood, tempo (BPM if it helps), and structure (intro/build/loop). \
         Do NOT use visual or image language (no cameras, lighting, colors). Only output \
         the expanded music prompt, nothing else, max 2 sentences."
@@ -106,13 +106,18 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
         .get("duration")
         .and_then(|d| d.as_u64())
         .map(|d| d as u32);
+    let lyrics = call
+        .arguments
+        .get("lyrics")
+        .and_then(|l| l.as_str())
+        .map(|s| s.to_string());
 
     // Automatic prompt enhancement (no user-facing toggle) — same silent-by-default
     // treatment images give their LoRA auto-router, tuned for music instead.
     let enhanced_prompt = enhance_music_prompt(prompt).await;
 
     let hera = hera_execution_agent();
-    match hera.generate_music(&enhanced_prompt, duration).await {
+    match hera.generate_music(&enhanced_prompt, duration, lyrics).await {
         Ok(res) => {
             let audio_url = res
                 .get("audio_url")
