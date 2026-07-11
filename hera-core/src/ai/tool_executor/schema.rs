@@ -315,6 +315,7 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
             | "edit_app_theme"
             | "geocode"
             | "reverse_geocode"
+            | "browser_action"
             | "storage_list"
             | "storage_get_url"
             | "storage_put"

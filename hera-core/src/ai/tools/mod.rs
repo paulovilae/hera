@@ -9,6 +9,7 @@ pub mod apps_movilo;
 pub mod apps_shop;
 pub mod apps_vetra;
 pub mod brand_studio;
+pub mod browser;
 pub mod build_feedback;
 pub mod code_graph;
 pub mod coding;
