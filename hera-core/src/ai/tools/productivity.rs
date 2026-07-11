@@ -551,10 +551,18 @@ context = ssl.create_default_context()
 try:
     mail = imaplib.IMAP4_SSL(host, port, ssl_context=context)
     mail.login(user, passwd)
-    mail.select(folder)
-    _, data = mail.search(None, criteria)
-    ids = data[0].split()
-    ids = ids[-limit:]
+    typ, sel_data = mail.select(folder)
+    if criteria == 'ALL':
+        # SEARCH ALL on a large mailbox (Gmail: tens of thousands of msgs)
+        # returns a response over imaplib's line-length limit and raises.
+        # Skip SEARCH entirely and fetch the last `limit` sequence numbers.
+        count = int(sel_data[0])
+        start = max(1, count - limit + 1)
+        ids = [str(i).encode() for i in range(start, count + 1)]
+    else:
+        _, data = mail.search(None, criteria)
+        ids = data[0].split()
+        ids = ids[-limit:]
     ids.reverse()
     results = []
     for uid in ids:
