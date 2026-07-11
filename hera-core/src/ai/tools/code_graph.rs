@@ -96,3 +96,39 @@ pub(crate) async fn execute_index_code_graph(call: &ToolCall) -> ToolResult {
     let summary = stdout.lines().last().unwrap_or("").trim();
     ok(call, true, format!("index_code_graph OK para '{slug}': {summary}"))
 }
+
+/// `query_code_graph` — consulta el knowledge graph de código ya indexado en
+/// Memento (kg_entity/kg_relation, scope collection="code_graph"). Wrapper
+/// delgado sobre las acciones IPC `kg_graph`/`kg_neighbors`/`kg_centrality`/
+/// `kg_path`/`kg_communities` (ya expuestas también vía MCP en
+/// `Memento/src/bin/memento_mcp.rs`) — mismo motor, dos superficies.
+pub(crate) async fn execute_query_code_graph(call: &ToolCall) -> ToolResult {
+    let query_type = arg_str(call, "query_type");
+    let action = match query_type {
+        "graph" => "kg_graph",
+        "neighbors" => "kg_neighbors",
+        "centrality" => "kg_centrality",
+        "path" => "kg_path",
+        "communities" => "kg_communities",
+        other => {
+            return err(
+                call,
+                format!(
+                    "query_type inválido: '{other}'. Usa uno de: graph, neighbors, centrality, path, communities."
+                ),
+            )
+        }
+    };
+
+    let mut payload = serde_json::json!({ "collection": "code_graph" });
+    for key in ["app_id", "seeds", "hops", "top", "from", "to", "max_hops", "min_size", "max_entities", "max_relations"] {
+        if let Some(v) = call.arguments.get(key) {
+            payload[key] = v.clone();
+        }
+    }
+
+    match crate::ipc::helpers::call_memento_action(action, payload).await {
+        Some(resp) => ok(call, true, resp.to_string()),
+        None => err(call, "No se pudo conectar a Memento (/tmp/memento.sock). ¿Está corriendo memento-node?"),
+    }
+}

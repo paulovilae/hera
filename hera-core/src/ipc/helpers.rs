@@ -12,6 +12,14 @@ fn memento_request(action: &str, payload: serde_json::Value) -> serde_json::Valu
     })
 }
 
+/// Public passthrough for tool executors that need a raw Memento IPC call
+/// (e.g. `query_code_graph` wrapping `kg_graph`/`kg_neighbors`/`kg_centrality`/
+/// `kg_path`/`kg_communities`). Prefer a purpose-built helper for anything
+/// that runs on every turn — this is for explicit, on-demand tool calls.
+pub async fn call_memento_action(action: &str, payload: serde_json::Value) -> Option<serde_json::Value> {
+    call_memento(action, payload).await
+}
+
 async fn call_memento(action: &str, payload: serde_json::Value) -> Option<serde_json::Value> {
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_millis(1200),

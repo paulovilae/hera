@@ -241,6 +241,7 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "cargo_build_release" => build_feedback::execute_cargo_build_release(call).await,
         "pytest" => build_feedback::execute_pytest(call).await,
         "index_code_graph" => code_graph::execute_index_code_graph(call).await,
+        "query_code_graph" => code_graph::execute_query_code_graph(call).await,
         "generate_access_link" => platform::execute_generate_access_link(call).await,
         "spline_interact" => platform::execute_spline_interact(call).await,
         "desktop_click" => platform::execute_desktop_click(call).await,
