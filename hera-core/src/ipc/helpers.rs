@@ -916,6 +916,77 @@ pub async fn fetch_rag_context(app_id: &str, expert_id: &str, query: &str) -> St
     format!("\n\n# RAG CONTEXT (relevant document chunks)\n{}", section)
 }
 
+/// Silent knowledge-graph recall: matches tokens from `user_message` against
+/// entity names in Memento's `app_id`-scoped KG, then expands 1 hop from the
+/// matched entities. Errors/no-match -> "" (never breaks the turn). Mirrors
+/// `fetch_rag_context`'s shape; injected into `dynamic_suffix`, never `stable_prefix`.
+pub async fn fetch_kg_context(app_id: &str, user_message: &str) -> String {
+    if app_id.is_empty() || user_message.trim().is_empty() {
+        return String::new();
+    }
+    let graph_payload = serde_json::json!({ "app_id": app_id, "max_entities": 100 });
+    let Some(graph_resp) = call_memento("kg_graph", graph_payload).await else {
+        return String::new();
+    };
+    let Some(entities) = graph_resp.get("entities").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if entities.is_empty() { return String::new(); }
+
+    let tokens: Vec<String> = user_message
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() > 2)
+        .map(|t| t.to_lowercase())
+        .collect();
+    if tokens.is_empty() { return String::new(); }
+
+    let mut seeds: Vec<String> = Vec::new();
+    for entity in entities {
+        let (Some(id), Some(name)) = (
+            entity.get("entity_id").and_then(|v| v.as_str()),
+            entity.get("name").and_then(|v| v.as_str()),
+        ) else { continue };
+        let name_lower = name.to_lowercase();
+        if tokens.iter().any(|t| name_lower.contains(t.as_str())) {
+            seeds.push(id.to_string());
+            if seeds.len() >= 5 { break; }
+        }
+    }
+    if seeds.is_empty() { return String::new(); }
+
+    let neighbors_payload = serde_json::json!({ "seeds": seeds, "hops": 1, "max_entities": 60 });
+    let Some(neighbors_resp) = call_memento("kg_neighbors", neighbors_payload).await else {
+        return String::new();
+    };
+    let Some(relations) = neighbors_resp.get("relations").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if relations.is_empty() { return String::new(); }
+
+    let names: std::collections::HashMap<String, String> = entities
+        .iter()
+        .filter_map(|e| {
+            let id = e.get("entity_id").and_then(|v| v.as_str())?;
+            let name = e.get("name").and_then(|v| v.as_str())?;
+            Some((id.to_string(), name.to_string()))
+        })
+        .collect();
+
+    let mut section = String::new();
+    for rel in relations.iter().take(10) {
+        let src = rel.get("src_id").and_then(|v| v.as_str()).unwrap_or("");
+        let dst = rel.get("dst_id").and_then(|v| v.as_str()).unwrap_or("");
+        let rel_type = rel.get("rel_type").and_then(|v| v.as_str()).unwrap_or("relacionado con");
+        let evidence = rel.get("evidence").and_then(|v| v.as_str()).unwrap_or("");
+        let src_name = names.get(src).map(|s| s.as_str()).unwrap_or(src);
+        let dst_name = names.get(dst).map(|s| s.as_str()).unwrap_or(dst);
+        if src_name.is_empty() || dst_name.is_empty() { continue; }
+        section.push_str(&format!("- {} — {} — {} ({})\n", src_name, rel_type, dst_name, evidence));
+    }
+    if section.is_empty() { return String::new(); }
+    format!("\n\n# CONTEXTO DE GRAFO ({})\n{}", app_id, section)
+}
+
 /// Persist a single conversation turn as a scoped_memory event. Fire-and-forget — errors only
 /// log via tracing. Memento's auto_derive=true triggers session/room/project summary derivation
 /// once enough events accumulate, which subsequent calls to `fetch_recursive_context` surface.

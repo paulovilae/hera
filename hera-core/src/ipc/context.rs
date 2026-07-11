@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use super::helpers::{
-    canonicalize_user_id, fetch_db_schema_context, fetch_rag_context, fetch_rag_pinned,
-    fetch_recursive_context, fetch_runtime_preflight, fetch_semantic_memories,
+    canonicalize_user_id, fetch_db_schema_context, fetch_kg_context, fetch_rag_context,
+    fetch_rag_pinned, fetch_recursive_context, fetch_runtime_preflight, fetch_semantic_memories,
     fetch_semantic_memory, save_session_summary,
 };
 use super::llm_audit::{LlmAuditEvent, build_event};
@@ -936,7 +936,7 @@ pub async fn build_full_system_prompt(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let (recursive_ctx, semantic_ctx, rag_pinned_ctx, rag_retrieved_ctx, recall_attribution) =
+    let (recursive_ctx, semantic_ctx, rag_pinned_ctx, rag_retrieved_ctx, kg_ctx, recall_attribution) =
         if budget.include_memory {
             let user_id = canonicalize_user_id(sender_name, chat_id, session_id);
             let recursive = clamp_chars(
@@ -954,9 +954,18 @@ pub async fn build_full_system_prompt(
                 fetch_rag_context(app_id, expert_id, user_prompt).await,
                 budget.max_memory_chars,
             );
-            (recursive, semantic, rag_pinned, rag_retrieved, attribution)
+            // KG conversacional silencioso (Latinos market graph + Capacita
+            // biblioteca) — solo dominios que ya alimentan el grafo hoy, sin
+            // writer nuevo. Cualquier error/cero-match -> "".
+            let mut kg = fetch_kg_context("latinos", user_prompt).await;
+            if kg.is_empty() {
+                kg = fetch_kg_context("capacita", user_prompt).await;
+            }
+            let kg = clamp_chars(kg, budget.max_memory_chars);
+            (recursive, semantic, rag_pinned, rag_retrieved, kg, attribution)
         } else {
             (
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -1075,7 +1084,7 @@ pub async fn build_full_system_prompt(
         fable5_autonomy_directives,
         rag_pinned_ctx
     );
-    let dynamic_suffix = format!("{}{}{}", recursive_ctx, semantic_ctx, rag_retrieved_ctx);
+    let dynamic_suffix = format!("{}{}{}{}", recursive_ctx, semantic_ctx, rag_retrieved_ctx, kg_ctx);
     let system_prompt = format!("{}{}", stable_prefix, dynamic_suffix);
 
     PromptAssembly {
