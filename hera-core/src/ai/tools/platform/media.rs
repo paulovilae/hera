@@ -122,10 +122,17 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
 
             let filename = audio_url.split('/').next_back().unwrap_or(audio_url);
             let public_url = format!("https://imaginos.ai/outputs/{}", filename);
-            let response = format!(
-                "Music generated successfully! Enhanced prompt: \"{}\"\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
-                enhanced_prompt, public_url
-            );
+            let actual_duration = res.get("duration").and_then(|d| d.as_u64());
+            let response = match actual_duration {
+                Some(secs) => format!(
+                    "Music generated successfully! Enhanced prompt: \"{}\" ({}s)\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
+                    enhanced_prompt, secs, public_url
+                ),
+                None => format!(
+                    "Music generated successfully! Enhanced prompt: \"{}\"\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
+                    enhanced_prompt, public_url
+                ),
+            };
 
             ToolResult {
                 name: call.name.clone(),
