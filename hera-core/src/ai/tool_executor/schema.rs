@@ -213,6 +213,39 @@ pub fn load_agent_artifact(agent_name: &str) -> AgentArtifact {
 ///   ["garcero"]   → loads global + apps/garcero/
 ///   ["movilo"]    → loads global + apps/movilo/
 ///   []            → loads nothing (no tools in prompt)
+///
+/// Coding-surface narrowing (2026-07-11): for the dedicated coding agent
+/// (`agent_name` == `ava_coder`/`coding` — i.e. `claude --coding` via
+/// `bin/claude.rs`, or any MCP caller on `route_profile: "coding"` via
+/// `hera_mcp.rs::is_coding_surface`), `permissions` is by convention a literal
+/// TOOL-NAME allowlist, never an app name (see `bin/claude.rs`'s `--coding`
+/// injection and `hera_diagnose_incident.sh`/`hera_compile.sh`) — unlike every
+/// other caller, where a value like `"vetra"` means "app directory", not a
+/// function name. So for that surface only, once `permissions` is non-empty and
+/// doesn't contain the literal `"all"` wildcard, the GLOBAL tool list (which is
+/// otherwise unfiltered by `permissions` — only by `consumers`) is narrowed to
+/// the tools actually named in `permissions`. Root-cause fix for an incident
+/// (2026-07-11, `hera_diagnose_incident.sh`) where the small local model saw
+/// globally-available tools (e.g. `bash_exec`) it was never granted — `execute
+/// vs offer` are two different gates (`permissions_allow_tool` in
+/// `security.rs` is the execution gate and was already correct) and the
+/// mismatch between "offered" and "executable" confused the model into
+/// narrating tool use instead of emitting a real `<tool_call>`.
+///
+/// Deliberately NOT reusing `permissions_allow_tool`'s `unsafe_all`/`system_admin`
+/// broad-grant bypass here: `--coding` (and `hera_mcp`'s coding-surface
+/// injection) unconditionally adds `unsafe_all` to every coding-surface call
+/// (needed so Critical tools like `edit_file` remain *executable* — see the
+/// `--coding` comment in `bin/claude.rs`), so treating it as a schema-broadening
+/// signal too would make this filter a permanent no-op for exactly the callers
+/// it exists to fix. `"all"` is the sole broad-bypass for schema purposes,
+/// mirroring the pre-existing `has_all` semantics below that already gate the
+/// apps-directory load.
+///
+/// Scoped to the coding surface only — general callers (Telegram bots, other
+/// personas) keep passing app-name permissions (`["vetra"]`, `["garcero"]`,
+/// ...) and are completely unaffected; applying literal-name filtering to
+/// those would incorrectly strip every global tool they rely on.
 pub fn hera_tool_schemas(permissions: &[String], agent_name: &str) -> String {
     let base_dir = "/home/paulo/Programs/apps/OS/Tools";
     let mut tools_vec: Vec<Value> = Vec::new();
@@ -223,6 +256,7 @@ pub fn hera_tool_schemas(permissions: &[String], agent_name: &str) -> String {
     }
 
     let has_all = permissions.contains(&"all".to_string());
+    let is_coding_surface = matches!(agent_name, "ava_coder" | "coding");
 
     // 1. Always load global tools (recursive through topic subfolders)
     let global_dir = PathBuf::from(format!("{}/global", base_dir));
@@ -239,6 +273,20 @@ pub fn hera_tool_schemas(permissions: &[String], agent_name: &str) -> String {
             let app_dir = PathBuf::from(format!("{}/apps/{}", base_dir, perm));
             collect_tool_schemas_from_dir(&app_dir, &mut tools_vec, agent_name);
         }
+    }
+
+    // Coding-surface allowlist narrowing (see doc comment above). Skills
+    // (step 3 below) are intentionally exempt — dynamic skill disclosure was
+    // never permission-gated and stays "always offered" here.
+    if is_coding_surface && !has_all {
+        let allowed: std::collections::HashSet<&str> =
+            permissions.iter().map(String::as_str).collect();
+        tools_vec.retain(|tool| {
+            tool.pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(|name| allowed.contains(name))
+                .unwrap_or(false)
+        });
     }
 
     // 3. Dynamic Skill Disclosure: Parse OS/Skills for SKILL.md
@@ -503,5 +551,119 @@ pub(crate) fn tool_has_raw_json_dispatch(tool_name: &str, execution_kind: Option
                 | "verify_app_health"
         ),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod coding_surface_schema_tests {
+    use super::hera_tool_schemas;
+
+    fn tool_names(schema_text: &str) -> Vec<String> {
+        // Cheap extraction: hera_tool_schemas embeds a pretty-printed JSON array;
+        // scanning for `"name": "..."` lines under `"function"` is good enough
+        // here since we only assert presence/absence of specific tool names.
+        schema_text
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix("\"name\": \"")
+                    .and_then(|rest| rest.strip_suffix("\","))
+                    .map(ToString::to_string)
+            })
+            .collect()
+    }
+
+    /// Root-cause regression test for the 2026-07-11 incident: a narrow,
+    /// explicit permission grant on the coding surface (no `all`, no
+    /// broadening via `unsafe_all`) must not offer globally-available tools
+    /// the caller never asked for (e.g. `bash_exec`) — those confused the
+    /// small local model into narrating tool use instead of emitting a real
+    /// `<tool_call>` (see `scripts/hera_diagnose_incident.sh`).
+    #[test]
+    fn coding_surface_narrow_grant_excludes_ungranted_global_tools() {
+        let permissions = vec![
+            "read_pm2_logs".to_string(),
+            "memento_query".to_string(),
+            "grep_search".to_string(),
+            "glob_search".to_string(),
+        ];
+        let schema = hera_tool_schemas(&permissions, "ava_coder");
+        let names = tool_names(&schema);
+
+        assert!(
+            names.contains(&"grep_search".to_string()),
+            "granted tool grep_search missing from schema: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"read_pm2_logs".to_string()),
+            "granted tool read_pm2_logs missing from schema: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"bash_exec".to_string()),
+            "ungranted global tool bash_exec leaked into narrow coding-surface schema: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"service_restart".to_string()),
+            "ungranted global tool service_restart leaked into narrow coding-surface schema: {:?}",
+            names
+        );
+    }
+
+    /// `unsafe_all` grants Critical-tool *execution* (`permissions_allow_tool`
+    /// in security.rs, unchanged) but must NOT broaden the *schema* — `--coding`
+    /// always injects `unsafe_all` (see `bin/claude.rs`), so treating it as a
+    /// schema-broadening signal here would make the narrowing filter a
+    /// permanent no-op for every `--coding` caller, including the one this
+    /// test guards against regressing.
+    #[test]
+    fn coding_surface_unsafe_all_does_not_broaden_schema() {
+        let permissions = vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "edit_file".to_string(),
+            "grep_search".to_string(),
+            "glob_search".to_string(),
+            "cargo_check".to_string(),
+            "cargo_test".to_string(),
+            "unsafe_all".to_string(),
+        ];
+        let schema = hera_tool_schemas(&permissions, "ava_coder");
+        let names = tool_names(&schema);
+
+        assert!(
+            names.contains(&"edit_file".to_string()),
+            "granted tool edit_file missing: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"bash_exec".to_string()),
+            "unsafe_all incorrectly broadened schema to include bash_exec: {:?}",
+            names
+        );
+    }
+
+    /// The literal-tool-name filter is scoped to the coding surface only.
+    /// General callers (bots, personas) pass APP-name permissions
+    /// (e.g. `["vetra"]`) that mean "load Tools/apps/vetra/", not a literal
+    /// tool name — applying the coding-surface filter to them would wipe out
+    /// every global tool they rely on. Non-coding agent_name must be
+    /// completely unaffected by this change.
+    #[test]
+    fn non_coding_agent_is_unaffected_by_narrow_permissions() {
+        let permissions = vec!["vetra".to_string()];
+        let schema = hera_tool_schemas(&permissions, "vetra");
+        let names = tool_names(&schema);
+
+        // memento_query is a broadly-consumed global tool (consumers include
+        // "vetra") that has nothing to do with the literal string "vetra" as
+        // a tool name — it must still be present for a non-coding agent.
+        assert!(
+            names.contains(&"memento_query".to_string()),
+            "non-coding agent lost an unrelated global tool it should still see: {:?}",
+            names
+        );
     }
 }
