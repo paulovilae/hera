@@ -538,6 +538,7 @@ pub async fn execute_tool_raw_json(call: &ToolCall) -> Result<Value, String> {
             false,
             Some(&error),
         );
+        emit_tool_call_telemetry(call, &error, start.elapsed().as_millis(), false, Some(&error));
         return Ok(tool_error_envelope(
             call,
             &error,
@@ -579,15 +580,30 @@ pub async fn execute_tool_raw_json(call: &ToolCall) -> Result<Value, String> {
                 Err(error) => tool_error_envelope(call, &error, start.elapsed().as_millis()),
             };
 
+            let envelope_success = envelope
+                .get("ok")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let envelope_error = envelope.get("error").and_then(|v| v.as_str());
             audit_tool_execution(
                 call,
-                envelope
-                    .get("ok")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                envelope_success,
                 start.elapsed().as_millis(),
                 false,
-                envelope.get("error").and_then(|v| v.as_str()),
+                envelope_error,
+            );
+            // Durable per-tool-call telemetry (`hera_tool_calls` in Memento) — the
+            // `execute_tool` action IPC path (used by Imaginclaw's slash commands like
+            // /draw and /music via `execute_hera_tool`) previously bypassed this: only
+            // the chat/agentic-loop path (`tool_executor::execute_tool`) emitted it.
+            // Mirrored here so every tool call gets the same durable record regardless
+            // of entrypoint.
+            emit_tool_call_telemetry(
+                call,
+                &envelope.to_string(),
+                start.elapsed().as_millis(),
+                envelope_success,
+                envelope_error,
             );
             Ok(envelope)
         }
@@ -603,6 +619,7 @@ pub async fn execute_tool_raw_json(call: &ToolCall) -> Result<Value, String> {
                 timeout.as_millis()
             );
             audit_tool_execution(call, false, start.elapsed().as_millis(), true, Some(&error));
+            emit_tool_call_telemetry(call, &error, start.elapsed().as_millis(), false, Some(&error));
             Ok(tool_error_envelope(
                 call,
                 &error,

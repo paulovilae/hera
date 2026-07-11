@@ -1,7 +1,42 @@
 //! Media tool executors: draw, animate_avatar, speak, video, review_image, generate_music.
 use crate::ai::tool_executor::{ToolCall, ToolResult};
-use super::hera_execution_agent;
+use super::{hera_execution_agent, run_agent_via_hera_ipc};
 use tracing::info;
+
+/// Music prompt enhancer — mirrors `handle_generate_video`'s "Phase 1: Brain" pattern
+/// (`ipc/handler_media.rs`), the only existing automatic LLM prompt-expansion in the
+/// codebase (images only have a keyword-based LoRA auto-router, not LLM enhancement).
+/// Tool executors don't hold an `IpcState`/engine handle, so this goes through the
+/// same self-loopback Hera IPC call already used by `run_agent_via_hera_ipc` for
+/// agent personas (`execute_spawn_parallel_agents`). Best-effort: falls back to the
+/// raw prompt on any failure so a slow/unavailable brain never blocks generation.
+async fn enhance_music_prompt(raw_prompt: &str) -> String {
+    let persona = "You are a music producer AI. Given a short brief idea, expand it into \
+        a single detailed prompt for a text-to-music model (MusicGen). Describe genre, \
+        instruments, mood, tempo (BPM if it helps), and structure (intro/build/loop). \
+        Do NOT use visual or image language (no cameras, lighting, colors). Only output \
+        the expanded music prompt, nothing else, max 2 sentences."
+        .to_string();
+
+    match run_agent_via_hera_ipc(persona, raw_prompt.to_string()).await {
+        Ok(enhanced) if !enhanced.trim().is_empty() => {
+            let enhanced = enhanced.trim().to_string();
+            info!(
+                "🎵🧠 Enhanced music prompt: {}",
+                &enhanced[..enhanced.len().min(160)]
+            );
+            enhanced
+        }
+        Ok(_) => raw_prompt.to_string(),
+        Err(e) => {
+            tracing::warn!(
+                "🎵🧠 Music prompt enhancement failed, using raw prompt: {}",
+                e
+            );
+            raw_prompt.to_string()
+        }
+    }
+}
 
 pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
     let prompt = call
@@ -72,8 +107,12 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
         .and_then(|d| d.as_u64())
         .map(|d| d as u32);
 
+    // Automatic prompt enhancement (no user-facing toggle) — same silent-by-default
+    // treatment images give their LoRA auto-router, tuned for music instead.
+    let enhanced_prompt = enhance_music_prompt(prompt).await;
+
     let hera = hera_execution_agent();
-    match hera.generate_music(prompt, duration).await {
+    match hera.generate_music(&enhanced_prompt, duration).await {
         Ok(res) => {
             let audio_url = res
                 .get("audio_url")
@@ -84,8 +123,8 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
             let filename = audio_url.split('/').next_back().unwrap_or(audio_url);
             let public_url = format!("https://imaginos.ai/outputs/{}", filename);
             let response = format!(
-                "Music generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
-                public_url
+                "Music generated successfully! Enhanced prompt: \"{}\"\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
+                enhanced_prompt, public_url
             );
 
             ToolResult {

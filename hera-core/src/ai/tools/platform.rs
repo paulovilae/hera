@@ -153,7 +153,7 @@ pub(super) fn hera_execution_agent() -> Hera {
     Hera::new(SMARTOS_ROUTER_URL)
 }
 
-async fn run_agent_via_hera_ipc(persona: String, prompt: String) -> Result<String, String> {
+pub(super) async fn run_agent_via_hera_ipc(persona: String, prompt: String) -> Result<String, String> {
     let mut stream = UnixStream::connect(HERA_SOCKET)
         .await
         .map_err(|error| format!("failed to connect to Hera IPC: {error}"))?;
