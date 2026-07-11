@@ -213,6 +213,7 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "generate_image" | "hera_draw" => platform::execute_draw(call).await,
         "review_image" | "describe_image" => platform::execute_review_image(call).await,
         "animate_avatar" => platform::execute_animate_avatar(call).await,
+        "generate_music" => platform::execute_generate_music(call).await,
         "hera_search" => platform::execute_search(call).await,
         "geocode" => geo::execute_geocode(call).await,
         "reverse_geocode" => geo::execute_reverse_geocode(call).await,

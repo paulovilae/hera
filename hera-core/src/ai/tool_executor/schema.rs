@@ -287,6 +287,7 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "generate_image"
+            | "generate_music"
             | "hera_draw"
             | "hera_search"
             | "hera_speak"

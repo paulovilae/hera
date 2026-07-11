@@ -1,4 +1,4 @@
-//! Media tool executors: draw, animate_avatar, speak, video, review_image.
+//! Media tool executors: draw, animate_avatar, speak, video, review_image, generate_music.
 use crate::ai::tool_executor::{ToolCall, ToolResult};
 use super::hera_execution_agent;
 use tracing::info;
@@ -55,6 +55,51 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
                 name: call.name.clone(),
                 success: false,
                 output: format!("Image generation failed: {}", e),
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("An upbeat instrumental loop");
+    let duration = call
+        .arguments
+        .get("duration")
+        .and_then(|d| d.as_u64())
+        .map(|d| d as u32);
+
+    let hera = hera_execution_agent();
+    match hera.generate_music(prompt, duration).await {
+        Ok(res) => {
+            let audio_url = res
+                .get("audio_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("(no URL)");
+            info!("🎵 [Hera] Music generated: {}", audio_url);
+
+            let filename = audio_url.split('/').next_back().unwrap_or(audio_url);
+            let public_url = format!("https://imaginos.ai/outputs/{}", filename);
+            let response = format!(
+                "Music generated successfully!\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
+                public_url
+            );
+
+            ToolResult {
+                name: call.name.clone(),
+                success: true,
+                output: response,
+            }
+        }
+        Err(e) => {
+            tracing::error!("🎵 [Hera] Music generation failed: {:?}", e);
+            ToolResult {
+                name: call.name.clone(),
+                success: false,
+                output: format!("Music generation failed: {}", e),
             }
         }
     }

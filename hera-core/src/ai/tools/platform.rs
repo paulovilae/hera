@@ -4,7 +4,7 @@ pub(crate) mod media;
 pub(crate) mod workspace;
 
 pub(crate) use code::{execute_run_code, execute_write_file};
-pub(crate) use media::{execute_draw, execute_animate_avatar, execute_speak, execute_video, execute_review_image};
+pub(crate) use media::{execute_draw, execute_animate_avatar, execute_speak, execute_video, execute_review_image, execute_generate_music};
 pub(crate) use workspace::{execute_finish_bootstrap, execute_write_workspace_file};
 
 use crate::ai::tool_executor::{ToolCall, ToolResult, find_skill_artifact, load_agent_artifact};

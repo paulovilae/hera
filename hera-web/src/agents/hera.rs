@@ -14,6 +14,7 @@ pub struct Hera {
     pub mcp_client: McpHttpClient,
     pub http_client: reqwest::Client,
     pub draw_url: String,
+    pub music_url: String,
 }
 
 fn generated_outputs_dir() -> Result<PathBuf> {
@@ -46,6 +47,8 @@ impl Hera {
     pub fn new(smartos_router_url: &str) -> Self {
         let draw_url = std::env::var("HERA_DRAW_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string());
+        let music_url = std::env::var("HERA_MUSIC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8011".to_string());
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(90))
             .build()
@@ -54,6 +57,7 @@ impl Hera {
             mcp_client: McpHttpClient::new(smartos_router_url),
             http_client,
             draw_url,
+            music_url,
         }
     }
 
@@ -382,6 +386,47 @@ impl Hera {
         });
         let res = self.mcp_client.call_tool("smartos_ltx2", args).await?;
         Ok(serde_json::to_value(res)?)
+    }
+
+    /// Generates a short original music clip via MusicGen-small (CPU, genesis :8011).
+    /// The backend returns raw WAV bytes (mono 32kHz), not JSON — unlike the image
+    /// endpoint. Clamps duration to the backend's supported 2-30s range.
+    pub async fn generate_music(&self, prompt: &str, duration: Option<u32>) -> Result<serde_json::Value> {
+        let clamped_duration = duration.unwrap_or(10).clamp(2, 30);
+        let endpoint = format!("{}/generate", self.music_url);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .build()
+            .unwrap_or_default();
+
+        let res = client
+            .post(&endpoint)
+            .json(&json!({
+                "prompt": prompt,
+                "duration": clamped_duration
+            }))
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            let error_text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("MusicGen generation failed ({}): {}", endpoint, error_text));
+        }
+
+        let audio_bytes = res.bytes().await?;
+        let output_dir = generated_outputs_dir()?;
+        fs::create_dir_all(&output_dir)?;
+
+        let filename = format!("hera_music_{}.wav", Uuid::new_v4());
+        let filepath = output_dir.join(&filename);
+        fs::write(&filepath, &audio_bytes)?;
+
+        Ok(json!({
+            "status": "success",
+            "audio_url": format!("/outputs/{}", filename),
+            "duration": clamped_duration
+        }))
     }
 
     /// Animates a mascot or human face speaking the given text with lip-sync.
