@@ -15,6 +15,7 @@ pub mod security;
 pub use self::dispatch::execute_tool_raw_json;
 pub use self::intent::detect_intent_from_user_message;
 pub use self::schema::hera_tool_schemas;
+pub use self::schema::collect_hera_tool_schemas;
 pub use self::schema::{AgentArtifact, SkillArtifact};
 pub use self::registry::{
     canonicalize_app_slug, canonical_app_search_terms, load_canonical_app_registry,
