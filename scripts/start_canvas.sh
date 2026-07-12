@@ -6,7 +6,7 @@
 
 echo "🎬 Starting ImagineOS Canvas Engine (Wan2.1 T2V 1.3B)"
 echo "🖥️  GPU: 1 (NVIDIA GeForce RTX 3090)"
-echo "🔗 Port: 8090"
+echo "🔗 Port: ${CANVAS_PORT:-8092}"
 
 VENV="/home/paulo/Programs/apps/OS/Hera/canvas-venv"
 SCRIPT="/home/paulo/Programs/apps/OS/Hera/scripts/canvas_wan21.py"

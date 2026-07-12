@@ -16,6 +16,12 @@ fn draw_model() -> String {
     std::env::var("HERA_DRAW_MODEL").unwrap_or_else(|_| "Z-Image Turbo".to_string())
 }
 
+/// Returns the Canvas (Wan2.1 T2V/VACE) video generation base URL.
+/// Default :8092 — :8091 is occupied by GLiNER NER. Override with HERA_VIDEO_URL.
+fn video_url() -> String {
+    std::env::var("HERA_VIDEO_URL").unwrap_or_else(|_| "http://127.0.0.1:8092".to_string())
+}
+
 /// Per-LoRA auto-injection weight from lora_weights.json (default 0.7 — 1.0 tends
 /// to over-cook and drop quality). Set per LoRA via the Telegram /lora_weight cmd.
 fn lora_weight(name: &str) -> f32 {
@@ -407,7 +413,7 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
     }
 
     let result_text = match client
-        .post("http://127.0.0.1:8091/v1/video/generate")
+        .post(format!("{}/v1/video/generate", video_url()))
         .json(&canvas_payload)
         .send()
         .await

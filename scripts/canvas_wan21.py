@@ -3,7 +3,7 @@
 ImagineOS Native Video Canvas — Wan2.1 VACE 1.3B + T2V 1.3B
 Sovereign bare-metal video generation server.
 Supports both Text-to-Video AND Image-to-Video (FLUX anchor frame pipeline).
-Binds to 127.0.0.1:8091 on GPU 1.
+Binds to 127.0.0.1:$CANVAS_PORT (default 8092) on GPU 1.
 """
 
 import os
@@ -28,7 +28,7 @@ VACE_MODEL_ID = "Wan-AI/Wan2.1-VACE-1.3B-Diffusers"
 T2V_CACHE_DIR = "/data/models/wan2.1"
 VACE_CACHE_DIR = "/data/models/wan2.1-vace"
 OUTPUT_DIR = "/tmp/imagineos-canvas"
-PORT = 8091
+PORT = int(os.environ.get("CANVAS_PORT", "8092"))
 GPU_DEVICE = 1  # Physical GPU 1
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_DEVICE)
