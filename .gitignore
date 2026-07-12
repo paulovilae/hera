@@ -8,3 +8,9 @@ hera-core/*.png
 hera-core/src/ipc_server.rs.bak
 playground/outputs/
 hera-core/*.pdf
+
+# Syncthing in-flight/conflict artifacts (cron genesis_submodule_autocommit.sh
+# has previously `git add -A`-committed these by accident during an active
+# Syncthing sync — see etc/SESSION_INTENT.md session-hera-4gaps-deuda2-2026-07-11)
+.syncthing.*.tmp
+*sync-conflict-*
