@@ -16,20 +16,10 @@ fn draw_model() -> String {
     std::env::var("HERA_DRAW_MODEL").unwrap_or_else(|_| "Z-Image Turbo".to_string())
 }
 
-/// Path to the sd.cpp CLI binary (same binary that backs imagineos-draw's
-/// sd-server, just invoked as a one-shot subprocess for video — video gen is
-/// slow/rare enough that a resident process isn't worth the VRAM it would
-/// hold idle). Override with HERA_SD_CLI_PATH.
-fn sd_cli_path() -> String {
-    std::env::var("HERA_SD_CLI_PATH")
-        .unwrap_or_else(|_| "/home/paulo/sd.cpp/build/bin/sd-cli".to_string())
-}
-
-/// Wan2.2 TI2V-5B GGUF weights dir (diffusion model + VAE + UMT5 text encoder).
-/// Override with HERA_VIDEO_MODEL_DIR.
-fn video_model_dir() -> String {
-    std::env::var("HERA_VIDEO_MODEL_DIR")
-        .unwrap_or_else(|_| "/home/paulo/models/video-stack/wan2.2".to_string())
+/// Returns the Canvas (Wan2.1 T2V/VACE) video generation base URL.
+/// Default :8092 — :8091 is occupied by GLiNER NER. Override with HERA_VIDEO_URL.
+fn video_url() -> String {
+    std::env::var("HERA_VIDEO_URL").unwrap_or_else(|_| "http://127.0.0.1:8092".to_string())
 }
 
 /// Per-LoRA auto-injection weight from lora_weights.json (default 0.7 — 1.0 tends
@@ -395,10 +385,7 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
         }
     };
 
-    // Phase 3: GPU Swap — Stop FLUX, generate video via sd-cli subprocess.
-    // (sd.cpp: same binary as imagineos-draw's sd-server, run one-shot with
-    // -M vid_gen instead of a resident Python/diffusers server — sidesteps
-    // the accelerate cpu-offload device-mismatch bug entirely.)
+    // Phase 3: GPU Swap — Stop FLUX, generate video
     tracing::info!("🔄 GPU Swap: Stopping FLUX to free VRAM for video generation...");
     let _ = tokio::process::Command::new("pm2")
         .args(["stop", "imagineos-draw"])
@@ -406,86 +393,49 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
         .await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let output_dir = "/tmp/imagineos-canvas";
-    let _ = std::fs::create_dir_all(output_dir);
-    let video_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        .to_string();
-    let output_path = format!("{}/video_{}.mp4", output_dir, video_id);
-    let model_dir = video_model_dir();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_default();
 
-    let mut anchor_path: Option<String> = None;
+    let mut canvas_payload = serde_json::json!({
+        "prompt": enhanced,
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+    });
+
     if let Some(ref b64_img) = anchor_image_b64 {
-        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_img) {
-            Ok(bytes) => {
-                let path = format!("{}/anchor_{}.png", output_dir, video_id);
-                if std::fs::write(&path, bytes).is_ok() {
-                    tracing::info!("📹 Anchor image written for I2V: {}", path);
-                    anchor_path = Some(path);
-                }
-            }
-            Err(e) => tracing::warn!("Failed to decode anchor image: {}", e),
-        }
-    }
-
-    let mut cmd = tokio::process::Command::new(sd_cli_path());
-    cmd.env("CUDA_VISIBLE_DEVICES", "1")
-        .arg("-M")
-        .arg("vid_gen")
-        .arg("--diffusion-model")
-        .arg(format!("{}/Wan2.2-TI2V-5B-Q6_K.gguf", model_dir))
-        .arg("--vae")
-        .arg(format!("{}/wan2.2_vae.safetensors", model_dir))
-        .arg("--t5xxl")
-        .arg(format!("{}/umt5-xxl-encoder-Q8_0.gguf", model_dir))
-        .arg("-p")
-        .arg(&enhanced)
-        .arg("--cfg-scale")
-        .arg("6.0")
-        .arg("--sampling-method")
-        .arg("euler")
-        .arg("-W")
-        .arg(width.to_string())
-        .arg("-H")
-        .arg(height.to_string())
-        .arg("--video-frames")
-        .arg(num_frames.to_string())
-        .arg("--flow-shift")
-        .arg("3.0")
-        .arg("--diffusion-fa")
-        .arg("--offload-to-cpu")
-        .arg("-o")
-        .arg(&output_path);
-
-    if let Some(ref img) = anchor_path {
-        tracing::info!("📹 Using I2V pipeline (anchor image)");
-        cmd.arg("-i").arg(img);
+        canvas_payload["image_base64"] = serde_json::Value::String(b64_img.clone());
+        tracing::info!("📹 Sending anchor image to VACE I2V pipeline");
     } else {
         tracing::info!("📹 Using T2V pipeline (no anchor image)");
     }
 
-    tracing::info!("🎬 Running sd-cli video generation...");
-    let result_text = match cmd
-        .kill_on_drop(true)
-        .output()
+    let result_text = match client
+        .post(format!("{}/v1/video/generate", video_url()))
+        .json(&canvas_payload)
+        .send()
         .await
     {
-        Ok(out) => {
-            if out.status.success() && std::path::Path::new(&output_path).exists() {
-                tracing::info!("✅ Video generated: {}", output_path);
-                output_path.clone()
+        Ok(resp) => {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(path) = json.get("path").and_then(|p| p.as_str()) {
+                        path.to_string()
+                    } else {
+                        "Error: Canvas returned no video path".to_string()
+                    }
+                } else {
+                    "Error: Failed to parse Canvas response".to_string()
+                }
             } else {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let tail: String = stderr.chars().rev().take(800).collect::<String>().chars().rev().collect();
-                tracing::error!("sd-cli video generation failed: {}", tail);
-                format!("Error: sd-cli video generation failed: {}", tail)
+                format!("Error: Canvas returned status {}", resp.status())
             }
         }
         Err(e) => {
-            tracing::error!("sd-cli spawn error: {}", e);
-            format!("Error: sd-cli video engine unavailable: {}", e)
+            tracing::error!("Canvas connection error: {}", e);
+            format!("Error: Canvas video engine unavailable: {}", e)
         }
     };
 

@@ -3,7 +3,7 @@
 ImagineOS Native Video Canvas — Wan2.1 VACE 1.3B + T2V 1.3B
 Sovereign bare-metal video generation server.
 Supports both Text-to-Video AND Image-to-Video (FLUX anchor frame pipeline).
-Binds to 127.0.0.1:$CANVAS_PORT (default 8097) on GPU 1.
+Binds to 127.0.0.1:$CANVAS_PORT (default 8092) on GPU 1.
 """
 
 import os
@@ -28,7 +28,7 @@ VACE_MODEL_ID = "Wan-AI/Wan2.1-VACE-1.3B-Diffusers"
 T2V_CACHE_DIR = "/mnt/workspace/data/models/wan2.1"
 VACE_CACHE_DIR = "/mnt/workspace/data/models/wan2.1-vace"
 OUTPUT_DIR = "/tmp/imagineos-canvas"
-PORT = int(os.environ.get("CANVAS_PORT", "8097"))
+PORT = int(os.environ.get("CANVAS_PORT", "8092"))
 GPU_DEVICE = 1  # Physical GPU 1
 
 os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_DEVICE)
@@ -197,8 +197,6 @@ async def generate_video(req: VideoRequest):
     except Exception as e:
         elapsed = time.time() - start
         print(f"❌ Generation failed after {elapsed:.1f}s: {e}")
-        import traceback
-        traceback.print_exc()
         torch.cuda.empty_cache()
         raise HTTPException(status_code=500, detail=str(e))
 
