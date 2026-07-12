@@ -322,7 +322,7 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
     };
     tracing::info!(
         "🧠 Enhanced prompt: {}",
-        &enhanced[..enhanced.len().min(120)]
+        enhanced.chars().take(120).collect::<String>()
     );
 
     // Phase 2: Generate FLUX anchor frame (if no user image)
