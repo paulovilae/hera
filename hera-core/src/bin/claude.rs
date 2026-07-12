@@ -18,6 +18,7 @@ struct Config {
     socket_path: String,
     permissions: Vec<String>,
     session: Option<String>,
+    required_tools: Vec<String>,
 }
 
 impl Default for Config {
@@ -32,6 +33,7 @@ impl Default for Config {
             socket_path: DEFAULT_SOCKET.to_string(),
             permissions: Vec::new(),
             session: None,
+            required_tools: Vec::new(),
         }
     }
 }
@@ -132,6 +134,19 @@ fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn std::error::Error>> {
             "--session" => {
                 config.session = Some(iter.next().ok_or("missing value after --session")?);
             }
+            "--require-tool" => {
+                // Hard-gate the agentic loop (`required_tools` in the IPC payload,
+                // parsed in ipc/context.rs, enforced in ipc/agentic_loop.rs): if
+                // the model tries to finish without having called this tool, it
+                // gets nudged (and eventually `stop_reason: required_tool_missing`)
+                // instead of silently fabricating an answer. Repeatable, same
+                // pattern as --permission. Declaring a required tool does not
+                // grant it — pair with --permission for the tool to be callable.
+                config.required_tools.push(
+                    iter.next()
+                        .ok_or("missing value after --require-tool")?,
+                );
+            }
             "--json" => {
                 config.json_mode = true;
                 config.stream = false;
@@ -228,6 +243,7 @@ async fn send_prompt(
         "max_tokens": 1200,
         "json_mode": config.json_mode,
         "permissions": config.permissions,
+        "required_tools": config.required_tools,
     });
 
     if let Some(system) = &config.system {
@@ -287,6 +303,7 @@ async fn send_messages(
         "max_tokens": 1200,
         "json_mode": config.json_mode,
         "permissions": config.permissions,
+        "required_tools": config.required_tools,
     });
 
     if let Some(model) = &config.model {
@@ -451,6 +468,9 @@ fn print_help() {
            --model <name>            Override model hint\n\
            --socket <path>           Hera IPC socket path\n\
            --permission <name>       Allow a Hera tool (repeatable)\n\
+           --require-tool <name>     Hard-gate: agentic loop must call this\n\
+                                     tool before finishing (repeatable; does\n\
+                                     not grant it, pair with --permission)\n\
            --stream                  Stream output (default)\n\
            --no-stream               Wait for the full response\n\
            --json                    Request raw JSON output\n\
