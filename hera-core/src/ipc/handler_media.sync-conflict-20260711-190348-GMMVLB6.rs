@@ -10,16 +10,18 @@ fn draw_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:8999".to_string())
 }
 
+/// Returns the Canvas video generation base URL.
+/// Override with HERA_VIDEO_URL (e.g. if Canvas moves nodes or ports).
+/// Default: 127.0.0.1:8092 (Canvas Wan2.1, GPU1). GLiNER NER occupies :8091.
+fn video_url() -> String {
+    std::env::var("HERA_VIDEO_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8092".to_string())
+}
+
 /// Display name of the active image backend, reported to callers so UIs never
 /// hardcode the engine. Set HERA_DRAW_MODEL when you swap the draw model.
 fn draw_model() -> String {
     std::env::var("HERA_DRAW_MODEL").unwrap_or_else(|_| "Z-Image Turbo".to_string())
-}
-
-/// Returns the Canvas (Wan2.1 T2V/VACE) video generation base URL.
-/// Default :8092 — :8091 is occupied by GLiNER NER. Override with HERA_VIDEO_URL.
-fn video_url() -> String {
-    std::env::var("HERA_VIDEO_URL").unwrap_or_else(|_| "http://127.0.0.1:8092".to_string())
 }
 
 /// Per-LoRA auto-injection weight from lora_weights.json (default 0.7 — 1.0 tends

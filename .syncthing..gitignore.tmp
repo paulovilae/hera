@@ -1,0 +1,10 @@
+/target
+*.swp
+*.swo
+.env
+.env.local
+.DS_Store
+hera-core/*.png
+hera-core/src/ipc_server.rs.bak
+playground/outputs/
+hera-core/*.pdf

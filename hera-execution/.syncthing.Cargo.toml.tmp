@@ -1,0 +1,32 @@
+[package]
+name = "hera-execution"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["vector", "market", "docs", "web", "agents", "workflow"]
+vector = ["dep:hera-vector"]
+market = ["dep:hera-market"]
+docs = ["dep:hera-docs"]
+web = ["dep:hera-web", "dep:reqwest"]
+agents = []
+workflow = []
+
+[dependencies]
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "charset", "http2"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.50", features = ["full"] }
+uuid = { version = "1.22.0", features = ["v4"] }
+anyhow = "1.0"
+base64 = "0.22.1"
+rand = "0.9"
+ta = "0.5.0"
+chrono = "0.4.44"
+hera-web = { path = "../hera-web", optional = true }
+hera-docs = { path = "../hera-docs", optional = true }
+hera-vector = { path = "../hera-vector", optional = true }
+hera-market = { path = "../hera-market", optional = true }
+[lib]
+name = "hera_execution"

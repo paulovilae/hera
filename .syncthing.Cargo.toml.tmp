@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "hera-core",
+    "hera-execution",
+    "hera-web",
+    "hera-docs",
+    "hera-vector",
+    "hera-market"
+]
+resolver = "2"

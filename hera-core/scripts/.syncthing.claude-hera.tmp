@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="${HERA_CLAUDE_CODE_BASE_URL:-http://127.0.0.1:3002}"
+API_KEY="${HERA_CLAUDE_CODE_API_KEY:-dummy}"
+
+unset ANTHROPIC_BASE_URL
+unset ANTHROPIC_API_KEY
+
+export ANTHROPIC_BASE_URL="${BASE_URL}"
+export ANTHROPIC_API_KEY="${API_KEY}"
+
+exec claude "$@"
