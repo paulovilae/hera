@@ -104,6 +104,36 @@ pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
                 }
                 search_from = abs_end + close_tag.len();
             } else {
+                // Closing tag missing. Observed live 2026-07-11 (3/6 runs of
+                // `scripts/hera_diagnose_incident.sh` against the real Qwen3
+                // model on genesis): asked to "copy this exact <tool_call>{...}
+                // </tool_call> format", the model faithfully reproduces the
+                // opening tag and a complete, valid JSON object, then stops
+                // WITHOUT emitting `</tool_call>` — e.g.
+                // `<tool_call>{"name":"read_pm2_logs","arguments":{...}}}` with
+                // no closing tag at all (sometimes with a stray trailing brace
+                // too). Neither the tag-pair path above nor the bare-JSON
+                // fallback below catches this: the former requires the close
+                // tag, the latter requires the text to literally start with
+                // `{` (it starts with `<tool_call>`). Recover by brace-balance
+                // extracting the JSON object right after the open tag — same
+                // technique already used for the untagged fallback — so a
+                // well-formed-but-unterminated call still executes instead of
+                // silently leaking into the model's "final answer" text.
+                if let Some(json_str) = extract_balanced_json_object(&text[abs_start..]) {
+                    match parse_tool_call_json(&json_str) {
+                        Ok(val) => {
+                            append_tool_calls_from_value(&mut calls, &val, open_tag);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "⚠️ [Hera] Failed to parse unterminated tool_call JSON: {} — raw: {}",
+                                e,
+                                json_str
+                            );
+                        }
+                    }
+                }
                 break;
             }
         }
@@ -334,6 +364,52 @@ fn repair_truncated_json(input: &str) -> String {
     repaired
 }
 
+/// Extract the first balanced `{...}` JSON object from the start of `text`
+/// (after trimming leading whitespace), tolerating trailing garbage after the
+/// matching close brace (e.g. a stray extra `}` or missing closing tag — see
+/// the caller in `parse_tool_calls`). String contents are scanned with the
+/// same escape-aware tracking as `repair_truncated_json` so a `}` inside a
+/// quoted argument value never miscounts. Returns `None` if the text doesn't
+/// start with `{` or the braces never balance.
+fn extract_balanced_json_object(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut brace_balance = 0i32;
+
+    for (i, ch) in trimmed.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else {
+                match ch {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => brace_balance += 1,
+            '}' => {
+                brace_balance -= 1;
+                if brace_balance == 0 {
+                    return Some(trimmed[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
 
 fn append_tool_calls_from_value(
     calls: &mut Vec<ToolCall>,
@@ -636,5 +712,39 @@ mod tests {
         let calls = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn parses_tool_call_missing_closing_tag() {
+        // Regression for 2026-07-11: live runs of
+        // scripts/hera_diagnose_incident.sh against genesis's real model
+        // showed the model, when told to "copy this exact <tool_call>{...}
+        // </tool_call> format", reproducing the open tag + a complete valid
+        // JSON object but never emitting `</tool_call>` at all (3/6 runs,
+        // reproducible). Before this fix the whole line leaked verbatim into
+        // the "final answer" instead of executing the call.
+        let text = r#"<tool_call>{"name":"read_pm2_logs","arguments":{"service_name":"hera-core","lines":100,"log_type":"error"}}}"#;
+
+        let calls = parse_tool_calls(text);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_pm2_logs");
+        assert_eq!(
+            calls[0]
+                .arguments
+                .get("service_name")
+                .and_then(|value| value.as_str()),
+            Some("hera-core")
+        );
+    }
+
+    #[test]
+    fn missing_closing_tag_without_valid_json_yields_no_call() {
+        // Sanity check for the recovery path: if what follows the open tag
+        // isn't valid/balanced JSON at all, extract_balanced_json_object must
+        // return None rather than panicking or fabricating a call.
+        let text = "<tool_call>not even close to json, just rambling";
+        let calls = parse_tool_calls(text);
+        assert!(calls.is_empty());
     }
 }

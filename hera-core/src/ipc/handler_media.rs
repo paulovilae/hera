@@ -17,9 +17,9 @@ fn draw_model() -> String {
 }
 
 /// Returns the Canvas (Wan2.1 T2V/VACE) video generation base URL.
-/// Default :8092 — :8091 is occupied by GLiNER NER. Override with HERA_VIDEO_URL.
+/// Default :8097 — :8091 is occupied by GLiNER NER. Override with HERA_VIDEO_URL.
 fn video_url() -> String {
-    std::env::var("HERA_VIDEO_URL").unwrap_or_else(|_| "http://127.0.0.1:8092".to_string())
+    std::env::var("HERA_VIDEO_URL").unwrap_or_else(|_| "http://127.0.0.1:8097".to_string())
 }
 
 /// Per-LoRA auto-injection weight from lora_weights.json (default 0.7 — 1.0 tends
