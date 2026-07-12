@@ -1,4 +1,6 @@
-use hera_core::ai::tool_executor::{ToolCall, execute_tool, hera_tool_schemas, tool_is_critical};
+use hera_core::ai::tool_executor::{
+    ToolCall, collect_hera_tool_schemas, execute_tool, tool_is_critical,
+};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -164,6 +166,11 @@ struct ListToolSchemasParams {
     #[schemars(description = "Allowed Hera permissions")]
     #[serde(default = "default_permissions")]
     permissions: Vec<String>,
+    #[schemars(
+        description = "Optional exact tool name (e.g. \"memento_query\"). When set, returns the full JSON schema for just that tool. When omitted (default), returns a compact {name, description} summary for every tool available under the given permissions/agent_name — use that first, then call again with tool_name to get one tool's full parameter schema."
+    )]
+    #[serde(default)]
+    tool_name: Option<String>,
 }
 
 fn default_agent_name() -> String {
@@ -561,13 +568,61 @@ impl HeraMcp {
     }
 
     #[tool(
-        description = "Return the currently available Hera tool schemas for a given external agent identity and permission scope."
+        description = "List Hera tools available for a given external agent identity and permission scope. Without tool_name: a compact {name, description} summary for every available tool (small, fast). With tool_name: the full JSON schema for just that one tool."
     )]
     async fn list_tool_schemas(
         &self,
         Parameters(params): Parameters<ListToolSchemasParams>,
     ) -> String {
-        hera_tool_schemas(&params.permissions, &params.agent_name)
+        let tools = collect_hera_tool_schemas(&params.permissions, &params.agent_name);
+
+        let requested_name = params
+            .tool_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+
+        match requested_name {
+            Some(name) => {
+                let found = tools.iter().find(|tool| {
+                    tool.pointer("/function/name").and_then(|v| v.as_str()) == Some(name)
+                });
+                match found {
+                    Some(schema) => {
+                        serde_json::to_string_pretty(schema).unwrap_or_default()
+                    }
+                    None => {
+                        let available: Vec<&str> = tools
+                            .iter()
+                            .filter_map(|tool| {
+                                tool.pointer("/function/name").and_then(|v| v.as_str())
+                            })
+                            .collect();
+                        format!(
+                            "Error: no tool named '{}' found among {} tools available for \
+                             agent_name='{}' permissions={:?}. Available tool names: {}",
+                            name,
+                            available.len(),
+                            params.agent_name,
+                            params.permissions,
+                            available.join(", ")
+                        )
+                    }
+                }
+            }
+            None => {
+                let summary: Vec<serde_json::Value> = tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "name": tool.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or(""),
+                            "description": tool.pointer("/function/description").and_then(|v| v.as_str()).unwrap_or(""),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&summary).unwrap_or_default()
+            }
+        }
     }
 }
 

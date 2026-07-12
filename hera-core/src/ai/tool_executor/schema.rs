@@ -246,13 +246,21 @@ pub fn load_agent_artifact(agent_name: &str) -> AgentArtifact {
 /// personas) keep passing app-name permissions (`["vetra"]`, `["garcero"]`,
 /// ...) and are completely unaffected; applying literal-name filtering to
 /// those would incorrectly strip every global tool they rely on.
-pub fn hera_tool_schemas(permissions: &[String], agent_name: &str) -> String {
+/// Structured counterpart to `hera_tool_schemas` below: gathers the same set of
+/// tool schemas (global + permission-scoped app tools + dynamic skills, with the
+/// same coding-surface allowlist narrowing) but returns them as a `Vec<Value>`
+/// instead of a prompt-ready formatted string. Used by callers that want
+/// machine-readable schemas — e.g. the MCP `list_tool_schemas` bridge, which
+/// needs to emit a compact `{name, description}` summary or a single tool's
+/// full schema rather than dumping all ~90 full schemas at once (that dump was
+/// ~78KB / 2217 lines and blew past MCP tool-call response limits).
+pub fn collect_hera_tool_schemas(permissions: &[String], agent_name: &str) -> Vec<Value> {
     let base_dir = "/home/paulo/Programs/apps/OS/Tools";
     let mut tools_vec: Vec<Value> = Vec::new();
 
     // Empty permissions = no tools at all (e.g., Chigüí doing pure LLM generation)
     if permissions.is_empty() {
-        return "".to_string();
+        return tools_vec;
     }
 
     let has_all = permissions.contains(&"all".to_string());
@@ -305,6 +313,12 @@ pub fn hera_tool_schemas(permissions: &[String], agent_name: &str) -> String {
         });
         tools_vec.push(skill_tool);
     }
+
+    tools_vec
+}
+
+pub fn hera_tool_schemas(permissions: &[String], agent_name: &str) -> String {
+    let tools_vec = collect_hera_tool_schemas(permissions, agent_name);
 
     if tools_vec.is_empty() {
         return "".to_string();

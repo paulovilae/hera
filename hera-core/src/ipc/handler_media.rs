@@ -417,7 +417,9 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
         .map(|d| d.as_nanos())
         .unwrap_or(0)
         .to_string();
-    let avi_path = format!("{}/video_{}.avi", output_dir, video_id);
+    // No trailing extension here — sd-cli always appends ".avi" to -o itself
+    // (MJPG AVI is hardcoded), so this base + ".avi" gives the real path.
+    let avi_path = format!("{}/video_{}", output_dir, video_id);
     let mp4_path = format!("{}/video_{}.mp4", output_dir, video_id);
     let model_dir = video_model_dir();
 
