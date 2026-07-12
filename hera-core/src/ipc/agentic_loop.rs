@@ -34,6 +34,26 @@ const DEFAULT_MAX_ITERS: usize = 25;
 /// approach lets weak local models recover.
 const MAX_NOPROGRESS_NUDGES: usize = 2;
 
+/// Consecutive rounds of the SAME tool name (ignoring arguments) — restricted to
+/// passive/read-only rounds, see `round_is_passive` — before the loop treats it
+/// as no-progress, same as an exact-signature repeat.
+///
+/// Diagnosed 2026-07-12 against a real production hang (genesis, hera-core,
+/// `stop_reason=error` at iterations=18): a weak local model dodged the
+/// exact-signature repeat guard below by trivially varying one argument each
+/// round — `read_pm2_logs` called 10 rounds in a row against the SAME service
+/// with only `lines`/`log_type` changing (100→50→20→10→10→20→20→20→20). Each
+/// round looked "new" to `calls_signature` (exact string match), so the guard
+/// never fired past the first pair; the loop ground on, appending each round's
+/// raw log dump to the context, until per-round latency grew from ~1s to 70s+
+/// and the local inference engine itself failed to answer (connection error to
+/// the llama.cpp server) — the loop's actual failure mode was an unbounded,
+/// never-pruned context, not the tool logic. This catches the "same tool,
+/// cosmetically different args, no real state change" class without touching
+/// the legitimate edit→verify→edit debug loop the exact guard already protects
+/// (a round containing an edit/verify tool always resets this streak to 0).
+const SAME_TOOL_STREAK_LIMIT: usize = 4;
+
 /// Tools that mutate source. After one of these succeeds, the agent should
 /// verify before declaring the task done.
 const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
@@ -217,6 +237,27 @@ fn calls_signature(calls: &[ToolCall]) -> String {
         .join("|")
 }
 
+/// Whether every call in a round is passive — NOT an edit or verification tool.
+/// A round that edits or verifies is real progress and must never count toward
+/// the same-tool-name "fishing" streak (`SAME_TOOL_STREAK_LIMIT`); only rounds
+/// of pure re-reading/re-diagnosing without acting on it should.
+fn round_is_passive(calls: &[ToolCall]) -> bool {
+    calls.iter().all(|call| {
+        !EDIT_TOOLS.contains(&call.name.as_str()) && !VERIFY_TOOLS.contains(&call.name.as_str())
+    })
+}
+
+/// Tool-NAME-only signature of a round (arguments ignored) — coarser than
+/// `calls_signature`, used to detect "same tool, different-looking args, no
+/// real progress" streaks the exact-signature guard cannot see.
+fn tool_names_signature(calls: &[ToolCall]) -> String {
+    calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Append one completed tool round to the running conversation: the model's raw
 /// output (which contained the tool call) as the assistant turn, then the tool
 /// results as a user turn. Unlike `prepare_tool_result_followup_request`, the
@@ -283,6 +324,11 @@ pub async fn run_agentic_loop(
     let mut last_origin = "local".to_string();
     let mut last_text = String::new();
     let mut last_signature: Option<String> = None;
+    // See SAME_TOOL_STREAK_LIMIT: tracks consecutive passive rounds using the
+    // same tool name (regardless of arguments), to catch a model that dodges
+    // the exact-signature repeat guard by trivially varying one argument.
+    let mut last_tool_names: Option<String> = None;
+    let mut same_tool_streak: usize = 0;
     // Verify-before-done gate: track whether files were edited without a
     // subsequent green verification, and whether we've already nudged once.
     let mut edited_pending = false;
@@ -444,15 +490,36 @@ pub async fn run_agentic_loop(
             };
         }
 
+        // Coarser, name-only streak (see SAME_TOOL_STREAK_LIMIT doc comment):
+        // computed BEFORE the exact-signature check so it also counts the
+        // rounds the exact check already catches (those are still "the same
+        // tool name", just also identical args).
+        let passive_round = round_is_passive(&calls);
+        let names_only = tool_names_signature(&calls);
+        if passive_round && last_tool_names.as_deref() == Some(names_only.as_str()) {
+            same_tool_streak += 1;
+        } else {
+            same_tool_streak = usize::from(passive_round);
+        }
+        last_tool_names = Some(names_only.clone());
+        let stale_same_tool = passive_round && same_tool_streak >= SAME_TOOL_STREAK_LIMIT;
+
         let signature = calls_signature(&calls);
-        let no_progress = last_signature.as_deref() == Some(signature.as_str());
+        let exact_repeat = last_signature.as_deref() == Some(signature.as_str());
         last_signature = Some(signature);
+        let no_progress = exact_repeat || stale_same_tool;
 
         tracing::info!(
             "🔁 [Hera Loop] iter {} executing {} tool call(s){}",
             iter,
             calls.len(),
-            if no_progress { " (repeat — closing)" } else { "" }
+            if exact_repeat {
+                " (exact repeat)"
+            } else if stale_same_tool {
+                " (same-tool streak, varying args)"
+            } else {
+                ""
+            }
         );
 
         let tool_names = calls
@@ -524,20 +591,28 @@ pub async fn run_agentic_loop(
             if no_progress_nudges < MAX_NOPROGRESS_NUDGES {
                 no_progress_nudges += 1;
                 tracing::info!(
-                    "🔁 [Hera Loop] no-progress recovery nudge {}/{} at iter {}",
+                    "🔁 [Hera Loop] no-progress recovery nudge {}/{} at iter {} ({})",
                     no_progress_nudges,
                     MAX_NOPROGRESS_NUDGES,
-                    iter
+                    iter,
+                    if exact_repeat { "exact repeat" } else { "same-tool streak" }
                 );
                 req.messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: MessageContent::Text(content),
                 });
+                let nudge_text = if exact_repeat {
+                    format!(
+                        "Tool execution results:{outputs}\n\nYou repeated the same tool call and got the same result — that is not progress. Do NOT repeat it. Re-read the file and the exact error, then try a DIFFERENT fix with different arguments. If an edit_file failed with 'old_string not found', read the file again with read_file and copy the exact text, including indentation, before editing."
+                    )
+                } else {
+                    format!(
+                        "Tool execution results:{outputs}\n\nYou have called {names_only} {same_tool_streak} times in a row with only cosmetic argument changes (e.g. a different line count or filter) and never edited or verified anything — that is re-reading the same information, not progress. Stop calling it. Either act on what you already know (edit_file/write_file, then verify) or give your final answer now."
+                    )
+                };
                 req.messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: MessageContent::Text(format!(
-                        "Tool execution results:{outputs}\n\nYou repeated the same tool call and got the same result — that is not progress. Do NOT repeat it. Re-read the file and the exact error, then try a DIFFERENT fix with different arguments. If an edit_file failed with 'old_string not found', read the file again with read_file and copy the exact text, including indentation, before editing."
-                    )),
+                    content: MessageContent::Text(nudge_text),
                 });
                 continue;
             }
@@ -866,6 +941,97 @@ mod tests {
         assert_eq!(outcome.stop_reason, "no_progress");
         // Recovery nudges delayed the close past the first repeat.
         assert!(outcome.iterations >= 2 + MAX_NOPROGRESS_NUDGES);
+    }
+
+    #[tokio::test]
+    async fn loop_closes_on_same_tool_streak_with_varying_args() {
+        // Reproduces the real production hang diagnosed 2026-07-12 (genesis,
+        // hera-core, iterations=18 stop_reason=error): the model calls the SAME
+        // tool every round but trivially varies one argument each time, so
+        // `calls_signature` never matches two consecutive rounds and the exact
+        // no-progress guard alone never fires. Without SAME_TOOL_STREAK_LIMIT
+        // this script would run all 9 scripted rounds; with it, the loop must
+        // close well before exhausting the script (and long before max_iters).
+        let calls = [100_u32, 100, 50, 20, 10, 10, 20, 20, 20]
+            .iter()
+            .map(|lines| {
+                format!(
+                    "<tool_call>{{\"name\":\"read_pm2_logs\",\"arguments\":{{\"service_name\":\"hera-core\",\"lines\":{lines},\"log_type\":\"error\"}}}}</tool_call>"
+                )
+            })
+            .collect::<Vec<_>>();
+        let scripts: Vec<&str> = calls.iter().map(String::as_str).collect();
+        let engine: Arc<dyn LLMEngine + Send + Sync> = Arc::new(ScriptedEngine::new(scripts));
+        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed(), None).await;
+        assert_eq!(outcome.stop_reason, "no_progress");
+        // The whole point: it must NOT grind through all 9 scripted rounds (the
+        // pre-fix behaviour) — it should close several rounds earlier once the
+        // same-tool streak crosses SAME_TOOL_STREAK_LIMIT.
+        assert!(
+            outcome.iterations < calls.len(),
+            "expected an early close, got {} iterations (script had {})",
+            outcome.iterations,
+            calls.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn same_tool_streak_is_inert_when_edit_or_verify_interleaved() {
+        // A legitimate edit→verify→edit debug loop also calls a small set of
+        // tools repeatedly, but it must NEVER trip the same-tool-streak guard —
+        // only pure re-reading without acting on it should. Script: edit, check
+        // (fails), edit, check (fails), edit, check (fails) — 3x each tool,
+        // which would exceed SAME_TOOL_STREAK_LIMIT if edit/verify rounds counted.
+        let edit = "<tool_call>{\"name\":\"edit_file\",\"arguments\":{\"path\":\"/x\",\"old\":\"a\",\"new\":\"b\"}}</tool_call>";
+        let check = "<tool_call>{\"name\":\"cargo_check\",\"arguments\":{}}</tool_call>";
+        let engine: Arc<dyn LLMEngine + Send + Sync> = Arc::new(ScriptedEngine::new(vec![
+            edit, check, edit, check, edit, check, edit, check,
+        ]));
+        let outcome = run_agentic_loop(&engine, base_request(), &test_parsed(), None).await;
+        // Every tool call is denied (empty permissions in test_parsed), so this
+        // never reaches "verified" — the point is only that it is NOT closed as
+        // "no_progress" by the same-tool-streak guard despite 4x edit_file and
+        // 4x cargo_check across the run (each individually below the streak
+        // limit, and never consecutive with itself since they alternate).
+        assert_ne!(outcome.stop_reason, "no_progress");
+    }
+
+    #[test]
+    fn round_is_passive_excludes_edit_and_verify_tools() {
+        assert!(round_is_passive(&[ToolCall {
+            name: "read_pm2_logs".to_string(),
+            arguments: serde_json::json!({}),
+        }]));
+        assert!(!round_is_passive(&[ToolCall {
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({}),
+        }]));
+        assert!(!round_is_passive(&[ToolCall {
+            name: "cargo_check".to_string(),
+            arguments: serde_json::json!({}),
+        }]));
+        // A round mixing a passive read with an edit is NOT passive — any
+        // real action in the round disqualifies it.
+        assert!(!round_is_passive(&[
+            ToolCall { name: "read_file".to_string(), arguments: serde_json::json!({}) },
+            ToolCall { name: "write_file".to_string(), arguments: serde_json::json!({}) },
+        ]));
+    }
+
+    #[test]
+    fn tool_names_signature_ignores_arguments() {
+        let a = vec![ToolCall {
+            name: "read_pm2_logs".to_string(),
+            arguments: serde_json::json!({"lines": 100}),
+        }];
+        let b = vec![ToolCall {
+            name: "read_pm2_logs".to_string(),
+            arguments: serde_json::json!({"lines": 10, "log_type": "both"}),
+        }];
+        // Same tool name, very different arguments — the whole point of this
+        // signature is that it does NOT distinguish them, unlike calls_signature.
+        assert_eq!(tool_names_signature(&a), tool_names_signature(&b));
+        assert_ne!(calls_signature(&a), calls_signature(&b));
     }
 
     // --- Efficiency early-close decision logic (stop_reason = "verified") ---
