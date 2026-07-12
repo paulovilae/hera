@@ -12,7 +12,7 @@ use tracing::info;
 /// raw prompt on any failure so a slow/unavailable brain never blocks generation.
 async fn enhance_music_prompt(raw_prompt: &str) -> String {
     let persona = "You are a music producer AI. Given a short brief idea, expand it into \
-        a single detailed prompt for a text-to-music model (MusicGen). Describe genre, \
+        a single detailed prompt for a text-to-music model (ACE-Step). Describe genre, \
         instruments, mood, tempo (BPM if it helps), and structure (intro/build/loop). \
         Do NOT use visual or image language (no cameras, lighting, colors). Only output \
         the expanded music prompt, nothing else, max 2 sentences."
@@ -95,6 +95,76 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
     }
 }
 
+/// Extract lyrics from free-text prompt and return (style_prompt, lyrics).
+/// Handles: "letra: ...", "lyrics: ...", "que diga: ...", "[Verso]...", "[Verse]..."
+/// The style portion (without the lyrics clause) is returned as the prompt for the enhancer.
+fn split_lyrics_from_prompt(text: &str) -> (String, Option<String>) {
+    let lower = text.to_lowercase();
+
+    // Explicit "letra:" / "lyrics:" / "que diga:" delimiter — everything after is lyrics
+    for marker in &["letra:", "lyrics:", "que diga:", "que diga "] {
+        if let Some(pos) = lower.find(marker) {
+            let style = text[..pos].trim().to_string();
+            let raw_lyrics = text[pos + marker.len()..].trim().to_string();
+            if !raw_lyrics.is_empty() {
+                let lyrics = raw_lyrics
+                    .trim_matches(|c| c == '"' || c == '\'' || c == '\u{201c}' || c == '\u{201d}')
+                    .trim()
+                    .to_string();
+                return (if style.is_empty() { "music".to_string() } else { style }, Some(lyrics));
+            }
+        }
+    }
+    // Structural markers anywhere in the text indicate lyric content inline
+    if lower.contains("[verso]") || lower.contains("[coro]")
+        || lower.contains("[verse]") || lower.contains("[chorus]")
+        || lower.contains("[bridge]") || lower.contains("[puente]")
+    {
+        // Everything before the first structural marker = style hint; rest = lyrics
+        let structural = ["[verso]", "[coro]", "[verse]", "[chorus]", "[bridge]", "[puente]"];
+        if let Some(first) = structural.iter().filter_map(|m| lower.find(m)).min() {
+            let style = text[..first].trim().to_string();
+            let lyrics = text[first..].trim().to_string();
+            return (if style.is_empty() { "music".to_string() } else { style }, Some(lyrics));
+        }
+    }
+    (text.to_string(), None)
+}
+
+/// Parse "60 segundos", "30 seconds", "45s", "2 minutos", "2 minutes" from free text.
+fn extract_duration_from_text(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    // "2 minutos" / "2 minutes" → seconds
+    let minute_pat = ["minuto", "minutos", "minute", "minutes", "min"];
+    for pat in &minute_pat {
+        if let Some(pos) = lower.find(pat) {
+            let before = lower[..pos].trim_end();
+            if let Some(n) = before.split_whitespace().next_back().and_then(|s| s.parse::<u32>().ok()) {
+                return Some((n * 60).clamp(10, 120));
+            }
+        }
+    }
+    // "60 segundos" / "60 seconds" / "60s"
+    let sec_pat = ["segundo", "segundos", "second", "seconds"];
+    for pat in &sec_pat {
+        if let Some(pos) = lower.find(pat) {
+            let before = lower[..pos].trim_end();
+            if let Some(n) = before.split_whitespace().next_back().and_then(|s| s.parse::<u32>().ok()) {
+                return Some(n.clamp(10, 120));
+            }
+        }
+    }
+    // bare "60s" (digit immediately followed by 's')
+    for word in lower.split_whitespace() {
+        if word.ends_with('s') {
+            if let Ok(n) = word[..word.len()-1].parse::<u32>() {
+                if n >= 10 { return Some(n.clamp(10, 120)); }
+            }
+        }
+    }
+    None
+}
+
 pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
     let prompt = call
         .arguments
@@ -105,14 +175,26 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
         .arguments
         .get("duration")
         .and_then(|d| d.as_u64())
-        .map(|d| d as u32);
+        .map(|d| d as u32)
+        // Fallback: extract "N segundos" / "N seconds" / "Ns" from the prompt text
+        // when the model absorbed duration into text rather than as a parameter.
+        .or_else(|| extract_duration_from_text(prompt));
+    // Prefer explicit `lyrics` param; fall back to extracting from the raw prompt text
+    // (local model often absorbs user-provided lyrics into the style description).
+    let (style_prompt, extracted_lyrics) = split_lyrics_from_prompt(prompt);
+    let lyrics = call
+        .arguments
+        .get("lyrics")
+        .and_then(|l| l.as_str())
+        .map(|s| s.to_string())
+        .or(extracted_lyrics);
 
-    // Automatic prompt enhancement (no user-facing toggle) — same silent-by-default
-    // treatment images give their LoRA auto-router, tuned for music instead.
-    let enhanced_prompt = enhance_music_prompt(prompt).await;
+    // Send only the style portion to the enhancer so lyrics don't get re-absorbed.
+    let prompt_for_enhancer = if lyrics.is_some() { &style_prompt } else { prompt };
+    let enhanced_prompt = enhance_music_prompt(prompt_for_enhancer).await;
 
     let hera = hera_execution_agent();
-    match hera.generate_music(&enhanced_prompt, duration).await {
+    match hera.generate_music(&enhanced_prompt, duration, lyrics).await {
         Ok(res) => {
             let audio_url = res
                 .get("audio_url")

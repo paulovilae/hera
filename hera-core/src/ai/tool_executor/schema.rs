@@ -436,6 +436,7 @@ fn is_infra_tool_name(tool_name: &str) -> bool {
             | "review_all_apps_status"
             | "verify_app_health"
             | "query_federation_state"
+            | "cluster_snapshot"
     )
 }
 
