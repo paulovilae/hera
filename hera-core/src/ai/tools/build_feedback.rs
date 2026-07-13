@@ -43,19 +43,78 @@ fn timeout_secs(call: &ToolCall) -> u64 {
         .clamp(5, MAX_TIMEOUT_S)
 }
 
+/// Optional `--features` passthrough for cargo_check / cargo_test. Accepts a
+/// space- or comma-separated list (e.g. "local-llm embeddings"), or "*"/"all"
+/// for `--all-features`. Without it a crate is only ever checked in its DEFAULT
+/// configuration — for Hera itself that is the stub build (the primary LLM
+/// engine compiles to a "disabled" stub without `local-llm`), so a featureless
+/// cargo_check silently verifies the wrong config. Returns the normalized
+/// (space-separated) feature string, "*" for all-features, or None.
+fn features_arg(call: &ToolCall) -> Option<String> {
+    let raw = arg_str(call, "features");
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == "*" || raw.eq_ignore_ascii_case("all") {
+        return Some("*".to_string());
+    }
+    let normalized = raw
+        .split(|c| c == ',' || c == ' ')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+/// Append the resolved `--features` / `--all-features` flags (if any) to a cargo
+/// argument vector. Shared by cargo_check and cargo_test so both honor the same
+/// caller-supplied feature set.
+fn push_feature_flags(args: &mut Vec<String>, features: &Option<String>) {
+    if let Some(f) = features {
+        if f == "*" {
+            args.push("--all-features".to_string());
+        } else {
+            args.push("--features".to_string());
+            args.push(f.clone());
+        }
+    }
+}
+
 fn workdir(call: &ToolCall) -> Result<std::path::PathBuf, String> {
     // Require an explicit path. Defaulting to "." used to silently run cargo in
     // Hera's own cwd (the whole OS monorepo) — wrong project, huge build, and the
     // observed cause of red cargo_test rounds when the model omitted `path`. An
     // actionable error is re-injected into the agentic loop so the model corrects
     // in one round instead of thrashing.
-    let p = arg_str(call, "path");
+    // Accept `path` (a directory) OR `manifest_path` (a Cargo.toml) — weak local
+    // models reach for `manifest_path` (cargo's real flag name) and would
+    // otherwise hit "missing 'path'" and thrash. A manifest path is normalized
+    // to its parent directory.
+    let mut p = arg_str(call, "path").trim().to_string();
+    if p.is_empty() {
+        let mp = arg_str(call, "manifest_path").trim();
+        if !mp.is_empty() {
+            p = if mp.ends_with("Cargo.toml") {
+                std::path::Path::new(mp)
+                    .parent()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| mp.to_string())
+            } else {
+                mp.to_string()
+            };
+        }
+    }
     if p.trim().is_empty() {
         return Err("missing 'path': pass the ABSOLUTE path to the project directory \
                     (the folder containing Cargo.toml), e.g. \"/tmp/ava_eval2\"."
             .to_string());
     }
-    let resolved = resolve_guarded_fs_path(p, true)?;
+    let resolved = resolve_guarded_fs_path(&p, true)?;
     if !resolved.is_dir() {
         return Err(format!("'{}' is not a directory.", resolved.display()));
     }
@@ -195,12 +254,19 @@ pub(crate) async fn execute_cargo_check(call: &ToolCall) -> ToolResult {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let mut args = vec!["check", "--message-format=json", "--color=never"];
+    let features = features_arg(call);
+    let mut args: Vec<String> = vec![
+        "check".to_string(),
+        "--message-format=json".to_string(),
+        "--color=never".to_string(),
+    ];
     if include_tests {
-        args.push("--tests");
+        args.push("--tests".to_string());
     }
+    push_feature_flags(&mut args, &features);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    let (success, stdout, stderr) = match run_cmd(&dir, "cargo", &args, timeout_s).await {
+    let (success, stdout, stderr) = match run_cmd(&dir, "cargo", &arg_refs, timeout_s).await {
         Ok(r) => r,
         Err(e) => return err(call, e),
     };
@@ -289,9 +355,19 @@ pub(crate) async fn execute_cargo_test(call: &ToolCall) -> ToolResult {
     };
     let timeout_s = timeout_secs(call);
 
+    let features = features_arg(call);
+
     // First a structured build check so build errors come back as file:line.
+    let mut check_args: Vec<String> = vec![
+        "check".to_string(),
+        "--tests".to_string(),
+        "--message-format=json".to_string(),
+        "--color=never".to_string(),
+    ];
+    push_feature_flags(&mut check_args, &features);
+    let check_refs: Vec<&str> = check_args.iter().map(String::as_str).collect();
     let (check_ok, check_stdout, check_stderr) =
-        match run_cmd(&dir, "cargo", &["check", "--tests", "--message-format=json", "--color=never"], timeout_s).await {
+        match run_cmd(&dir, "cargo", &check_refs, timeout_s).await {
             Ok(r) => r,
             Err(e) => return err(call, e),
         };
@@ -317,8 +393,15 @@ pub(crate) async fn execute_cargo_test(call: &ToolCall) -> ToolResult {
         );
     }
 
+    let mut test_args: Vec<String> = vec![
+        "test".to_string(),
+        "--no-fail-fast".to_string(),
+        "--color=never".to_string(),
+    ];
+    push_feature_flags(&mut test_args, &features);
+    let test_refs: Vec<&str> = test_args.iter().map(String::as_str).collect();
     let (success, stdout, stderr) =
-        match run_cmd(&dir, "cargo", &["test", "--no-fail-fast", "--color=never"], timeout_s).await {
+        match run_cmd(&dir, "cargo", &test_refs, timeout_s).await {
             Ok(r) => r,
             Err(e) => return err(call, e),
         };
