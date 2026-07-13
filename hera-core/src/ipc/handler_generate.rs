@@ -341,15 +341,35 @@ pub async fn handle_generate(
             // across every turn of the agentic loop (see LoopUsage in
             // agentic_loop.rs) — previously hardcoded to 0,0,0 because the
             // loop discarded per-turn ChatResponse.usage entirely.
+            //
+            // When the loop reports 0 total tokens (the local engine returned
+            // no usage field for this request shape — observed for
+            // claude_code/default `standard` calls that answer in one turn with
+            // no tool call, while `coding`-route calls report usage fine), fall
+            // back to the same cheap char/4 estimate Path B uses (below), so a
+            // real local-compute turn is never undercounted as a hard 0 in
+            // hera_usage_events. Approximate but free — no extra engine call.
+            let (log_prompt_tokens, log_completion_tokens, log_total_tokens) =
+                if loop_usage.total_tokens == 0 {
+                    let est_prompt = est_tokens as u32;
+                    let est_completion = (result_text.len() / 4) as u32;
+                    (est_prompt, est_completion, est_prompt + est_completion)
+                } else {
+                    (
+                        loop_usage.prompt_tokens,
+                        loop_usage.completion_tokens,
+                        loop_usage.total_tokens,
+                    )
+                };
             spawn_log_usage(
                 parsed.app_name.clone(),
                 canonicalize_user_id(&parsed.sender_name, &parsed.chat_id, &parsed.session_id),
                 parsed.session_id.clone(),
                 parsed.route_profile_id.clone(),
                 response_model.clone(),
-                loop_usage.prompt_tokens,
-                loop_usage.completion_tokens,
-                loop_usage.total_tokens,
+                log_prompt_tokens,
+                log_completion_tokens,
+                log_total_tokens,
                 response_origin.contains("cloud"),
                 duration_ms,
                 parsed.trace_id.clone(),
