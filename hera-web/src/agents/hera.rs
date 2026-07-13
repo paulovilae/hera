@@ -406,6 +406,13 @@ impl Hera {
         });
         if let Some(ref lyr) = lyrics {
             body["lyrics"] = json!(lyr);
+            // ACE-Step's own internal language auto-detect (a small CoT LM pass)
+            // is non-deterministic on short lyric snippets — observed live: the
+            // identical Spanish text detected "es" once and "unknown" the next
+            // call, and "unknown" produced unintelligible/inaudible vocals.
+            // Detect ourselves from the lyrics text so the same input always
+            // gets the same language, instead of leaving it to that guess.
+            body["vocal_language"] = json!(Self::detect_lyrics_language(lyr));
         }
 
         let res = client
@@ -432,6 +439,33 @@ impl Hera {
             "audio_url": format!("/outputs/{}", filename),
             "duration": clamped_duration
         }))
+    }
+
+    /// Cheap, deterministic Spanish/English vocal-language guess for ACE-Step
+    /// lyrics (ISO codes from `acestep/constants.py::VALID_LANGUAGES`, which
+    /// includes both). The platform's lyric prompts (`examples.json`, the
+    /// operator's own bot) are Spanish-first, so this defaults to "es" unless
+    /// the text has clear English-only signals and no Spanish markers at all —
+    /// same-text-in, same-language-out, unlike ACE-Step's own internal CoT
+    /// detector which flip-flopped on identical Spanish input.
+    fn detect_lyrics_language(lyrics: &str) -> &'static str {
+        let lower = lyrics.to_lowercase();
+        let has_spanish_markers = lyrics.chars().any(|c| "áéíóúñ¿¡".contains(c))
+            || [" el ", " la ", " que ", " de ", " y ", " en ", " con ", " para ", " mi ", " tu "]
+                .iter()
+                .any(|w| format!(" {} ", lower).contains(w));
+        if has_spanish_markers {
+            return "es";
+        }
+        let has_english_markers = [" the ", " and ", " you ", " love ", " my ", " with "]
+            .iter()
+            .any(|w| format!(" {} ", lower).contains(w));
+        if has_english_markers {
+            return "en";
+        }
+        // Ambiguous/short snippet with no markers either way — default to the
+        // platform's primary language rather than leave it to ACE-Step's flaky guess.
+        "es"
     }
 
     /// Animates a mascot or human face speaking the given text with lip-sync.
