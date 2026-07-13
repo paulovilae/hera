@@ -140,10 +140,24 @@ fn parse_ipc_result(response: &str) -> Result<String, String> {
         }
     }
 
+    // Strip <think>...</think> reasoning leaks — same gap already patched in
+    // tool_executor/mod.rs and ipc/runtime_tools.rs for other IPC call sites,
+    // but this one (used by enhance_music_prompt / spawn_parallel_agents) never
+    // had it: a local model answering a "give me 2 sentences" persona sometimes
+    // emits its internal verification monologue verbatim instead of the final
+    // answer, which then gets sent straight to ACE-Step as the style prompt.
+    fn strip_think(text: String) -> String {
+        if let Some(end_idx) = text.find("</think>") {
+            text[end_idx + "</think>".len()..].trim().to_string()
+        } else {
+            text
+        }
+    }
+
     if let Some(result) = final_result {
-        Ok(result)
+        Ok(strip_think(result))
     } else if !accumulated_text.is_empty() {
-        Ok(accumulated_text)
+        Ok(strip_think(accumulated_text))
     } else {
         Err("No content in Hera IPC response".to_string())
     }

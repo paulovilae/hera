@@ -53,13 +53,14 @@ async fn enhance_music_prompt(raw_prompt: &str) -> String {
     let persona = "You are a music producer AI. Given a short brief idea, expand it into \
         a single detailed prompt for a text-to-music model (ACE-Step). Describe genre, \
         instruments, mood, tempo (BPM if it helps), and structure (intro/build/loop). \
-        Do NOT use visual or image language (no cameras, lighting, colors). Only output \
-        the expanded music prompt, nothing else, max 2 sentences."
+        Do NOT use visual or image language (no cameras, lighting, colors). \
+        Do not think, reason, verify, or explain your answer — do not use <think> tags. \
+        Output ONLY the expanded music prompt itself, nothing else, max 2 sentences."
         .to_string();
 
     match run_agent_via_hera_ipc(persona, raw_prompt.to_string()).await {
         Ok(enhanced) if !enhanced.trim().is_empty() => {
-            let enhanced = enhanced.trim().to_string();
+            let enhanced = sanitize_enhanced_music_prompt(enhanced.trim(), raw_prompt);
             info!(
                 "🎵🧠 Enhanced music prompt: {}",
                 &enhanced[..enhanced.len().min(160)]
@@ -74,6 +75,49 @@ async fn enhance_music_prompt(raw_prompt: &str) -> String {
             );
             raw_prompt.to_string()
         }
+    }
+}
+
+/// Hard backstop against reasoning leaks the persona instruction alone doesn't
+/// always stop (observed live: a ~900-char self-verification monologue —
+/// "Para verificar esta descripción, necesito confirmar que el prompt cumple
+/// con los requisitos..." — sent straight to ACE-Step as the style prompt).
+/// `parse_ipc_result` already strips a well-formed `<think>...</think>` block;
+/// this catches what's left: cap length and drop the reasoning-monologue tail
+/// if one slipped through unwrapped.
+fn sanitize_enhanced_music_prompt(enhanced: &str, raw_prompt: &str) -> String {
+    const MAX_CHARS: usize = 400;
+    // A local model narrating its own reasoning tends to open a new sentence
+    // with one of these — cut there if found, keeping only the real answer.
+    const LEAK_MARKERS: &[&str] = &[
+        "Para verificar",
+        "para verificar",
+        "To verify",
+        "to verify",
+        "Let me verify",
+        "Let me think",
+        "I need to confirm",
+        "necesito confirmar",
+    ];
+    let mut text = enhanced;
+    for marker in LEAK_MARKERS {
+        if let Some(pos) = text.find(marker) {
+            text = text[..pos].trim_end();
+        }
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return raw_prompt.to_string();
+    }
+    if text.len() <= MAX_CHARS {
+        return text.to_string();
+    }
+    // Truncate at the last sentence boundary before the cap so we don't cut
+    // ACE-Step's style prompt mid-word.
+    let truncated = &text[..MAX_CHARS];
+    match truncated.rfind(['.', '\n']) {
+        Some(cut) if cut > MAX_CHARS / 3 => truncated[..=cut].trim().to_string(),
+        _ => truncated.trim().to_string(),
     }
 }
 
