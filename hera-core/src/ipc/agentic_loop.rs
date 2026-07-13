@@ -19,7 +19,7 @@ use super::context::ParsedPayload;
 use super::helpers::infer_origin_from_model;
 use super::runtime_tools::execute_parsed_tool_calls;
 use crate::ai::tool_executor::ToolCall;
-use crate::ai::{ChatMessage, ChatRequest, LLMEngine, MessageContent};
+use crate::ai::{ChatMessage, ChatRequest, ChatUsage, LLMEngine, MessageContent};
 use std::sync::Arc;
 use tokio::net::UnixStream;
 
@@ -64,6 +64,32 @@ const VERIFY_TOOLS: &[&str] = &["cargo_check", "cargo_test", "pytest"];
 /// "verified" never fires on `cargo_check` alone (compiles ≠ correct).
 pub const VERIFY_CLOSE_TOOLS: &[&str] = &["cargo_test", "pytest"];
 
+/// Token usage summed across every turn of an agentic loop run (the engine
+/// reports usage per-turn; a single loop run can take many turns, so this is
+/// a running total, not a single response's `ChatUsage`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoopUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+impl LoopUsage {
+    fn add(&mut self, usage: &Option<ChatUsage>) {
+        if let Some(usage) = usage {
+            self.prompt_tokens += usage.prompt_tokens;
+            self.completion_tokens += usage.completion_tokens;
+            self.total_tokens += usage.total_tokens;
+        }
+    }
+
+    fn plus(&self, usage: &Option<ChatUsage>) -> LoopUsage {
+        let mut merged = *self;
+        merged.add(usage);
+        merged
+    }
+}
+
 /// Outcome of a full agentic loop run.
 pub struct AgenticLoopOutcome {
     pub result_text: String,
@@ -75,6 +101,11 @@ pub struct AgenticLoopOutcome {
     pub iterations: usize,
     /// "done" | "verified" | "max_iters" | "no_progress" | "empty" | "error"
     pub stop_reason: &'static str,
+    /// Summed token usage across all turns. Previously always zero — the loop
+    /// discarded per-turn `ChatResponse.usage` entirely (see hera_usage_events
+    /// diagnostic 2026-07-13: every claude_code row had real latency but
+    /// total_tokens=0).
+    pub usage: LoopUsage,
 }
 
 /// Whether the multi-turn loop is enabled. Off by default (sovereign-safe rollout).
@@ -320,6 +351,7 @@ pub async fn run_agentic_loop(
         req.temperature = Some(coding_temp());
     }
     let mut executed_calls_json: Vec<serde_json::Value> = Vec::new();
+    let mut usage = LoopUsage::default();
     let mut last_model = String::new();
     let mut last_origin = "local".to_string();
     let mut last_text = String::new();
@@ -379,10 +411,12 @@ pub async fn run_agentic_loop(
                     executed_calls_json,
                     iterations: iter + 1,
                     stop_reason: "error",
+                    usage,
                 };
             }
         };
 
+        usage.add(&resp.usage);
         last_model = resp.model.clone();
         last_origin = infer_origin_from_model(&resp.model).to_string();
 
@@ -394,6 +428,7 @@ pub async fn run_agentic_loop(
                 executed_calls_json,
                 iterations: iter + 1,
                 stop_reason: "empty",
+                usage,
             };
         };
         let content = choice.message.content.unwrap_or_default();
@@ -453,6 +488,7 @@ pub async fn run_agentic_loop(
                     executed_calls_json,
                     iterations: iter + 1,
                     stop_reason: "required_tool_missing",
+                    usage,
                 };
             }
             // Verify-before-done gate: the model is trying to finish, but it
@@ -487,6 +523,7 @@ pub async fn run_agentic_loop(
                 executed_calls_json,
                 iterations: iter + 1,
                 stop_reason: "done",
+                usage,
             };
         }
 
@@ -558,7 +595,7 @@ pub async fn run_agentic_loop(
             append_tool_round(&mut req, &content, &outputs, true);
             return close_with_final_answer(
                 engine, req, executed_calls_json, last_model, last_origin, outputs, iter + 1,
-                "max_iters",
+                "max_iters", usage,
             )
             .await;
         }
@@ -578,7 +615,7 @@ pub async fn run_agentic_loop(
             append_tool_round(&mut req, &content, &outputs, true);
             return close_with_final_answer(
                 engine, req, executed_calls_json, last_model, last_origin, outputs, iter + 1,
-                "verified",
+                "verified", usage,
             )
             .await;
         }
@@ -619,7 +656,7 @@ pub async fn run_agentic_loop(
             append_tool_round(&mut req, &content, &outputs, true);
             return close_with_final_answer(
                 engine, req, executed_calls_json, last_model, last_origin, outputs, iter + 1,
-                "no_progress",
+                "no_progress", usage,
             )
             .await;
         }
@@ -636,6 +673,7 @@ pub async fn run_agentic_loop(
         executed_calls_json,
         iterations: max,
         stop_reason: "max_iters",
+        usage,
     }
 }
 
@@ -651,9 +689,11 @@ async fn close_with_final_answer(
     fallback_outputs: String,
     iterations: usize,
     stop_reason: &'static str,
+    usage: LoopUsage,
 ) -> AgenticLoopOutcome {
     match engine.generate_content(req).await {
         Ok(resp) => {
+            let usage = usage.plus(&resp.usage);
             let model = resp.model.clone();
             let origin = infer_origin_from_model(&model).to_string();
             let text = resp
@@ -670,6 +710,7 @@ async fn close_with_final_answer(
                 executed_calls_json,
                 iterations: iterations + 1,
                 stop_reason,
+                usage,
             }
         }
         Err(error) => {
@@ -680,6 +721,7 @@ async fn close_with_final_answer(
                 origin: fallback_origin,
                 executed_calls_json,
                 iterations: iterations + 1,
+                usage,
                 stop_reason,
             }
         }

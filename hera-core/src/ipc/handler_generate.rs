@@ -252,6 +252,7 @@ pub async fn handle_generate(
                 loop_outcome.stop_reason,
                 loop_outcome.executed_calls_json.len()
             );
+            let loop_usage = loop_outcome.usage;
             let result_text = loop_outcome.result_text;
             let response_origin = loop_outcome.origin;
             let response_model = loop_outcome.model;
@@ -336,17 +337,19 @@ pub async fn handle_generate(
                 });
             }
 
-            // Path A — usage logging (best-effort, fire-and-forget).
-            // Agentic loop does not expose per-turn token counts yet; use 0.
+            // Path A — usage logging (best-effort, fire-and-forget). Summed
+            // across every turn of the agentic loop (see LoopUsage in
+            // agentic_loop.rs) — previously hardcoded to 0,0,0 because the
+            // loop discarded per-turn ChatResponse.usage entirely.
             spawn_log_usage(
                 parsed.app_name.clone(),
                 canonicalize_user_id(&parsed.sender_name, &parsed.chat_id, &parsed.session_id),
                 parsed.session_id.clone(),
                 parsed.route_profile_id.clone(),
                 response_model.clone(),
-                0,
-                0,
-                0,
+                loop_usage.prompt_tokens,
+                loop_usage.completion_tokens,
+                loop_usage.total_tokens,
                 response_origin.contains("cloud"),
                 duration_ms,
                 parsed.trace_id.clone(),
