@@ -294,6 +294,25 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
         .map(|s| s.to_string())
         .or(extracted_lyrics);
 
+    // When there's lyrics, ACE-Step needs room for intro+verse+chorus — 10-12s
+    // (the backend's own default/typical short request) isn't enough for the vocal
+    // to land intelligibly. Bump the floor to 30s (still well inside the backend's
+    // 10-120s range) when the requested/default duration falls short. No lyrics:
+    // leave duration behavior exactly as before.
+    const MIN_DURATION_WITH_LYRICS: u32 = 30;
+    let mut duration_bumped_for_lyrics = false;
+    let duration = if lyrics.is_some() {
+        let requested = duration.unwrap_or(10);
+        if requested < MIN_DURATION_WITH_LYRICS {
+            duration_bumped_for_lyrics = true;
+            Some(MIN_DURATION_WITH_LYRICS)
+        } else {
+            Some(requested)
+        }
+    } else {
+        duration
+    };
+
     // Send only the style portion to the enhancer so lyrics don't get re-absorbed.
     let prompt_for_enhancer = if lyrics.is_some() { &style_prompt } else { prompt };
     let enhanced_prompt = enhance_music_prompt(prompt_for_enhancer).await;
@@ -310,14 +329,19 @@ pub(crate) async fn execute_generate_music(call: &ToolCall) -> ToolResult {
             let filename = audio_url.split('/').next_back().unwrap_or(audio_url);
             let public_url = format!("https://imaginos.ai/outputs/{}", filename);
             let actual_duration = res.get("duration").and_then(|d| d.as_u64());
+            let bump_note = if duration_bumped_for_lyrics {
+                " (duración ajustada a 30s para que la letra tenga espacio)"
+            } else {
+                ""
+            };
             let response = match actual_duration {
                 Some(secs) => format!(
-                    "Music generated successfully! Enhanced prompt: \"{}\" ({}s)\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
-                    enhanced_prompt, secs, public_url
+                    "Music generated successfully! Enhanced prompt: \"{}\" ({}s){}\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
+                    enhanced_prompt, secs, bump_note, public_url
                 ),
                 None => format!(
-                    "Music generated successfully! Enhanced prompt: \"{}\"\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
-                    enhanced_prompt, public_url
+                    "Music generated successfully! Enhanced prompt: \"{}\"{}\nMEDIA: {}\nInclude this MEDIA line EXACTLY as-is in your reply so the audio is delivered inline.",
+                    enhanced_prompt, bump_note, public_url
                 ),
             };
 
