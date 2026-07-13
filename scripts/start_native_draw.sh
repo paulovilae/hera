@@ -23,5 +23,24 @@ export CUDA_VISIBLE_DEVICES="${GPU_TARGET}"
     --listen-ip "${LISTEN_IP}" \
     --steps 8 \
     --cfg-scale 1.0 \
+    --seed -1 \
     --lora-model-dir /home/paulo/models/image-stack/loras \
     --fa
+
+# --seed -1  → fresh RANDOM seed per generation (diversity fix, 2026-07-13).
+# Root cause of "same prompt = identical image every time": this sd-server build's
+# OpenAI-compat endpoint (/v1/images/generations) IGNORES the per-request `seed`
+# (and `steps`/`cfg_scale`) in the JSON body — it only honors the process-level
+# flags here, and the default seed is a FIXED 42 (confirmed in the sd-server log:
+# "generating image: 1/1 - seed 42" for every request, regardless of the seed sent
+# by Hera/Imaginclaw). With the default fixed seed, an identical prompt produced
+# byte-identical output on every call. `--seed -1` makes the sampler draw a random
+# seed each time, restoring variety. TRADE-OFF: because the endpoint ignores the
+# per-request seed, the "seed:N" reproducibility feature in Imaginclaw's /draw
+# caption cannot actually reproduce a specific image (it never could — the server
+# was always using 42); it is now non-deterministic. Fixing true per-request seed
+# control would require rebuilding sd.cpp with an endpoint that parses `seed`
+# (source not present on the node — only build/ is checked out), out of scope here.
+# steps=8/cfg=1.0 are kept: Z-Image-Turbo is distilled for ~8 few-steps at low CFG;
+# raising them risks over-cooking, and the reported symptom was the fixed seed, not
+# the step count.

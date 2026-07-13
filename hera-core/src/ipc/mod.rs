@@ -25,6 +25,7 @@ pub mod handler_tools;
 pub mod helpers;
 pub mod inflight;
 pub mod llm_audit;
+pub mod media_safety;
 pub mod route_profiles;
 pub mod runtime_tools;
 pub mod types;

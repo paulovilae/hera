@@ -1,7 +1,46 @@
 //! Media tool executors: draw, animate_avatar, speak, video, review_image, generate_music.
 use crate::ai::tool_executor::{ToolCall, ToolResult};
+use crate::ipc::media_safety::{self, MediaRequestContext};
 use super::{hera_execution_agent, run_agent_via_hera_ipc};
 use tracing::info;
+
+/// Build a media-safety context for a tool-executor call. Identity/permissions
+/// come from the optional `_hera` metadata the dispatcher attaches; when absent
+/// they default to unknown/empty, which makes Tier B (NSFW) fail **closed**.
+fn tool_media_ctx(call: &ToolCall, prompt: &str) -> MediaRequestContext {
+    let hera = call.arguments.get("_hera");
+    let caller = hera
+        .and_then(|h| h.get("caller").or_else(|| h.get("app_name")).or_else(|| h.get("app")))
+        .and_then(|v| v.as_str())
+        .or_else(|| call.arguments.get("app").and_then(|v| v.as_str()))
+        .unwrap_or("unknown")
+        .to_string();
+    let permissions = hera
+        .and_then(|h| h.get("permissions"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let chat_id = hera
+        .and_then(|h| h.get("chat_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    MediaRequestContext {
+        media_kind: "image".to_string(),
+        requester_id: caller.clone(),
+        chat_id,
+        sender_name: String::new(),
+        channel: "tool".to_string(),
+        bot_name: caller,
+        permissions,
+        prompt_raw: prompt.to_string(),
+        prompt_final: prompt.to_string(),
+        seed: None,
+        engine: "sd.cpp".to_string(),
+        steps: None,
+        cfg_scale: None,
+    }
+}
 
 /// Music prompt enhancer — mirrors `handle_generate_video`'s "Phase 1: Brain" pattern
 /// (`ipc/handler_media.rs`), the only existing automatic LLM prompt-expansion in the
@@ -55,6 +94,25 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
         .and_then(|h| h.as_u64())
         .map(|h| h as u32);
 
+    // Content safety gate (same gate as the /draw IPC path — Tier A illegal is
+    // blocked unconditionally; Tier B NSFW needs `nsfw_allowed`, which is not
+    // usually forwarded to tool calls, so autonomous NSFW draws fail closed).
+    let media_ctx = tool_media_ctx(call, prompt);
+    let (decision, details) = media_safety::evaluate_gate_via_ipc(&media_ctx).await;
+    if decision.is_blocked() {
+        media_safety::record_media_generation(&media_ctx, &decision, details.as_ref(), None, "png");
+        tracing::warn!(
+            "🛡️ hera_draw tool blocked ({}) caller={}",
+            decision.audit_label(),
+            media_ctx.bot_name
+        );
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: decision.user_message(),
+        };
+    }
+
     let hera = hera_execution_agent();
     match hera
         .generate_image(
@@ -68,6 +126,9 @@ pub(crate) async fn execute_draw(call: &ToolCall) -> ToolResult {
                 .and_then(|u| u.as_str())
                 .unwrap_or("(no URL)");
             info!("🎨 [Hera] Image generated: {}", image_url);
+            // Audit the allowed generation (tool path writes the blob to the
+            // hera-web outputs dir; the row records prompt + identity + decision).
+            media_safety::record_media_generation(&media_ctx, &decision, details.as_ref(), None, "png");
 
             // Build a public URL that candle-core serves at /outputs/{filename}
             // The filename is the last segment of image_url (e.g., "/outputs/hera_drawn_UUID.png")
