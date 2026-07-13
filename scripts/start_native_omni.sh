@@ -67,8 +67,20 @@ echo "🧹 Releasing VRAM before native binding..."
 # Start Native Llama Server.
 # --split-mode none + --main-gpu 0 = Force ALL layers onto GPU 0 (24GB)
 # This keeps GPU 1 completely free for FLUX (12GB) + Wan2.1 video
-OMNI_KV_CACHE_TYPE_K="${IMAGINEOS_OMNI_KV_CACHE_TYPE_K:-q8_0}"
-OMNI_KV_CACHE_TYPE_V="${IMAGINEOS_OMNI_KV_CACHE_TYPE_V:-q8_0}"
+#
+# KV cache quant default FIXED 2026-07-13 (root cause of the 89-crash OOM
+# restart loop, see hera-llm-primary block in ecosystem.config.cjs): this
+# script has shipped q8_0/q8_0 since the flag was introduced (commit
+# 81c44024, 2026-06-30) -- but Hera/CLAUDE.md's "Context budget calibration"
+# note, written the SAME DAY, always documented the design as q4_0/q4_0
+# ("KV cache quantized q4_0/q4_0 to fit in 48 GB VRAM"). That was a doc/impl
+# mismatch from day one, not a later regression: q4_0 was never actually
+# applied. q8_0 KV at --ctx-size 131072 needs ~6528 MiB; q4_0 needs roughly
+# half that (measured ~3450-3550 MiB on this box), which is what restores
+# enough GPU0 headroom to run the full calibrated 131072 context instead of
+# the emergency-patched 65536. Do not silently drop this back to q8_0.
+OMNI_KV_CACHE_TYPE_K="${IMAGINEOS_OMNI_KV_CACHE_TYPE_K:-q4_0}"
+OMNI_KV_CACHE_TYPE_V="${IMAGINEOS_OMNI_KV_CACHE_TYPE_V:-q4_0}"
 OMNI_ROPE_SCALING="${IMAGINEOS_OMNI_ROPE_SCALING:-}"
 OMNI_ROPE_SCALE="${IMAGINEOS_OMNI_ROPE_SCALE:-}"
 OMNI_YARN_ORIG_CTX="${IMAGINEOS_OMNI_YARN_ORIG_CTX:-}"
