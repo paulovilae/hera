@@ -35,6 +35,36 @@ const CODING_TOOLS_DISABLED_MSG: &str =
      glob_search/cargo_check/cargo_test (directly or via execute_tool for any Critical-risk \
      tool).";
 
+/// Resolve a caller-supplied path for the coding tools against the OS repo root.
+///
+/// External MCP clients (e.g. Claude Code) naturally pass **repo-relative** paths
+/// (`Hera/hera-core/src/...`) or omit the path entirely. But the underlying tool
+/// executor resolves those against the bridge process's cwd — which is `$HOME` on a
+/// node reached over SSH, not the repo. Repo-relative paths then "Failed to resolve
+/// parent directory" and empty paths silently search `$HOME` instead of the repo.
+///
+/// When `HERA_MCP_REPO_ROOT` is set, an empty path becomes the repo root and a
+/// relative path is joined onto it; absolute paths pass through untouched. Unset →
+/// original behavior (backwards compatible), so this only ever fixes the broken case.
+fn resolve_repo_path(path: &str) -> String {
+    let root = std::env::var("HERA_MCP_REPO_ROOT").unwrap_or_default();
+    if root.is_empty() {
+        return path.to_string();
+    }
+    if path.is_empty() {
+        return root;
+    }
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        std::path::Path::new(&root)
+            .join(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GenerateTextParams {
     #[schemars(description = "The user prompt to send to Hera")]
@@ -461,7 +491,7 @@ impl HeraMcp {
         let call = ToolCall {
             name: "edit_file".to_string(),
             arguments: json!({
-                "path": params.path,
+                "path": resolve_repo_path(&params.path),
                 "old_string": params.old_string,
                 "new_string": params.new_string,
                 "replace_all": params.replace_all.unwrap_or(false),
@@ -481,7 +511,7 @@ impl HeraMcp {
         let call = ToolCall {
             name: "write_file".to_string(),
             arguments: json!({
-                "path": params.path,
+                "path": resolve_repo_path(&params.path),
                 "content": params.content,
                 "_hera": {"caller": "external_mcp"},
             }),
@@ -500,7 +530,7 @@ impl HeraMcp {
             name: "grep_search".to_string(),
             arguments: json!({
                 "pattern": params.pattern,
-                "path": params.path.unwrap_or_default(),
+                "path": resolve_repo_path(&params.path.unwrap_or_default()),
                 "_hera": {"caller": "external_mcp"},
             }),
         };
@@ -518,7 +548,7 @@ impl HeraMcp {
             name: "glob_search".to_string(),
             arguments: json!({
                 "pattern": params.pattern,
-                "path": params.path.unwrap_or_default(),
+                "path": resolve_repo_path(&params.path.unwrap_or_default()),
                 "_hera": {"caller": "external_mcp"},
             }),
         };
@@ -533,7 +563,7 @@ impl HeraMcp {
             return CODING_TOOLS_DISABLED_MSG.to_string();
         }
         let mut arguments = json!({
-            "path": params.path,
+            "path": resolve_repo_path(&params.path),
             "_hera": {"caller": "external_mcp"},
         });
         if let Some(timeout_seconds) = params.timeout_seconds {
@@ -554,7 +584,7 @@ impl HeraMcp {
             return CODING_TOOLS_DISABLED_MSG.to_string();
         }
         let mut arguments = json!({
-            "path": params.path,
+            "path": resolve_repo_path(&params.path),
             "_hera": {"caller": "external_mcp"},
         });
         if let Some(timeout_seconds) = params.timeout_seconds {
