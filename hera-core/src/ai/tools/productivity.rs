@@ -559,6 +559,20 @@ try:
         count = int(sel_data[0])
         start = max(1, count - limit + 1)
         ids = [str(i).encode() for i in range(start, count + 1)]
+    elif criteria.upper().startswith('X-GM-RAW'):
+        # Gmail power-search: X-GM-RAW takes the raw Gmail query (e.g.
+        # 'from:x has:attachment newer_than:7d') as a SEPARATE, quoted arg.
+        # Passing it as one combined string makes imaplib emit a malformed
+        # SEARCH -> Gmail replies 'Unknown argument X-GM-RAW'. Only Gmail
+        # hosts support this extension; on other IMAP servers we return no
+        # match rather than a garbage literal TEXT search.
+        raw = criteria[len('X-GM-RAW'):].strip().strip('"')
+        if 'gmail' in host.lower():
+            _, data = mail.search(None, 'X-GM-RAW', '"%s"' % raw)
+            ids = data[0].split()
+            ids = ids[-limit:]
+        else:
+            ids = []
     else:
         _, data = mail.search(None, criteria)
         ids = data[0].split()
