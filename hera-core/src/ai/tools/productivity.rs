@@ -350,9 +350,13 @@ pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResul
     match memento_send("recall_recursive_context", payload).await {
         Ok(res) => {
             let mut parts: Vec<String> = Vec::new();
+            // Memento wraps everything under res["recursive_context"]
+            let ctx = res
+                .get("recursive_context")
+                .unwrap_or(&res);
 
             // Durable facts — highest signal, always shown
-            if let Some(facts) = res.get("durable_facts").and_then(|v| v.as_array()) {
+            if let Some(facts) = ctx.get("durable_facts").and_then(|v| v.as_array()) {
                 if !facts.is_empty() {
                     let lines: Vec<String> = facts
                         .iter()
@@ -375,7 +379,7 @@ pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResul
 
             // Recent events — shown for "full" and "recent"
             if focus != "decisions" {
-                if let Some(events) = res.get("recent_events").and_then(|v| v.as_array()) {
+                if let Some(events) = ctx.get("recent_events").and_then(|v| v.as_array()) {
                     let shown: Vec<String> = events
                         .iter()
                         .take(8)
@@ -397,7 +401,7 @@ pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResul
             // Session/project summaries — only for "full"
             if focus == "full" {
                 for key in &["project_summaries", "room_summaries", "session_summaries"] {
-                    if let Some(summaries) = res.get(key).and_then(|v| v.as_array()) {
+                    if let Some(summaries) = ctx.get(key).and_then(|v| v.as_array()) {
                         if let Some(latest) = summaries.last() {
                             if let Some(content) = latest.get("content").and_then(|v| v.as_str()) {
                                 let label = key.replace('_', " ");
