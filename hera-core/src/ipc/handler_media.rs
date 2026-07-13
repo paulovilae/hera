@@ -138,30 +138,41 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
         if let Some(seed) = request.payload.get("seed").and_then(|s| s.as_i64()) {
             payload["seed"] = serde_json::json!(seed);
         }
-        match client
-            .post(&draw_endpoint)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        if let Some(b64) = json["data"][0]["b64_json"].as_str() {
-                            format!("data:image/png;base64,{}", b64)
+        // imagineos-draw crash-restarts occasionally (GPU1 VRAM is tight — see
+        // project_gpu1_vae_cpu_fallback_queued memory): a crashed sd-server
+        // needs ~6-10s to reload the GGUF model before it accepts connections
+        // again. One retry after a short wait turns a transient crash-restart
+        // window into a slower request instead of a hard user-facing error.
+        let mut attempt = 0;
+        loop {
+            match client.post(&draw_endpoint).json(&payload).send().await {
+                Ok(resp) => {
+                    break if resp.status().is_success() {
+                        if let Ok(json) = resp.json::<serde_json::Value>().await {
+                            if let Some(b64) = json["data"][0]["b64_json"].as_str() {
+                                format!("data:image/png;base64,{}", b64)
+                            } else {
+                                "Error: Invalid response format from sd.cpp".to_string()
+                            }
                         } else {
-                            "Error: Invalid response format from sd.cpp".to_string()
+                            "Error: Failed to parse sd.cpp JSON response".to_string()
                         }
                     } else {
-                        "Error: Failed to parse sd.cpp JSON response".to_string()
-                    }
-                } else {
-                    format!("Error: sd.cpp returned status {}", resp.status())
+                        format!("Error: sd.cpp returned status {}", resp.status())
+                    };
                 }
-            }
-            Err(e) => {
-                tracing::error!("sd.cpp connection error: {}", e);
-                format!("Error connecting to Native Image Generator: {}", e)
+                Err(e) if attempt == 0 => {
+                    attempt += 1;
+                    tracing::warn!(
+                        "sd.cpp connection error (attempt {attempt}), retrying in 8s in case it's mid-restart: {}",
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                }
+                Err(e) => {
+                    tracing::error!("sd.cpp connection error after retry: {}", e);
+                    break format!("Error connecting to Native Image Generator: {}", e);
+                }
             }
         }
     }};
