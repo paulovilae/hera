@@ -11,7 +11,7 @@ pub struct RouteProfile {
     pub target_first_token_ms: Option<u64>,
 }
 
-const DEFAULT_PERSONA: &str = "/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md";
+const DEFAULT_PERSONA: &str = "/home/paulo/Programs/apps/OS/Agents/ava.md";
 
 const ROUTE_PROFILES: &[RouteProfile] = &[
     RouteProfile {
