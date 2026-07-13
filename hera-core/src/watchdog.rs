@@ -25,6 +25,17 @@ const TICK_INTERVAL_SECS: u64 = 60;
 const MAX_AUTO_RESTARTS: u32 = 3;
 /// PM2 ecosystem config used to re-register deleted bundle services
 const ECOSYSTEM_CONFIG: &str = "/home/paulo/Programs/apps/OS/ecosystem.config.cjs";
+/// Directory of admin-stop markers (one empty file per service name). A service
+/// with a marker present was intentionally taken offline by an operator (e.g.
+/// freeing VRAM) and must NOT be auto-healed just because pm2 reports it
+/// "stopped" — see `scripts/pm2_admin_stop.sh`. Lives outside /tmp so it
+/// survives reboots (pm2 resurrect restores the same "stopped" state).
+const ADMIN_STOPPED_DIR: &str = "/home/paulo/.pm2-admin-stopped";
+
+/// True if `name` has an admin-stop marker — the watchdog must leave it alone.
+fn is_admin_stopped(name: &str) -> bool {
+    std::path::Path::new(ADMIN_STOPPED_DIR).join(name).exists()
+}
 
 /// Ava bundle services that must always be registered in PM2.
 /// A rogue `pm2 delete` on any of these is auto-healed within one watchdog tick.
@@ -193,6 +204,12 @@ fn check_pm2_services(state: &mut WatchdogState, emergencies: &mut Vec<Emergency
             .and_then(|u| u.as_u64())
             .unwrap_or(0);
         let since_last_start_ms = now_ms.saturating_sub(pm_uptime);
+
+        // Admin-stopped services are intentionally offline (e.g. freeing VRAM
+        // for another GPU consumer) — never auto-heal these.
+        if is_admin_stopped(name) {
+            continue;
+        }
 
         // Detect crashed/errored/stopped services
         if status == "errored" || status == "stopped" {
