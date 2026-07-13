@@ -992,7 +992,7 @@ fn pick_account<'a>(configs: &'a [ImapCreds], account: &str) -> Option<&'a ImapC
 }
 
 static DRAFT_SCRIPT: &str = r#"
-import imaplib, ssl, os, time
+import imaplib, ssl, os, time, re
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 
@@ -1013,18 +1013,36 @@ msg['Subject'] = subject
 msg['Date'] = formatdate(localtime=True)
 msg['Message-ID'] = make_msgid()
 
+def find_drafts(mail):
+    # RFC 6154 special-use \Drafts flag is locale-independent; fall back to
+    # known Drafts folder names (EN + ES: Gmail localizes the folder).
+    typ, boxes = mail.list()
+    candidates = []
+    for line in boxes or []:
+        s = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
+        m = re.search(r'"([^"]+)"\s*$', s)
+        name = m.group(1) if m else None
+        if not name:
+            continue
+        if '\\Drafts' in s:
+            return name
+        candidates.append(name)
+    for pref in ['[Gmail]/Drafts', '[Gmail]/Borradores', 'Drafts', 'Borradores']:
+        if pref in candidates:
+            return pref
+    return None
+
 context = ssl.create_default_context()
 try:
     mail = imaplib.IMAP4_SSL(host, port, ssl_context=context)
     mail.login(user, passwd)
-    if not folder:
-        folder = '[Gmail]/Drafts' if 'gmail' in host.lower() else 'Drafts'
-    r = mail.append(folder, '\\Draft', imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+    target = folder or find_drafts(mail) or ('[Gmail]/Drafts' if 'gmail' in host.lower() else 'Drafts')
+    r = mail.append(target, '\\Draft', imaplib.Time2Internaldate(time.time()), msg.as_bytes())
     mail.logout()
     if r[0] == 'OK':
-        print(f"Draft saved to '{folder}' on {user}\nTo: {to or '(none)'}\nSubject: {subject}")
+        print(f"Draft saved to '{target}' on {user}\nTo: {to or '(none)'}\nSubject: {subject}")
     else:
-        print(f'ERROR appending draft: {r}')
+        print(f'ERROR appending draft to {target!r}: {r}')
 except Exception as e:
     print(f'ERROR: {e}')
 "#;
