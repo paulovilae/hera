@@ -32,6 +32,28 @@ fn video_url() -> String {
         .unwrap_or_else(|_| "http://100.106.2.79:8098".to_string())
 }
 
+/// Free VRAM (MiB) on the draw GPU, or None if nvidia-smi is unavailable
+/// (e.g. non-GPU node — callers should fail OPEN in that case, not block).
+fn draw_gpu_free_mib() -> Option<u64> {
+    let device = std::env::var("DRAW_ENGINE_CUDA_DEVICE").unwrap_or_else(|_| "1".to_string());
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits", "-i", &device])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse::<u64>().ok()
+}
+
+/// A cold LoRA load merges extra tensors on top of the base model + VAE compute
+/// buffer, needing headroom beyond the VAE's own ~3.7GB — confirmed 2026-07-13
+/// (project_gpu1_vae_cpu_fallback_queued memory): auto-injecting a LoRA when
+/// GPU1 was already tight crashed sd-server with a CUDA alloc OOM repeatedly,
+/// even with a retry. Below this threshold, skip auto-LoRA and generate plain
+/// rather than crash-loop imagineos-draw.
+const MIN_FREE_MIB_FOR_AUTO_LORA: u64 = 6000;
+
 /// Per-LoRA auto-injection weight from lora_weights.json (default 0.7 — 1.0 tends
 /// to over-cook and drop quality). Set per LoRA via the Telegram /lora_weight cmd.
 fn lora_weight(name: &str) -> f32 {
@@ -76,15 +98,26 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
             }
         }
 
-        // 2. Auto-inject remaining LoRAs, avoiding claimed triggers
-        for (lora_name, keywords) in triggers {
-            if !prompt_lower.contains(&format!("<lora:{}", lora_name.to_lowercase())) {
-                for keyword in keywords {
-                    let kw_lower = keyword.to_lowercase();
-                    if prompt_lower.contains(&kw_lower) && !claimed_keywords.contains(&kw_lower) {
-                        prompt.push_str(&format!(" <lora:{}:{:.2}>", lora_name, lora_weight(&lora_name)));
-                        claimed_keywords.insert(kw_lower);
-                        break;
+        // 2. Auto-inject remaining LoRAs, avoiding claimed triggers — but only
+        // if GPU1 has headroom for the cold-load spike (see MIN_FREE_MIB_FOR_AUTO_LORA).
+        let free_mib = draw_gpu_free_mib();
+        let has_lora_headroom = free_mib.map(|f| f >= MIN_FREE_MIB_FOR_AUTO_LORA).unwrap_or(true);
+        if !has_lora_headroom {
+            tracing::warn!(
+                "Skipping auto-LoRA injection — GPU1 free VRAM ({:?} MiB) below {}MiB safety margin, generating plain to avoid crash-looping imagineos-draw",
+                free_mib, MIN_FREE_MIB_FOR_AUTO_LORA
+            );
+        }
+        if has_lora_headroom {
+            for (lora_name, keywords) in triggers {
+                if !prompt_lower.contains(&format!("<lora:{}", lora_name.to_lowercase())) {
+                    for keyword in keywords {
+                        let kw_lower = keyword.to_lowercase();
+                        if prompt_lower.contains(&kw_lower) && !claimed_keywords.contains(&kw_lower) {
+                            prompt.push_str(&format!(" <lora:{}:{:.2}>", lora_name, lora_weight(&lora_name)));
+                            claimed_keywords.insert(kw_lower);
+                            break;
+                        }
                     }
                 }
             }
