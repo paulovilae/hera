@@ -274,6 +274,13 @@ async fn send_ipc_generate(params: &GenerateTextParams) -> String {
     }
     let permissions = json!(perms);
 
+    // Thread the Claude Code session ID through so hera_usage_events rows are
+    // attributable to the session that made the call. The MCP bridge process
+    // inherits CLAUDE_SESSION_ID from the Claude Code parent at startup; it is
+    // stable for the lifetime of the session, so every generate_text call within
+    // the same session gets the same value.
+    let claude_session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
+
     let mut inner = json!({
         "prompt": params.prompt,
         "persona_path": if params.persona_path.is_empty() { serde_json::Value::Null } else { json!(params.persona_path) },
@@ -284,6 +291,7 @@ async fn send_ipc_generate(params: &GenerateTextParams) -> String {
         // MCP callers explicitly request tools via permissions; prevent lightweight-mode
         // detection from silently disabling them for short prompts (e.g. "hola").
         "context_budget_mode": "standard",
+        "session_id": claude_session_id,
     });
 
     // JSON trap guard: text directives like "Responde SOLO con JSON" cause the model
