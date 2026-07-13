@@ -16,20 +16,20 @@ fn draw_model() -> String {
     std::env::var("HERA_DRAW_MODEL").unwrap_or_else(|_| "Z-Image Turbo".to_string())
 }
 
-/// Path to the sd.cpp CLI binary (same binary that backs imagineos-draw's
-/// sd-server, just invoked as a one-shot subprocess for video — video gen is
-/// slow/rare enough that a resident process isn't worth the VRAM it would
-/// hold idle). Override with HERA_SD_CLI_PATH.
-fn sd_cli_path() -> String {
-    std::env::var("HERA_SD_CLI_PATH")
-        .unwrap_or_else(|_| "/home/paulo/sd.cpp/build/bin/sd-cli".to_string())
-}
-
-/// Wan2.2 TI2V-5B GGUF weights dir (diffusion model + VAE + UMT5 text encoder).
-/// Override with HERA_VIDEO_MODEL_DIR.
-fn video_model_dir() -> String {
-    std::env::var("HERA_VIDEO_MODEL_DIR")
-        .unwrap_or_else(|_| "/home/paulo/models/video-stack/wan2.2".to_string())
+/// Base URL of the OPTIONAL video generation engine. Video runs ONLY on
+/// atlas's opportunistic GPU (same pattern as HERA_MUSIC_URL) — NEVER on
+/// genesis. Genesis's GPU1 is dedicated to the LLM/image/vision/STT
+/// pipeline; a prior design ran video as a local sd-cli subprocess here that
+/// stopped/restarted imagineos-draw to free VRAM (GPU-swap hack, live
+/// 2026-07-11..2026-07-13), which hammered imagineos-draw with hundreds of
+/// cold restarts and starved GPU1, causing 39-113s image-gen times and
+/// Argus VRAM-91% alerts (incident 2026-07-13, see feedback from Paulo — video
+/// was never supposed to move onto genesis). Override with HERA_VIDEO_URL.
+/// If atlas is offline or the video engine isn't deployed there yet, calls
+/// fail cleanly (see handle_generate_video) instead of touching genesis.
+fn video_url() -> String {
+    std::env::var("HERA_VIDEO_URL")
+        .unwrap_or_else(|_| "http://100.106.2.79:8098".to_string())
 }
 
 /// Per-LoRA auto-injection weight from lora_weights.json (default 0.7 — 1.0 tends
@@ -395,136 +395,63 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
         }
     };
 
-    // Phase 3: GPU Swap — Stop FLUX, generate video via sd-cli subprocess.
-    // (sd.cpp: same binary as imagineos-draw's sd-server, run one-shot with
-    // -M vid_gen instead of a resident Python/diffusers server — sidesteps
-    // the accelerate cpu-offload device-mismatch bug entirely. --vae-on-cpu
-    // is required: the VAE decode step needs ~11GB VRAM alongside the
-    // diffusion+t5 weights, which doesn't fit GPU1's shared ~9-12GB headroom
-    // next to GLiNER/whisper/vision — confirmed via standalone test 2026-07-11,
-    // decode falls back to CPU in ~225s instead of OOMing.)
-    tracing::info!("🔄 GPU Swap: Stopping FLUX to free VRAM for video generation...");
-    let _ = tokio::process::Command::new("pm2")
-        .args(["stop", "imagineos-draw"])
-        .output()
-        .await;
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
+    // Phase 3: Generate the video — ALWAYS via atlas's opportunistic GPU,
+    // NEVER on genesis (see video_url() doc comment for why). genesis's own
+    // GPU/pm2 processes are never touched here.
     let output_dir = "/tmp/imagineos-canvas";
     let _ = std::fs::create_dir_all(output_dir);
-    let video_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        .to_string();
-    // No trailing extension here — sd-cli always appends ".avi" to -o itself
-    // (MJPG AVI is hardcoded), so this base + ".avi" gives the real path.
-    let avi_path = format!("{}/video_{}", output_dir, video_id);
-    let mp4_path = format!("{}/video_{}.mp4", output_dir, video_id);
-    let model_dir = video_model_dir();
 
-    let mut anchor_path: Option<String> = None;
-    if let Some(ref b64_img) = anchor_image_b64 {
-        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_img) {
-            Ok(bytes) => {
-                let path = format!("{}/anchor_{}.png", output_dir, video_id);
-                if std::fs::write(&path, bytes).is_ok() {
-                    tracing::info!("📹 Anchor image written for I2V: {}", path);
-                    anchor_path = Some(path);
-                }
-            }
-            Err(e) => tracing::warn!("Failed to decode anchor image: {}", e),
-        }
-    }
+    tracing::info!("🎬 Requesting video from atlas video engine...");
+    let video_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .unwrap_or_default();
+    let video_payload = serde_json::json!({
+        "prompt": enhanced,
+        "image_base64": anchor_image_b64,
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+    });
 
-    let mut cmd = tokio::process::Command::new(sd_cli_path());
-    cmd.env("CUDA_VISIBLE_DEVICES", "1")
-        .arg("-M")
-        .arg("vid_gen")
-        .arg("--diffusion-model")
-        .arg(format!("{}/Wan2.2-TI2V-5B-Q6_K.gguf", model_dir))
-        .arg("--vae")
-        .arg(format!("{}/wan2.2_vae.safetensors", model_dir))
-        .arg("--t5xxl")
-        .arg(format!("{}/umt5-xxl-encoder-Q8_0.gguf", model_dir))
-        .arg("-p")
-        .arg(&enhanced)
-        .arg("--cfg-scale")
-        .arg("6.0")
-        .arg("--sampling-method")
-        .arg("euler")
-        .arg("-W")
-        .arg(width.to_string())
-        .arg("-H")
-        .arg(height.to_string())
-        .arg("--video-frames")
-        .arg(num_frames.to_string())
-        .arg("--flow-shift")
-        .arg("3.0")
-        .arg("--diffusion-fa")
-        .arg("--vae-on-cpu")
-        .arg("-o")
-        .arg(&avi_path);
-
-    if let Some(ref img) = anchor_path {
-        tracing::info!("📹 Using I2V pipeline (anchor image)");
-        cmd.arg("-i").arg(img);
-    } else {
-        tracing::info!("📹 Using T2V pipeline (no anchor image)");
-    }
-
-    tracing::info!("🎬 Running sd-cli video generation...");
-    // sd-cli always writes MJPG AVI and appends ".avi" to -o regardless of
-    // the extension given, so the real file is `avi_path` + ".avi".
-    let avi_actual_path = format!("{}.avi", avi_path);
-    let result_text = match cmd.kill_on_drop(true).output().await {
-        Ok(out) => {
-            if out.status.success() && std::path::Path::new(&avi_actual_path).exists() {
-                tracing::info!("✅ Video generated: {}", avi_actual_path);
-                // Transcode MJPG AVI → H.264 MP4 so browsers can play it.
-                let transcode = tokio::process::Command::new("ffmpeg")
-                    .args([
-                        "-y",
-                        "-i",
-                        &avi_actual_path,
-                        "-c:v",
-                        "libx264",
-                        "-pix_fmt",
-                        "yuv420p",
-                        &mp4_path,
-                    ])
-                    .output()
-                    .await;
-                let _ = std::fs::remove_file(&avi_actual_path);
-                match transcode {
-                    Ok(t) if t.status.success() && std::path::Path::new(&mp4_path).exists() => {
-                        mp4_path.clone()
+    let result_text = match video_client
+        .post(format!("{}/generate", video_url()))
+        .json(&video_payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(json) => match json.get("video_base64").and_then(|v| v.as_str()) {
+                Some(b64) => match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) {
+                    Ok(bytes) => {
+                        let video_id = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let mp4_path = format!("{}/video_{}.mp4", output_dir, video_id);
+                        match std::fs::write(&mp4_path, bytes) {
+                            Ok(_) => {
+                                tracing::info!("✅ Video generated: {}", mp4_path);
+                                mp4_path
+                            }
+                            Err(e) => format!("Error: failed to save video: {}", e),
+                        }
                     }
-                    Ok(t) => format!(
-                        "Error: ffmpeg transcode failed: {}",
-                        String::from_utf8_lossy(&t.stderr)
-                    ),
-                    Err(e) => format!("Error: ffmpeg unavailable: {}", e),
-                }
-            } else {
-                format!(
-                    "Error: sd-cli video generation failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )
-            }
-        }
+                    Err(e) => format!("Error: atlas video engine returned invalid video data: {}", e),
+                },
+                None => "Error: atlas video engine returned no video data".to_string(),
+            },
+            Err(e) => format!("Error: atlas video engine returned an unreadable response: {}", e),
+        },
+        Ok(resp) => format!(
+            "Error: video generation unavailable (atlas video engine returned HTTP {})",
+            resp.status()
+        ),
         Err(e) => {
-            tracing::error!("sd-cli subprocess error: {}", e);
-            format!("Error: sd-cli video engine unavailable: {}", e)
+            tracing::warn!("Video engine (atlas) unreachable: {}", e);
+            "Error: video generation unavailable — atlas's video engine is offline or not yet provisioned. Video is opportunistic capacity, not required for the rest of the platform.".to_string()
         }
     };
-
-    // GPU Swap: Restart FLUX after video generation
-    tracing::info!("🔄 GPU Swap: Restarting FLUX after video generation...");
-    let _ = tokio::process::Command::new("pm2")
-        .args(["start", "imagineos-draw"])
-        .output()
-        .await;
 
     HandlerOutcome::Result {
         result_text,
