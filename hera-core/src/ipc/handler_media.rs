@@ -78,6 +78,7 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
             };
         }
     };
+    let prompt_raw = prompt_val.to_string();
     let mut prompt = prompt_val.to_string();
 
     // --- Auto-LoRA Router ---
@@ -135,6 +136,45 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
         .and_then(|h| h.as_u64())
         .unwrap_or(768) as usize;
 
+    // ── Content safety gate + immutable audit (see ipc/media_safety.rs) ─────────
+    // Runs BEFORE any backend call, so it covers BOTH the flux and sd.cpp paths.
+    // Tier A (illegal) is blocked unconditionally — no permission bypasses it.
+    // Tier B (adult NSFW) requires the bot's explicit `nsfw_allowed` permission.
+    // Fail-closed: a translation/classifier outage blocks rather than passing an
+    // unclassified prompt. `super::helpers::canonicalize_user_id` fills identity
+    // if Imaginclaw didn't forward a sender_id.
+    let media_ctx = super::media_safety::MediaRequestContext::from_payload(
+        &request.payload,
+        "image",
+        &prompt_raw,
+        &prompt,
+        &draw_model(),
+    );
+    let (gate_decision, gate_details) =
+        super::media_safety::evaluate_gate_with_engine(&state.engine, &media_ctx).await;
+    if gate_decision.is_blocked() {
+        super::media_safety::record_media_generation(
+            &media_ctx,
+            &gate_decision,
+            gate_details.as_ref(),
+            None,
+            "png",
+        );
+        tracing::warn!(
+            "🛡️ /draw blocked ({}) requester={} bot={} channel={}",
+            gate_decision.audit_label(),
+            media_ctx.requester_id,
+            media_ctx.bot_name,
+            media_ctx.channel
+        );
+        return HandlerOutcome::Result {
+            result_text: gate_decision.user_message(),
+            origin: "media_gate".to_string(),
+            model: draw_model(),
+            tool_calls: None,
+        };
+    }
+
     let result_text = {
     #[cfg(feature = "local-llm")]
     if let Some(flux) = &state.flux_engine {
@@ -142,6 +182,13 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
             Ok(image_bytes) => {
                 use base64::{Engine as _, engine::general_purpose};
                 let b64 = general_purpose::STANDARD.encode(&image_bytes);
+                super::media_safety::record_media_generation(
+                    &media_ctx,
+                    &gate_decision,
+                    gate_details.as_ref(),
+                    Some(&image_bytes),
+                    "png",
+                );
                 return HandlerOutcome::Result {
                     result_text: format!("data:image/png;base64,{}", b64),
                     origin: "unknown".to_string(),
@@ -209,6 +256,22 @@ pub async fn handle_generate_image(request: &IpcPayload, state: &IpcState) -> Ha
             }
         }
     }};
+
+    // Audit the allowed generation with the real output bytes (decoded from the
+    // data URL). A failed backend call still records the attempt (no bytes).
+    let output_bytes = result_text
+        .strip_prefix("data:image/png;base64,")
+        .and_then(|b64| {
+            use base64::{Engine as _, engine::general_purpose};
+            general_purpose::STANDARD.decode(b64).ok()
+        });
+    super::media_safety::record_media_generation(
+        &media_ctx,
+        &gate_decision,
+        gate_details.as_ref(),
+        output_bytes.as_deref(),
+        "png",
+    );
 
     HandlerOutcome::Result {
         result_text,
@@ -316,6 +379,40 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
             };
         }
     };
+
+    // ── Content safety gate + audit (video) ────────────────────────────────────
+    // Same two-tier gate as /draw, on the user's raw prompt (before enhancement),
+    // so illegal video requests are blocked before any GPU work. Fail-closed.
+    let video_ctx = super::media_safety::MediaRequestContext::from_payload(
+        &request.payload,
+        "video",
+        prompt,
+        prompt,
+        "video-engine",
+    );
+    let (video_gate, video_gate_details) =
+        super::media_safety::evaluate_gate_with_engine(&state.engine, &video_ctx).await;
+    if video_gate.is_blocked() {
+        super::media_safety::record_media_generation(
+            &video_ctx,
+            &video_gate,
+            video_gate_details.as_ref(),
+            None,
+            "mp4",
+        );
+        tracing::warn!(
+            "🛡️ video blocked ({}) requester={} bot={}",
+            video_gate.audit_label(),
+            video_ctx.requester_id,
+            video_ctx.bot_name
+        );
+        return HandlerOutcome::Result {
+            result_text: video_gate.user_message(),
+            origin: "media_gate".to_string(),
+            model: String::new(),
+            tool_calls: None,
+        };
+    }
 
     // Phase 1: Brain — Enhance the prompt
     let enhance_prompt = format!(
@@ -496,6 +593,28 @@ pub async fn handle_generate_video(request: &IpcPayload, state: &IpcState) -> Ha
             "Error: video generation unavailable — atlas's video engine is offline or not yet provisioned. Video is opportunistic capacity, not required for the rest of the platform.".to_string()
         }
     };
+
+    // Audit the allowed video generation. Copy the mp4 into the audit store when
+    // the result is a real file path under a sane size cap (video files are large;
+    // above the cap we record the row without the blob).
+    const VIDEO_AUDIT_MAX_BYTES: u64 = 60 * 1024 * 1024;
+    let video_bytes = if (result_text.starts_with("/tmp/") || result_text.starts_with("/home/"))
+        && !result_text.starts_with("Error")
+    {
+        std::fs::metadata(&result_text)
+            .ok()
+            .filter(|m| m.len() <= VIDEO_AUDIT_MAX_BYTES)
+            .and_then(|_| std::fs::read(&result_text).ok())
+    } else {
+        None
+    };
+    super::media_safety::record_media_generation(
+        &video_ctx,
+        &video_gate,
+        video_gate_details.as_ref(),
+        video_bytes.as_deref(),
+        "mp4",
+    );
 
     HandlerOutcome::Result {
         result_text,
