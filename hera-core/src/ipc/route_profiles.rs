@@ -124,6 +124,24 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
         target_first_token_ms: None,
     },
     RouteProfile {
+        id: "claude_code",
+        app: "claude_code",
+        persona_path: DEFAULT_PERSONA,
+        // minimal = memory ON, tool schemas + db schema OFF, allow_tools=false.
+        // Claude Code calls generate_text for pure drafting / mechanical gen and
+        // has its OWN tools — injecting Hera's 90-tool schema (~28K) + a DB schema
+        // (~12K) was pure waste on every call (runtime telemetry flagged
+        // tool_schema_inflation + db_schema_inflation for app_id=claude_code).
+        // Callers that genuinely want Hera's tool loop pass route_profile
+        // "coding"/"heavy" or explicit permissions/context_budget_mode, which still
+        // escalate (parse_context_budget honours explicit modes; coding/heavy map to
+        // heavy), so this only trims the default pure-generation call.
+        default_context_budget_mode: "minimal",
+        prefer_stream: false,
+        target_p95_ms: 30_000,
+        target_first_token_ms: None,
+    },
+    RouteProfile {
         id: "default",
         app: "",
         persona_path: DEFAULT_PERSONA,

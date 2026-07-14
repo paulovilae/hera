@@ -831,7 +831,15 @@ pub fn parse_payload(payload: &serde_json::Value) -> ParsedPayload {
         context_budget_for_mode(route_profile.default_context_budget_mode, lightweight_mode)
     };
 
-    let persona_drift = persona_path != route_profile.persona_path;
+    // Persona drift is only a meaningful misconfiguration signal when a *dedicated*
+    // route profile expected a specific persona and the running persona differs.
+    // An app with no dedicated profile falls back to the catch-all "default" profile;
+    // a caller (e.g. an app bot or the Hera MCP) legitimately supplying its own
+    // persona_path there is NOT drift — flagging it filled the regression table with
+    // false positives (e.g. dccolombia → default profile, own persona) that masked
+    // real drift.
+    let persona_drift =
+        route_profile.id != "default" && persona_path != route_profile.persona_path;
     let required_tools: Vec<String> = payload
         .get("required_tools")
         .and_then(|v| v.as_array())
