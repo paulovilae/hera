@@ -281,13 +281,22 @@ async fn send_ipc_generate(params: &GenerateTextParams) -> String {
     // the same session gets the same value.
     let claude_session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
 
+    // Resolve effective app: caller-provided → HERA_MCP_DEFAULT_APP env fallback.
+    // This ensures all MCP calls from Claude Code are attributed even when the caller
+    // omits the app field (unattributed calls were ~25% of claude_code traffic).
+    let effective_app = if params.app.is_empty() {
+        std::env::var("HERA_MCP_DEFAULT_APP").unwrap_or_default()
+    } else {
+        params.app.clone()
+    };
+
     let mut inner = json!({
         "prompt": params.prompt,
         "persona_path": if params.persona_path.is_empty() { serde_json::Value::Null } else { json!(params.persona_path) },
         "max_tokens": params.max_tokens.unwrap_or(800),
         "temperature": params.temperature.unwrap_or(0.3),
         "permissions": permissions,
-        "app": params.app,
+        "app": effective_app,
         // MCP callers explicitly request tools via permissions; prevent lightweight-mode
         // detection from silently disabling them for short prompts (e.g. "hola").
         "context_budget_mode": "standard",
