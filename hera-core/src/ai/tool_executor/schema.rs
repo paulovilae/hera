@@ -383,6 +383,8 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
             | "storage_get_url"
             | "storage_put"
             | "read_email"
+            | "create_draft"
+            | "list_labels"
             | "reply_email"
             | "mark_read"
             | "move_email"

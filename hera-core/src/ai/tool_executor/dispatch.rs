@@ -248,6 +248,8 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "desktop_type" => platform::execute_desktop_type(call).await,
         "edit_app_theme" => platform::execute_edit_app_theme(call).await,
         "read_email" => productivity::execute_read_email(call).await,
+        "create_draft" => productivity::execute_create_draft(call).await,
+        "list_labels" => productivity::execute_list_labels(call).await,
         "reply_email" => email_imap::execute_reply_email(call).await,
         "mark_read" => email_imap::execute_mark_read(call).await,
         "move_email" => email_imap::execute_move_email(call).await,

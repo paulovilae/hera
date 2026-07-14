@@ -24,6 +24,7 @@ pub(crate) fn tool_risk_level(tool_name: &str) -> ToolRiskLevel {
         | "create_skill"
         | "execute_workflow"
         | "dispatch_email"
+        | "create_draft"
         | "bind_telegram_workspace"
         | "edit_app_theme"
         | "git_add"

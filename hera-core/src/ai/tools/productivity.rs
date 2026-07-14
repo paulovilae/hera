@@ -350,9 +350,13 @@ pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResul
     match memento_send("recall_recursive_context", payload).await {
         Ok(res) => {
             let mut parts: Vec<String> = Vec::new();
+            // Memento wraps everything under res["recursive_context"]
+            let ctx = res
+                .get("recursive_context")
+                .unwrap_or(&res);
 
             // Durable facts — highest signal, always shown
-            if let Some(facts) = res.get("durable_facts").and_then(|v| v.as_array()) {
+            if let Some(facts) = ctx.get("durable_facts").and_then(|v| v.as_array()) {
                 if !facts.is_empty() {
                     let lines: Vec<String> = facts
                         .iter()
@@ -375,7 +379,7 @@ pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResul
 
             // Recent events — shown for "full" and "recent"
             if focus != "decisions" {
-                if let Some(events) = res.get("recent_events").and_then(|v| v.as_array()) {
+                if let Some(events) = ctx.get("recent_events").and_then(|v| v.as_array()) {
                     let shown: Vec<String> = events
                         .iter()
                         .take(8)
@@ -397,7 +401,7 @@ pub(crate) async fn execute_recall_session_context(call: &ToolCall) -> ToolResul
             // Session/project summaries — only for "full"
             if focus == "full" {
                 for key in &["project_summaries", "room_summaries", "session_summaries"] {
-                    if let Some(summaries) = res.get(key).and_then(|v| v.as_array()) {
+                    if let Some(summaries) = ctx.get(key).and_then(|v| v.as_array()) {
                         if let Some(latest) = summaries.last() {
                             if let Some(content) = latest.get("content").and_then(|v| v.as_str()) {
                                 let label = key.replace('_', " ");
@@ -559,6 +563,20 @@ try:
         count = int(sel_data[0])
         start = max(1, count - limit + 1)
         ids = [str(i).encode() for i in range(start, count + 1)]
+    elif criteria.upper().startswith('X-GM-RAW'):
+        # Gmail power-search: X-GM-RAW takes the raw Gmail query (e.g.
+        # 'from:x has:attachment newer_than:7d') as a SEPARATE, quoted arg.
+        # Passing it as one combined string makes imaplib emit a malformed
+        # SEARCH -> Gmail replies 'Unknown argument X-GM-RAW'. Only Gmail
+        # hosts support this extension; on other IMAP servers we return no
+        # match rather than a garbage literal TEXT search.
+        raw = criteria[len('X-GM-RAW'):].strip().strip('"')
+        if 'gmail' in host.lower():
+            _, data = mail.search(None, 'X-GM-RAW', '"%s"' % raw)
+            ids = data[0].split()
+            ids = ids[-limit:]
+        else:
+            ids = []
     else:
         _, data = mail.search(None, criteria)
         ids = data[0].split()
@@ -964,6 +982,192 @@ pub(crate) async fn execute_read_notes(call: &ToolCall) -> ToolResult {
 }
 
 // ─── Python execution helper ──────────────────────────────────────────────
+
+/// Pick an IMAP account by label/username substring, or the primary (first) when
+/// `account` is empty. Returns None if an explicit account was requested but not found.
+fn pick_account<'a>(configs: &'a [ImapCreds], account: &str) -> Option<&'a ImapCreds> {
+    if account.trim().is_empty() {
+        return configs.first();
+    }
+    let a = account.to_lowercase();
+    configs
+        .iter()
+        .find(|c| c.label.to_lowercase().contains(&a) || c.username.to_lowercase().contains(&a))
+}
+
+static DRAFT_SCRIPT: &str = r#"
+import imaplib, ssl, os, time, re
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
+
+host   = os.environ['IMAP_HOST']
+port   = int(os.environ.get('IMAP_PORT', '993'))
+user   = os.environ['IMAP_USER']
+passwd = os.environ['IMAP_PASS']
+to      = os.environ.get('DRAFT_TO', '')
+subject = os.environ.get('DRAFT_SUBJECT', '')
+body    = os.environ.get('DRAFT_BODY', '')
+folder  = os.environ.get('DRAFT_FOLDER', '').strip()
+
+msg = MIMEText(body, 'plain', 'utf-8')
+msg['From'] = user
+if to:
+    msg['To'] = to
+msg['Subject'] = subject
+msg['Date'] = formatdate(localtime=True)
+msg['Message-ID'] = make_msgid()
+
+def find_drafts(mail):
+    # RFC 6154 special-use \Drafts flag is locale-independent; fall back to
+    # known Drafts folder names (EN + ES: Gmail localizes the folder).
+    typ, boxes = mail.list()
+    candidates = []
+    for line in boxes or []:
+        s = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
+        m = re.search(r'"([^"]+)"\s*$', s)
+        name = m.group(1) if m else None
+        if not name:
+            continue
+        if '\\Drafts' in s:
+            return name
+        candidates.append(name)
+    for pref in ['[Gmail]/Drafts', '[Gmail]/Borradores', 'Drafts', 'Borradores']:
+        if pref in candidates:
+            return pref
+    return None
+
+context = ssl.create_default_context()
+try:
+    mail = imaplib.IMAP4_SSL(host, port, ssl_context=context)
+    mail.login(user, passwd)
+    target = folder or find_drafts(mail) or ('[Gmail]/Drafts' if 'gmail' in host.lower() else 'Drafts')
+    r = mail.append(target, '\\Draft', imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+    mail.logout()
+    if r[0] == 'OK':
+        print(f"Draft saved to '{target}' on {user}\nTo: {to or '(none)'}\nSubject: {subject}")
+    else:
+        print(f'ERROR appending draft to {target!r}: {r}')
+except Exception as e:
+    print(f'ERROR: {e}')
+"#;
+
+static LABELS_SCRIPT: &str = r#"
+import imaplib, ssl, os, re
+
+host   = os.environ['IMAP_HOST']
+port   = int(os.environ.get('IMAP_PORT', '993'))
+user   = os.environ['IMAP_USER']
+passwd = os.environ['IMAP_PASS']
+source = os.environ.get('IMAP_SOURCE', '')
+
+context = ssl.create_default_context()
+try:
+    mail = imaplib.IMAP4_SSL(host, port, ssl_context=context)
+    mail.login(user, passwd)
+    typ, data = mail.list()
+    mail.logout()
+    names = []
+    for line in data or []:
+        if isinstance(line, bytes):
+            s = line.decode('utf-8', errors='replace')
+            m = re.search(r'"([^"]+)"\s*$', s)
+            names.append(m.group(1) if m else s.rsplit(' ', 1)[-1])
+    hdr = f"Labels/folders on {source or user}:" if (source or user) else 'Labels/folders:'
+    print(hdr + '\n' + ('\n'.join(names) if names else '(none)'))
+except Exception as e:
+    print(f'ERROR [{source}]: {e}')
+"#;
+
+/// `create_draft` — save an email draft to the account's Drafts folder via IMAP APPEND.
+/// Sovereign (no send): the draft lands in Gmail/IMAP Drafts for the user to review + send.
+pub(crate) async fn execute_create_draft(call: &ToolCall) -> ToolResult {
+    let to = call.arguments.get("to").and_then(|v| v.as_str()).unwrap_or("");
+    let subject = call.arguments.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+    let body = call.arguments.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let account = call.arguments.get("account").and_then(|v| v.as_str()).unwrap_or("");
+    let folder = call.arguments.get("folder").and_then(|v| v.as_str()).unwrap_or("");
+
+    if subject.is_empty() || body.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: "Missing required fields: subject and body are required".to_string(),
+        };
+    }
+
+    let configs = discover_imap_configs();
+    let Some(creds) = pick_account(&configs, account) else {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: if account.is_empty() {
+                format!("No IMAP account configured. Set up {}/imap.conf.", IMAP_SECRETS_DIR)
+            } else {
+                format!("No IMAP account matching '{}'. Available: {}", account,
+                    configs.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", "))
+            },
+        };
+    };
+
+    info!("📧 [Productivity] Creating draft on {}", creds.label);
+    run_python_with_env(
+        &call.name,
+        DRAFT_SCRIPT,
+        &[
+            ("IMAP_HOST", creds.host.as_str()),
+            ("IMAP_PORT", &creds.port.to_string()),
+            ("IMAP_USER", creds.username.as_str()),
+            ("IMAP_PASS", creds.password.as_str()),
+            ("DRAFT_TO", to),
+            ("DRAFT_SUBJECT", subject),
+            ("DRAFT_BODY", body),
+            ("DRAFT_FOLDER", folder),
+        ],
+    )
+    .await
+}
+
+async fn list_labels_for(tool_name: &str, creds: &ImapCreds) -> String {
+    let port = creds.port.to_string();
+    run_python_with_env(
+        tool_name,
+        LABELS_SCRIPT,
+        &[
+            ("IMAP_HOST", creds.host.as_str()),
+            ("IMAP_PORT", port.as_str()),
+            ("IMAP_USER", creds.username.as_str()),
+            ("IMAP_PASS", creds.password.as_str()),
+            ("IMAP_SOURCE", creds.label.as_str()),
+        ],
+    )
+    .await
+    .output
+}
+
+/// `list_labels` — list mailbox folders / Gmail labels via IMAP LIST, for every inbox.
+pub(crate) async fn execute_list_labels(call: &ToolCall) -> ToolResult {
+    let configs = discover_imap_configs();
+    if configs.is_empty() {
+        return ToolResult {
+            name: call.name.clone(),
+            success: false,
+            output: format!("No IMAP account configured. Set up {}/imap.conf.", IMAP_SECRETS_DIR),
+        };
+    }
+
+    let fetches: Vec<_> = configs
+        .iter()
+        .map(|c| list_labels_for(&call.name, c))
+        .collect();
+    let outputs = futures_util::future::join_all(fetches).await;
+    let parts: Vec<String> = outputs.into_iter().filter(|s| !s.is_empty()).collect();
+
+    ToolResult {
+        name: call.name.clone(),
+        success: true,
+        output: parts.join("\n\n"),
+    }
+}
 
 pub(crate) async fn run_python_with_env(tool_name: &str, script: &str, env: &[(&str, &str)]) -> ToolResult {
     let mut cmd = tokio::process::Command::new("python3");

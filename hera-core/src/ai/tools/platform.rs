@@ -750,7 +750,7 @@ pub(crate) async fn execute_update_soul(call: &ToolCall) -> ToolResult {
     }
 
     let soul_path = std::env::var("HERA_SOUL_PATH").unwrap_or_else(|_| {
-        "/home/paulo/Programs/apps/imaginos/imaginclaw/persona/SOUL.md".to_string()
+        "/home/paulo/Programs/apps/OS/Agents/ava.md".to_string()
     });
 
     match std::fs::write(&soul_path, new_soul_content) {
