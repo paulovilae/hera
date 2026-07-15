@@ -256,6 +256,18 @@ impl Hera {
         Ok(description)
     }
 
+    /// Generates an image via the sovereign sd.cpp backend (`sd-server`,
+    /// Z-Image-Turbo on genesis :8999, OpenAI-compatible `/v1/images/generations`).
+    ///
+    /// The legacy SwarmUI/Automatic1111 endpoints (`/sdapi/v1/txt2img`,
+    /// `/sdapi/v1/img2img`) are gone from the current backend — it exposes only
+    /// the OpenAI-compat image route, mirroring `Hera/hera-core/src/ipc/handler_media.rs`
+    /// (the already-migrated `/draw` chat path). `sd-server` does not implement
+    /// an img2img/edits endpoint today (confirmed live: `/v1/images/edits` → 404),
+    /// so `init_image` is used only to derive a text prompt via vision
+    /// (`describe_sketch`), not posted as pixel data. `model`/`loras`/`denoising_strength`
+    /// are accepted for signature compatibility with callers but are not
+    /// forwardable to this single-checkpoint backend.
     pub async fn generate_image(
         &self,
         prompt: &str,
@@ -263,10 +275,10 @@ impl Hera {
         width: Option<u32>,
         height: Option<u32>,
         steps: Option<u32>,
-        model: Option<&str>,
-        loras: Option<&Vec<serde_json::Value>>,
+        _model: Option<&str>,
+        _loras: Option<&Vec<serde_json::Value>>,
         init_image: Option<&str>,
-        denoising_strength: Option<f32>,
+        _denoising_strength: Option<f32>,
         cfg_scale: Option<f32>,
         _nsfw: Option<bool>,
     ) -> Result<serde_json::Value> {
@@ -284,42 +296,25 @@ impl Hera {
         };
         let w = width.unwrap_or(512);
         let h = height.unwrap_or(512);
-        let use_img2img = init_image.is_some();
-        let endpoint = if use_img2img {
-            format!("{}/sdapi/v1/img2img", self.draw_url)
-        } else {
-            format!("{}/sdapi/v1/txt2img", self.draw_url)
-        };
+        let endpoint = format!("{}/v1/images/generations", self.draw_url);
 
+        // sd.cpp (OpenAI-compat) reads "size" ("WxH"); width/height alone are
+        // ignored (falls back to a 512x512 square) — same gotcha handler_media.rs
+        // documents for the chat /draw path.
         let mut payload = json!({
             "prompt": effective_prompt,
             "width": w,
             "height": h,
+            "size": format!("{w}x{h}"),
+            "response_format": "b64_json",
             "seed": rand::random::<u32>()
         });
 
         if let Some(s) = steps {
-            payload.as_object_mut().unwrap().insert("steps".to_string(), json!(s));
-        }
-        if let Some(m) = model {
-            payload.as_object_mut().unwrap().insert("override_settings".to_string(), json!({
-                "sd_model_checkpoint": m
-            }));
-        }
-        if let Some(lora_list) = loras {
-            if !lora_list.is_empty() {
-                payload.as_object_mut().unwrap().insert("loras".to_string(), json!(lora_list));
-            }
+            payload.as_object_mut().unwrap().insert("sample_steps".to_string(), json!(s));
         }
         if let Some(cfg) = cfg_scale {
             payload.as_object_mut().unwrap().insert("cfg_scale".to_string(), json!(cfg));
-        }
-        if let Some(img) = init_image {
-            payload.as_object_mut().unwrap().insert("init_images".to_string(), json!([img]));
-            payload.as_object_mut().unwrap().insert(
-                "denoising_strength".to_string(),
-                json!(denoising_strength.unwrap_or(0.65)),
-            );
         }
 
         let res = self.http_client.post(&endpoint)
@@ -330,14 +325,16 @@ impl Hera {
 
         if !res.status().is_success() {
             let error_text = res.text().await?;
-            return Err(anyhow!("SwarmUI Generation Failed: {}", error_text));
+            return Err(anyhow!("Native Image Generator failed: {}", error_text));
         }
 
         let result_json: serde_json::Value = res.json().await?;
-        let b64_result = result_json.get("images")
-            .and_then(|images| images.as_array())
+        let b64_result = result_json
+            .get("data")
+            .and_then(|data| data.as_array())
             .and_then(|arr| arr.first())
-            .and_then(|img| img.as_str())
+            .and_then(|item| item.get("b64_json"))
+            .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
         if let Some(b64) = b64_result {
@@ -363,7 +360,7 @@ impl Hera {
             }));
         }
 
-        Err(anyhow!("Invalid response format from SwarmUI"))
+        Err(anyhow!("Invalid response format from Native Image Generator (expected data[0].b64_json)"))
     }
 
     pub async fn synthesize_speech(&self, text: &str, voice: Option<&str>) -> Result<serde_json::Value> {
