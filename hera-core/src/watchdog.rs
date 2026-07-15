@@ -541,7 +541,7 @@ async fn purge_audit_log() {
         // "password authentication failed" repitiendo cada minuto en este watchdog).
         let pw = std::fs::read_to_string("/home/paulo/.config/imagineos/secrets/postgres-password")
             .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "imaginos_secure_2026".to_string());
+            .unwrap_or_default();
         format!("postgresql://imaginos:{pw}@127.0.0.1:5432/os_core_db")
     });
 
