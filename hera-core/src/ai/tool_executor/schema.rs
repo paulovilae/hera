@@ -380,6 +380,7 @@ fn is_platform_tool_name(tool_name: &str) -> bool {
             | "geocode"
             | "reverse_geocode"
             | "browser_action"
+            | "escalate_to_cloud_agent"
             | "storage_list"
             | "storage_get_url"
             | "storage_put"

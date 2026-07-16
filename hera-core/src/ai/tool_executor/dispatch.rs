@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use crate::ai::tools::{
     apps_construvendo, apps_latinos, apps_movilo, apps_shop, apps_vetra, brand_studio, browser,
-    build_feedback, code_graph, coding, data, deploy, email_imap, geo, infra_health, infra_smoke,
-    mission_control, platform, productivity, storage,
+    build_feedback, cloud_escalation, code_graph, coding, data, deploy, email_imap, geo,
+    infra_health, infra_smoke, mission_control, platform, productivity, storage,
 };
 
 use super::{ToolCall, ToolResult, ToolRiskLevel};
@@ -218,6 +218,9 @@ async fn dispatch_platform_tool(call: &ToolCall) -> Option<ToolResult> {
         "geocode" => geo::execute_geocode(call).await,
         "reverse_geocode" => geo::execute_reverse_geocode(call).await,
         "browser_action" => browser::execute_browser_action(call).await,
+        "escalate_to_cloud_agent" => {
+            cloud_escalation::execute_escalate_to_cloud_agent(call).await
+        }
         "storage_list" => storage::execute_storage_list(call).await,
         "storage_get_url" => storage::execute_storage_get_url(call).await,
         "storage_put" => storage::execute_storage_put(call).await,

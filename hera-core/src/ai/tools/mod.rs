@@ -11,6 +11,7 @@ pub mod apps_vetra;
 pub mod brand_studio;
 pub mod browser;
 pub mod build_feedback;
+pub mod cloud_escalation;
 pub mod code_graph;
 pub mod coding;
 pub mod data;
