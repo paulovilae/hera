@@ -19,7 +19,17 @@ async fn memento_send(action: &str, payload: Value) -> Result<Value, String> {
         .await
         .map_err(|e| format!("Memento not running: {}", e))?;
 
-    let msg = serde_json::json!({ "action": action, "payload": payload });
+    // "client" tags this call as caller=hera (matches ipc/helpers.rs::memento_request) —
+    // without it, this traffic logs as client="<anonymous>" in Memento, indistinguishable
+    // from real orphaned calls when auditing usage (found 2026-07-16).
+    let msg = serde_json::json!({
+        "action": action,
+        "payload": payload,
+        "client": {
+            "app": "hera",
+            "token": std::env::var("MEMENTO_CLIENT_TOKEN").ok()
+        }
+    });
     stream
         .write_all(msg.to_string().as_bytes())
         .await
