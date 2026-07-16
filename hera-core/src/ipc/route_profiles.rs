@@ -112,6 +112,22 @@ const ROUTE_PROFILES: &[RouteProfile] = &[
         target_first_token_ms: None,
     },
     RouteProfile {
+        id: "ava",
+        app: "ava",
+        persona_path: DEFAULT_PERSONA,
+        // heavy = full tools + schema + memory; allow_tools=true so the agentic
+        // loop engages. Ava (operator-only, Telegram+WhatsApp) was fused with
+        // AvaCoder's toolset 2026-07-16 (bots.toml now grants edit_file/
+        // grep_search/cargo_*) so Paulo has one bot that both chats and makes
+        // real repo edits. Without this entry `profile_for_app("ava")` fell
+        // through to "default" (standard budget, no agentic loop) and the
+        // coding tools listed in bots.toml were silently inert.
+        default_context_budget_mode: "heavy",
+        prefer_stream: false,
+        target_p95_ms: 120_000,
+        target_first_token_ms: None,
+    },
+    RouteProfile {
         id: "heavy",
         app: "",
         persona_path: DEFAULT_PERSONA,
