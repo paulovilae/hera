@@ -122,10 +122,17 @@ pub(crate) async fn execute_save_memory(call: &ToolCall) -> ToolResult {
 
     let expires_at = call.arguments.get("expires_at").cloned();
 
+    let expert_id = call
+        .arguments
+        .get("expert_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ava")
+        .to_string();
+
     let mut payload = serde_json::json!({
         "user_id": "paulo",
-        "app_id": "ava",
-        "expert_id": "ava",
+        "app_id": expert_id,
+        "expert_id": expert_id,
         "content": content,
         "memory_type": memory_type,
         "entry_title": entry_title,
