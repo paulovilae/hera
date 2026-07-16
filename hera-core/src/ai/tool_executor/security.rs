@@ -148,6 +148,60 @@ pub(crate) fn audit_tool_execution(
     {
         let _ = writeln!(file, "{}", record);
     }
+
+    let mirror_record = record;
+    std::thread::spawn(move || mirror_tool_audit_to_memento(&mirror_record));
+}
+
+/// Best-effort mirror of a tool-execution audit record into Memento's central
+/// `audit_log` — previously only written to the local HERA_TOOL_AUDIT_LOG file,
+/// invisible to any cross-service audit query. Fire-and-forget on its own OS
+/// thread (this fn is sync, called from the async dispatch hot path) so a slow
+/// or down Memento never adds latency to tool execution.
+fn mirror_tool_audit_to_memento(record: &serde_json::Value) {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let Ok(mut stream) = UnixStream::connect("/tmp/memento.sock") else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+
+    let tool = record.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown_tool");
+    let caller = record.get("caller").and_then(|v| v.as_str()).unwrap_or("hera");
+    let success = record.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let risk = record.get("risk_level").and_then(|v| v.as_str()).unwrap_or("low");
+    let sensitive_action = if !success || risk == "critical" {
+        Some(
+            record
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| risk.to_string()),
+        )
+    } else {
+        None
+    };
+
+    let message = serde_json::json!({
+        "action": "audit_log",
+        "client": { "app": "hera" },
+        "payload": {
+            "actor": "hera",
+            "expert_identity": caller,
+            "capability_used": tool,
+            "sensitive_action": sensitive_action,
+            "mutation_description": format!("tool_call {} success={}", tool, success),
+            "trace_payload": record,
+        },
+    });
+    let bytes = message.to_string();
+    if stream.write_all(bytes.as_bytes()).is_ok() {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+    }
 }
 
 pub fn permissions_allow_tool(permissions: &[String], tool_name: &str) -> bool {
