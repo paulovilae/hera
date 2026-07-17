@@ -201,6 +201,11 @@ struct ListToolSchemasParams {
     )]
     #[serde(default)]
     tool_name: Option<String>,
+    #[schemars(
+        description = "When true and tool_name is set, returns just {name, description} for that one tool instead of its full JSON parameter schema (cheaper — use when you only need to confirm the tool exists / read its one-line description). Has no effect when tool_name is omitted, since that case is already compact by default. Defaults to false."
+    )]
+    #[serde(default)]
+    summary: bool,
 }
 
 fn default_agent_name() -> String {
@@ -615,7 +620,7 @@ impl HeraMcp {
     }
 
     #[tool(
-        description = "List Hera tools available for a given external agent identity and permission scope. Without tool_name: a compact {name, description} summary for every available tool (small, fast). With tool_name: the full JSON schema for just that one tool."
+        description = "List Hera tools available for a given external agent identity and permission scope. Without tool_name: a compact {name, description} summary for every available tool (small, fast) — call this first to check what capabilities exist before assuming Hera can't do something. With tool_name: the full JSON schema for just that one tool; pass summary=true alongside tool_name for a compact {name, description} of just that tool instead of its full JSON schema."
     )]
     async fn list_tool_schemas(
         &self,
@@ -635,6 +640,13 @@ impl HeraMcp {
                     tool.pointer("/function/name").and_then(|v| v.as_str()) == Some(name)
                 });
                 match found {
+                    Some(schema) if params.summary => {
+                        let compact = json!({
+                            "name": schema.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or(""),
+                            "description": schema.pointer("/function/description").and_then(|v| v.as_str()).unwrap_or(""),
+                        });
+                        serde_json::to_string_pretty(&compact).unwrap_or_default()
+                    }
                     Some(schema) => {
                         serde_json::to_string_pretty(schema).unwrap_or_default()
                     }
