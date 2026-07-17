@@ -723,12 +723,25 @@ pub async fn handle_generate(
                 append_llm_audit_event(&outcome.audit_event);
                 let _ = record_runtime_observation(outcome.observation_payload).await;
                 inflight::remove(&parsed.trace_id);
-                return HandlerOutcome::Result {
-                    result_text: format!("Error: {}", error_text),
-                    origin: "offline".to_string(),
-                    model: String::new(),
-                    tool_calls: None,
+                // BUG (found 2026-07-16, Latinos Oportunidades leaking raw text to
+                // end users): this used to return HandlerOutcome::Result with
+                // status "success" and a "Error: ..." result_text — every caller of
+                // os-hera-ipc-kit::delegate_to_hera checks ONLY resp.status ==
+                // "success" to decide Ok/Err, so an inference failure was silently
+                // indistinguishable from a real answer and got stored/rendered
+                // verbatim platform-wide. Send a proper error envelope instead so
+                // callers hit their existing Err(...) fallback paths.
+                let err_response = IpcResponse {
+                    status: "error".to_string(),
+                    data: serde_json::json!({ "error": error_text }),
                 };
+                if let Ok(mut res_str) = serde_json::to_string(&err_response) {
+                    res_str.push('\n');
+                    if let Err(e) = stream.write_all(res_str.as_bytes()).await {
+                        tracing::error!("❌ Failed to write IPC error response: {}", e);
+                    }
+                }
+                return HandlerOutcome::DirectResponse;
             }
         }
     }
