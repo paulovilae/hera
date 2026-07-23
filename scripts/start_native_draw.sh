@@ -25,6 +25,7 @@ export CUDA_VISIBLE_DEVICES="${GPU_TARGET}"
     --cfg-scale 1.0 \
     --seed -1 \
     --lora-model-dir /home/paulo/models/image-stack/loras \
+    --vae-tiling \
     --fa
 
 # --seed -1  → fresh RANDOM seed per generation (diversity fix, 2026-07-13).
@@ -44,3 +45,10 @@ export CUDA_VISIBLE_DEVICES="${GPU_TARGET}"
 # steps=8/cfg=1.0 are kept: Z-Image-Turbo is distilled for ~8 few-steps at low CFG;
 # raising them risks over-cooking, and the reported symptom was the fixed seed, not
 # the step count.
+#
+# --vae-tiling (added 2026-07-22): GPU1 free VRAM shrank to ~3.5GB (llama-server +
+# hera-core + qwen3-tts + stt-whisper sharing the card) — the untiled VAE decode
+# buffer needs 3744MiB, ~170MB short, causing cudaMalloc OOM -> segfault -> pm2
+# crash-loop (626 restarts) on every real 768x768 request (Hera's default size;
+# small 384x384 test requests happened to fit and masked the bug). Tiled decode
+# processes the VAE in chunks, cutting the compute buffer well under the margin.
