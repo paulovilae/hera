@@ -8,7 +8,7 @@
 # Default ENV values if Argus orchestration isn't explicitly providing them
 GPU_TARGET="${DRAW_ENGINE_CUDA_DEVICE:-1}"
 LISTEN_PORT="${DRAW_ENGINE_PORT:-8999}"
-LISTEN_IP="${DRAW_ENGINE_LISTEN_IP:-127.0.0.1}"
+LISTEN_IP="${DRAW_ENGINE_LISTEN_IP:-0.0.0.0}"
 
 echo "Starting ImagineOS Native Draw Engine (Z-Image-Turbo) on GPU ${GPU_TARGET} at port ${LISTEN_PORT}..."
 
@@ -52,3 +52,12 @@ export CUDA_VISIBLE_DEVICES="${GPU_TARGET}"
 # crash-loop (626 restarts) on every real 768x768 request (Hera's default size;
 # small 384x384 test requests happened to fit and masked the bug). Tiled decode
 # processes the VAE in chunks, cutting the compute buffer well under the margin.
+#
+# LISTEN_IP default 127.0.0.1 -> 0.0.0.0 (added 2026-07-22): Imaginclaw/hera-core
+# run on ANCHOR, not genesis (anchor.ecosystem.config.cjs sets HERA_DRAW_URL to
+# the WireGuard mesh IP http://10.100.0.2:8999, genesis's wg0 address). Binding
+# only to loopback meant anchor could never reach this service at all — every
+# request failed with a connection error regardless of GPU/OOM health, and
+# curl tests run locally on genesis (127.0.0.1) always looked fine and masked
+# it. Same pattern as qwen3-tts/Kokoro-FastAPI (both bind 0.0.0.0) — this is a
+# WireGuard-mesh-internal service, not public-facing, so 0.0.0.0 is safe here.
