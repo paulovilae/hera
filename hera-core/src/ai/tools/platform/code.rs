@@ -310,6 +310,24 @@ pub(crate) async fn execute_write_file(call: &ToolCall) -> ToolResult {
         }
     };
 
+    // The path has already been validated against the forbidden/allowed-root
+    // guard above (resolve_guarded_fs_path), so it is safe to create any
+    // missing parent directories here. Without this, writing to a path whose
+    // directory doesn't exist yet (e.g. a brand-new `src/engines/mod.rs`)
+    // failed with "No such file or directory" even though the guard already
+    // approved the target path.
+    if let Some(parent) = resolved_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return ToolResult {
+                    name: call.name.clone(),
+                    success: false,
+                    output: format!("Failed to create parent directory: {}", e),
+                };
+            }
+        }
+    }
+
     match std::fs::write(&resolved_path, content) {
         Ok(_) => ToolResult {
             name: call.name.clone(),

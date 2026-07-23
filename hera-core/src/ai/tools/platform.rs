@@ -55,15 +55,42 @@ pub(crate) fn resolve_guarded_fs_path(path: &str, allow_tmp: bool) -> Result<Pat
     let candidate = if raw.exists() {
         std::fs::canonicalize(raw).map_err(|e| format!("Failed to resolve path: {}", e))?
     } else {
-        let parent = raw
-            .parent()
-            .ok_or_else(|| "Path must include a parent directory".to_string())?;
-        let resolved_parent = std::fs::canonicalize(parent)
+        // Walk up the ancestor chain until we find a directory that actually
+        // exists (not just the immediate parent), then rebuild the full
+        // candidate onto its canonicalized form. This is what lets write_file
+        // target a path whose parent AND grandparent don't exist yet (e.g. a
+        // brand-new `src/engines/mod.rs` in an app that never had that
+        // directory) instead of failing with "Failed to resolve parent
+        // directory" one level up. The forbidden/allowed-root checks below
+        // still run on the final rebuilt `candidate`, so walking further up
+        // to find an existing ancestor does not weaken the guard at all —
+        // it only changes how the same validated path gets constructed.
+        let mut missing_components: Vec<std::ffi::OsString> = Vec::new();
+        let mut cursor = raw.to_path_buf();
+        loop {
+            if cursor.as_os_str().is_empty() {
+                cursor = PathBuf::from(".");
+            }
+            if cursor.exists() {
+                break;
+            }
+            let file_name = cursor
+                .file_name()
+                .ok_or_else(|| "Path must include a file name".to_string())?
+                .to_os_string();
+            missing_components.push(file_name);
+            cursor = match cursor.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => return Err("Path must include a parent directory".to_string()),
+            };
+        }
+        let resolved_ancestor = std::fs::canonicalize(&cursor)
             .map_err(|e| format!("Failed to resolve parent directory: {}", e))?;
-        resolved_parent.join(
-            raw.file_name()
-                .ok_or_else(|| "Path must include a file name".to_string())?,
-        )
+        let mut rebuilt = resolved_ancestor;
+        for component in missing_components.into_iter().rev() {
+            rebuilt = rebuilt.join(component);
+        }
+        rebuilt
     };
 
     if is_forbidden_path(&candidate) {
